@@ -1,7 +1,8 @@
 //! carto: bin target for the `carto` CLI. clap root, exit-code mapping
-//! (spec §9.2). No `index`/`where`/`deps`/`map` yet — those arrive with
-//! their implementations in M1.b; only `selfcheck` exists in M1.a.
+//! (spec §9.2). `selfcheck` (M1.a) and `index` (M1.b.1) exist;
+//! `where`/`deps`/`map` arrive with M1.b.3.
 
+mod index;
 mod selfcheck;
 
 use clap::{Parser, Subcommand};
@@ -24,31 +25,58 @@ struct Cli {
 enum Command {
     /// Environment report: versions, grammar mode, landlock status.
     Selfcheck,
+    /// Build the structural graph of a repo (spec §7.1).
+    Index(index::IndexArgs),
 }
 
 fn main() {
     let cli = Cli::parse();
-
-    let exit_code = match &cli.command {
-        Command::Selfcheck => run_selfcheck(cli.json),
-    };
-
+    let exit_code = run(&cli).unwrap_or_else(|e| {
+        // Logs to stderr only — stdout is data (spec §9.2).
+        eprintln!("carto: {e}");
+        e.exit_code()
+    });
     std::process::exit(exit_code.into());
 }
 
-fn run_selfcheck(json: bool) -> u8 {
-    let report = selfcheck::run();
-    if json {
-        match serde_json::to_string(&report) {
-            Ok(s) => println!("{s}"),
-            Err(e) => {
-                // Logs to stderr only — stdout is data (spec §9.2).
-                eprintln!("carto: failed to serialize selfcheck report: {e}");
-                return carto_core::ErrorKind::DataError.exit_code();
-            }
+/// Dispatches to each command's implementation and emits its output
+/// (spec §9.2: `--json` serializes the same struct the human renderer
+/// reads from; stdout carries only one or the other, diagnostics go to
+/// stderr). A command's own failure (user/data/invariant) propagates as
+/// `Err` and is mapped to the process exit code in exactly one place
+/// ([`main`]), rather than each command wiring up its own exit code.
+fn run(cli: &Cli) -> carto_core::Result<u8> {
+    match &cli.command {
+        Command::Selfcheck => {
+            let report = selfcheck::run();
+            emit(cli.json, &report, || selfcheck::print_human(&report))?;
         }
-    } else {
-        selfcheck::print_human(&report);
+        Command::Index(args) => {
+            let summary = index::run(args)?;
+            emit(cli.json, &summary, || index::print_human(&summary))?;
+        }
     }
-    0
+    Ok(0)
+}
+
+/// `--json`: serialize `value` to stdout. Otherwise, call `human`, which
+/// prints the same information in human form. Never both.
+fn emit<T: serde::Serialize>(
+    json: bool,
+    value: &T,
+    human: impl FnOnce(),
+) -> carto_core::Result<()> {
+    if json {
+        let s = serde_json::to_string(value).map_err(|e| {
+            carto_core::Error::with_source(
+                carto_core::ErrorKind::DataError,
+                "failed to serialize output",
+                e,
+            )
+        })?;
+        println!("{s}");
+    } else {
+        human();
+    }
+    Ok(())
 }

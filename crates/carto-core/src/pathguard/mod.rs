@@ -36,7 +36,7 @@ impl PathGuard {
     /// repo root unless `--out` inside repo was explicit".
     pub fn new(repo_root: &Path, out_root: &Path, allow_writes_in_repo: bool) -> Result<Self> {
         denylist::check(out_root)?;
-        let canonical_out_root = canonicalize_via_longest_existing_ancestor(out_root)?;
+        let canonical_out_root = resolve_prospective(out_root)?;
         denylist::check(&canonical_out_root)?;
 
         std::fs::create_dir_all(out_root)?;
@@ -83,7 +83,7 @@ impl PathGuard {
         denylist::check(relative)?;
 
         let joined = self.out_root.join(relative);
-        let canonical = canonicalize_via_longest_existing_ancestor(&joined)?;
+        let canonical = resolve_prospective(&joined)?;
 
         denylist::check(&canonical)?;
 
@@ -117,8 +117,15 @@ impl PathGuard {
 /// exists on disk, then re-joining the remaining (not-yet-created)
 /// components. This lets pathguard catch a symlink escape introduced by an
 /// existing ancestor directory even though the final file itself doesn't
-/// exist yet (it's about to be created).
-fn canonicalize_via_longest_existing_ancestor(path: &Path) -> Result<PathBuf> {
+/// exist yet (it's about to be created) — used internally by
+/// [`PathGuard::writer`] and [`PathGuard::new`].
+///
+/// Public because callers deciding *what* to pass as `--out`/`allow_writes_in_repo`
+/// face the same problem before a `PathGuard` even exists: e.g.
+/// `crates/carto-cli/src/index.rs` needs to know whether a not-yet-created
+/// `--out` path would resolve inside the repo root, which needs exactly
+/// this resolution.
+pub fn resolve_prospective(path: &Path) -> Result<PathBuf> {
     let mut existing = path;
     let mut remainder: Vec<&std::ffi::OsStr> = Vec::new();
     loop {
