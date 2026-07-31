@@ -3,9 +3,11 @@
 //! extractors follow in a later slice, reusing [`extractor`]'s types.
 
 pub mod extractor;
+pub mod resolve;
 pub mod rust;
 
 pub use extractor::{ExtractOut, LangExtractor, RawCallSite, RawImport, RawSymbol};
+pub use resolve::{FileExtraction, ResolvedExtraction, resolve};
 pub use rust::RustExtractor;
 
 use serde::{Deserialize, Serialize};
