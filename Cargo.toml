@@ -1,0 +1,22 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/carto-core",
+    "crates/carto-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/carto/carto"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+disallowed_methods = "deny"
+
+[profile.release]
+lto = true
