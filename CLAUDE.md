@@ -74,7 +74,7 @@ a narrowly-scoped `[[bans.skip]]` carrying a reason, **never** by relaxing
 
 ## Architecture
 
-Single static Rust binary. Data flows one direction:
+Single static Rust binary. Write path, then read path:
 
 ```
 walk ──► lang::extract_and_resolve ──► Graph ──► graph::persist ──► <out>/graph.json
@@ -82,7 +82,20 @@ walk ──► lang::extract_and_resolve ──► Graph ──► graph::persis
                contains/imports/calls edges)    sort → redact → validate
                                                 → size caps → atomic write
                                                 through PathGuard)
+
+<out>/graph.json ──► graph::load ──► QueryGraph ──► query::{find,deps,map} ──► CLI renderer
+                     (size-checked                  (adjacency index,          (--json: plain
+                      before parse,                  BFS/scans,                 serde; human:
+                      schema-checked)                 BTreeMap, not             render_fenced()
+                                                       petgraph — ADR-0009)      once per section,
+                                                                                 ADR-0010)
 ```
+
+`query`'s result structs (`FindResult`, `DepsResult`, …) are plain
+serde types over `&QueryGraph` — spec §7.1's "commands = MCP tools, same
+core functions" means these are also M4's MCP payloads, so their serde
+shape is a compatibility surface the CLI only renders, not an internal
+detail to reshape freely.
 
 - **`crates/carto-core`** — everything above; no clap, no rmcp, no I/O
   besides fs.

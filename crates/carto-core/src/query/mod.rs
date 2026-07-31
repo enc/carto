@@ -17,16 +17,17 @@
 //! "replacing `inferred` edges by ID") would need a `NodeId <-> NodeIndex`
 //! side map to use petgraph's index-addressed edges anyway.
 
+pub mod deps;
 pub mod find;
 
 use crate::graph::{Edge, EdgeId, GraphDocument, Node, NodeId, SymbolNode};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+pub use deps::{DepEdge, DepsQuery, DepsResult, Hop, NodeSummary, run as deps};
 pub use find::{FindQuery, FindResult, SymbolMatch, run as find};
 
-// `deps`/`map` submodules land in the commits that implement each
-// command; declared here as each lands rather than all at once.
+// `map` lands in the commit that implements it.
 
 /// The spec §7.2 truncation contract every query result ends with:
 /// "Every response ends with `truncated: bool` and, if true, the exact
@@ -62,6 +63,19 @@ pub enum Direction {
     In,
     Out,
     Both,
+}
+
+impl Direction {
+    /// Matches the `--dir` flag spelling (spec §7.1) and this enum's own
+    /// serde spelling — used when building a `Truncation::next_call`
+    /// string, so the suggested follow-up command is copy-pasteable.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Direction::In => "in",
+            Direction::Out => "out",
+            Direction::Both => "both",
+        }
+    }
 }
 
 /// An in-memory, queryable view of a loaded `graph.json` (spec §4.4).

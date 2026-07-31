@@ -97,6 +97,83 @@ fn where_matches_golden_json() {
 }
 
 #[test]
+fn deps_matches_golden_json() {
+    let out = TempDir::new("deps-golden");
+    index(out.path());
+
+    let output = Command::cargo_bin("carto")
+        .unwrap()
+        .arg("deps")
+        .arg("handle")
+        .arg(fixture_path())
+        .arg("--out")
+        .arg(out.path())
+        .arg("--depth")
+        .arg("2")
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let pretty = serde_json::to_string_pretty(&value).unwrap();
+    assert_matches_golden("deps", &pretty);
+}
+
+/// `--depth` above `consts::MAX_DEPS_DEPTH` is a user error at the CLI
+/// boundary too, not just in `query::deps::run`'s own unit test.
+#[test]
+fn deps_target_out_of_range_depth_exits_1() {
+    let out = TempDir::new("deps-depth");
+    index(out.path());
+
+    let output = Command::cargo_bin("carto")
+        .unwrap()
+        .arg("deps")
+        .arg("handle")
+        .arg(fixture_path())
+        .arg("--out")
+        .arg(out.path())
+        .arg("--depth")
+        .arg("99")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("exceeds the cap"), "got: {stderr}");
+}
+
+#[test]
+fn deps_dir_in_finds_the_containing_file() {
+    let out = TempDir::new("deps-dir-in");
+    index(out.path());
+
+    let output = Command::cargo_bin("carto")
+        .unwrap()
+        .arg("deps")
+        .arg("handle")
+        .arg(fixture_path())
+        .arg("--out")
+        .arg(out.path())
+        .arg("--dir")
+        .arg("in")
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let hops = value["hops"].as_array().unwrap();
+    assert_eq!(hops.len(), 1);
+    let edges = hops[0]["edges"].as_array().unwrap();
+    assert_eq!(edges.len(), 1);
+    assert_eq!(edges[0]["kind"], "contains");
+    assert_eq!(edges[0]["confidence"], "certain");
+    assert_eq!(edges[0]["node"]["label"], "src/handlers.rs");
+}
+
+#[test]
 fn where_exact_and_substring_behave_differently_at_the_cli_boundary() {
     let out = TempDir::new("where-exact");
     index(out.path());

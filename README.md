@@ -37,10 +37,10 @@ carto never calls an LLM and never needs an API key.
 ## Status
 
 Implementation in progress, milestone by milestone (spec §10). Currently:
-**M1.b.2a — Rust extractor, full depth** (symbols, imports, calls, and
-the full §5.3 resolution policy for Rust; TS/TSX/JS/Python/Go extractors
-and `where`/`deps`/`map` not started yet). See
-[`docs/STATUS.md`](docs/STATUS.md) for the detailed handoff.
+**M1.b.3 — query layer** (`carto where`/`deps` work end-to-end against
+an indexed Rust repo; `map` next; TS/TSX/JS/Python/Go extractors not
+started yet). See [`docs/STATUS.md`](docs/STATUS.md) for the detailed
+handoff.
 
 ## Building
 

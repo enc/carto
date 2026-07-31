@@ -1,0 +1,94 @@
+{
+  "hops": [
+    {
+      "depth": 1,
+      "edges": [
+        {
+          "confidence": "inferred",
+          "direction": "out",
+          "evidence": [
+            "same-package"
+          ],
+          "kind": "calls",
+          "node": {
+            "id": "fcdcda3d414be6ab",
+            "kind": "symbol",
+            "label": "audit_order",
+            "location": "src/orders.rs:20-22"
+          }
+        },
+        {
+          "confidence": "inferred",
+          "direction": "out",
+          "evidence": [
+            "imported"
+          ],
+          "kind": "calls",
+          "node": {
+            "id": "4a4516397bb8de54",
+            "kind": "symbol",
+            "label": "parse_order",
+            "location": "src/orders.rs:11-14"
+          }
+        },
+        {
+          "confidence": "inferred",
+          "direction": "out",
+          "evidence": [
+            "same-file"
+          ],
+          "kind": "calls",
+          "node": {
+            "id": "87ac662deeb56bc2",
+            "kind": "symbol",
+            "label": "log_order",
+            "location": "src/handlers.rs:11-13"
+          }
+        },
+        {
+          "confidence": "inferred",
+          "direction": "out",
+          "evidence": [
+            "same-package"
+          ],
+          "kind": "calls",
+          "node": {
+            "id": "6b3204814809105e",
+            "kind": "symbol",
+            "label": "summary",
+            "location": "src/orders.rs:6-8"
+          }
+        }
+      ]
+    },
+    {
+      "depth": 2,
+      "edges": [
+        {
+          "confidence": "inferred",
+          "direction": "out",
+          "evidence": [
+            "same-file"
+          ],
+          "kind": "calls",
+          "node": {
+            "id": "6d61c8d51dfe75ea",
+            "kind": "symbol",
+            "label": "validate",
+            "location": "src/orders.rs:16-18"
+          }
+        }
+      ]
+    }
+  ],
+  "root": {
+    "id": "f294d12c8a780a1f",
+    "kind": "symbol",
+    "label": "handle",
+    "location": "src/handlers.rs:3-9"
+  },
+  "truncation": {
+    "next_call": "carto deps handle --dir out --depth 3",
+    "truncated": true
+  }
+}

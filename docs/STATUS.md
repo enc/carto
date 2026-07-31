@@ -1,6 +1,6 @@
 # carto — status / handoff
 
-**Milestone:** M1.b.2a complete · M1.b.2b not started
+**Milestone:** M1.b.3 (where/deps) in progress · map not started · M1.b.2b not started
 
 Where the implementation is in the milestone sequence, what's deliberately
 absent, and what's next. Everything else lives elsewhere on purpose:
@@ -20,9 +20,12 @@ so they've been subdivided. Current state:
 - **M1.a** — invariant substrate (consts, error, taint, pathguard, outdir). Done.
 - **M1.b.1** — walk, graph store, persist choke-point, `carto index`. Done.
 - **M1.b.2a** — Rust extractor end-to-end: symbols, imports, calls, full
-  spec §5.3 resolution policy. **Done — current head.**
+  spec §5.3 resolution policy. Done.
+- **M1.b.3** — `where`/`deps`/`map` commands. `where`/`deps` done
+  (`QueryGraph` adjacency index, ADR-0009/0010); `map --budget` next.
+  Taken ahead of M1.b.2b — no new deps/grammar work, and it closes
+  ADR-0005's traversal deferral against real requirements. **Current head.**
 - **M1.b.2b** — TS/TSX, JS, Python, Go extractors. Not started.
-- **M1.b.3** — `where`/`deps`/`map` commands. Not started.
 - **M2+** — infra graph, join, MCP, ingest, real redaction. Per spec §10.
 
 ## Deliberately absent — not gaps, not bugs
@@ -46,18 +49,35 @@ Do not "fix" these without checking the linked reasoning first:
   carve-out — [ADR-0007](adr/0007-carto-grammars-unsafe-carveout.md).
 - **"Same-package" means "same walked repo"** — no `Cargo.toml`/workspace
   parsing. Revisit only if multi-crate false positives show up in practice.
+- **`where` matches `Symbol.name` only** — `File`/`Module` nodes aren't
+  searched. Spec §7.1 names "symbol name" specifically; broadening this
+  is a real decision, not an oversight.
+- **`deps` reports a spanning-tree view, not every edge in the reachable
+  subgraph** — each node listed once via the edge that first discovered
+  it; a "cross edge" between two already-discovered nodes isn't shown
+  separately. See `crates/carto-core/src/query/deps.rs`'s module doc.
+- **No stale-index detection** — `manifest.json` carries `commit_sha`/
+  `file_sha256` but nothing compares them against the working tree.
+  M5 incrementality territory.
+- **`MCP_TEXT_CAP`'s 8 KiB byte cap isn't enforced anywhere yet** — no
+  MCP text renderer exists until M4. Today's output is bounded by each
+  command's own `--limit`/`--depth`/`--budget`.
+- **Query-layer `--json` output never fences tainted text; human output
+  fences once per section, not once per row** —
+  [ADR-0010](adr/0010-tainted-text-in-query-output.md).
 
-## Next: M1.b.2b
+## Next: `map --budget`, then M1.b.2b
 
-Not yet planned in detail. TS/TSX, JS, Python, Go `LangExtractor` impls,
-each needing its own `.scm` query set and its own ADR-0008-style mapping of
-spec §5.3's generic rules onto that language's actual import/call semantics.
+`map` (spec §7.1: layered overview, top modules by fan-in/out, entry
+points, infra summary — hard-capped at `--budget` lines, default 200)
+finishes M1.b.3. `QueryGraph`, `find`, and `deps` are already in place
+for it to build on (`crates/carto-core/src/query/`).
 
-Expect each language to require at least one real judgment call rather than
-mechanical repetition — TS's `import './x'` is genuinely file-relative, which
-nothing in Rust's `mod`/`use` system is. `fixtures/ts-app`/`py-lib`/`go-svc`
-(spec §11.1) get built alongside the extractors that need them.
-
-Then M1.b.3 (`where`/`deps`/`map`), which finally has `Symbol` nodes and real
-edges to traverse, and is where ADR-0005's "why not petgraph yet" gets
-revisited against actual traversal requirements.
+After that, M1.b.2b: TS/TSX, JS, Python, Go `LangExtractor` impls, each
+needing its own `.scm` query set and its own ADR-0008-style mapping of
+spec §5.3's generic rules onto that language's actual import/call
+semantics. Expect each language to require at least one real judgment
+call rather than mechanical repetition — TS's `import './x'` is
+genuinely file-relative, which nothing in Rust's `mod`/`use` system is.
+`fixtures/ts-app`/`py-lib`/`go-svc` (spec §11.1) get built alongside the
+extractors that need them.

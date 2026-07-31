@@ -87,6 +87,19 @@ impl NodeData {
             _ => None,
         }
     }
+
+    /// The node kind as a string, matching this enum's own
+    /// `#[serde(tag = "kind", ...)]` spelling exactly. Used by the query
+    /// layer (`deps`'s `NodeSummary.kind`, `map`'s per-kind counts) so
+    /// there's one place that spells out "file"/"symbol"/"module" for
+    /// output, not a second match arm per consumer.
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            NodeData::File(_) => "file",
+            NodeData::Symbol(_) => "symbol",
+            NodeData::Module(_) => "module",
+        }
+    }
 }
 
 /// Why a file's contents were never parsed. Spec §5.1 (walk).

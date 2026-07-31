@@ -46,6 +46,26 @@ impl EdgeKind {
             EdgeKind::Annotates => "annotates",
         }
     }
+
+    /// Inverse of [`as_str`](Self::as_str) — parses a canonical spelling
+    /// back into a variant. `None` for anything else. Used by the CLI's
+    /// `deps --kinds` filter so the accepted spellings live in one place
+    /// (here) rather than being hardcoded a second time at the argument
+    /// parser.
+    pub fn parse(s: &str) -> Option<EdgeKind> {
+        match s {
+            "contains" => Some(EdgeKind::Contains),
+            "imports" => Some(EdgeKind::Imports),
+            "calls" => Some(EdgeKind::Calls),
+            "references" => Some(EdgeKind::References),
+            "depends_on" => Some(EdgeKind::DependsOn),
+            "has_policy" => Some(EdgeKind::HasPolicy),
+            "deployed_as" => Some(EdgeKind::DeployedAs),
+            "triggered_by" => Some(EdgeKind::TriggeredBy),
+            "annotates" => Some(EdgeKind::Annotates),
+            _ => None,
+        }
+    }
 }
 
 /// Spec §4.2's confidence vocabulary, in the total order the §4.3 merge
@@ -61,6 +81,21 @@ pub enum Confidence {
     Inferred,
     Strong,
     Certain,
+}
+
+impl Confidence {
+    /// Matches this enum's own serde spelling — used by human-readable
+    /// renderers (`deps`'s CLI output) that want the same lowercase form
+    /// `--json` output uses, rather than `{:?}`'s capitalized variant name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Confidence::Ingested => "ingested",
+            Confidence::Weak => "weak",
+            Confidence::Inferred => "inferred",
+            Confidence::Strong => "strong",
+            Confidence::Certain => "certain",
+        }
+    }
 }
 
 /// Max evidence strings kept per edge (spec §4.3: "concatenating evidence,
@@ -134,6 +169,31 @@ mod tests {
 
     fn nid(s: &str) -> NodeId {
         super::super::id::file_id(s)
+    }
+
+    #[test]
+    fn parse_is_the_exact_inverse_of_as_str_for_every_variant() {
+        let all = [
+            EdgeKind::Contains,
+            EdgeKind::Imports,
+            EdgeKind::Calls,
+            EdgeKind::References,
+            EdgeKind::DependsOn,
+            EdgeKind::HasPolicy,
+            EdgeKind::DeployedAs,
+            EdgeKind::TriggeredBy,
+            EdgeKind::Annotates,
+        ];
+        for kind in all {
+            assert_eq!(EdgeKind::parse(kind.as_str()), Some(kind));
+        }
+        assert_eq!(EdgeKind::parse("not-a-kind"), None);
+    }
+
+    #[test]
+    fn confidence_as_str_matches_serde_spelling() {
+        assert_eq!(Confidence::Inferred.as_str(), "inferred");
+        assert_eq!(Confidence::Certain.as_str(), "certain");
     }
 
     #[test]
