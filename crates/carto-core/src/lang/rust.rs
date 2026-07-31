@@ -6,6 +6,7 @@
 use super::extractor::{ExtractOut, LangExtractor, RawCallSite, RawImport, RawSymbol};
 use crate::graph::SymKind;
 use crate::lang::Lang;
+use std::collections::BTreeMap;
 use streaming_iterator::StreamingIterator as _;
 use tree_sitter::{Node, Parser, Query, QueryCursor};
 
@@ -54,7 +55,14 @@ fn extract_symbols(root: Node, src: &[u8]) -> Vec<RawSymbol> {
     let names = query.capture_names();
     let mut cursor = QueryCursor::new();
 
-    let mut out = Vec::new();
+    // Keyed by the item node's byte range: an impl-block method's
+    // `function_item` is matched twice — once by the plain
+    // `symbol.function` pattern (which doesn't know it's nested inside an
+    // `impl_item`) and once by the more specific `symbol.method` pattern.
+    // Both matches describe the same underlying node, so this dedupes by
+    // range, always preferring the `Method` classification when both are
+    // present (whichever match tree-sitter happens to produce first).
+    let mut by_range: BTreeMap<(usize, usize), RawSymbol> = BTreeMap::new();
     let mut matches = cursor.matches(&query, root, src);
     while let Some(m) = matches.next() {
         let mut name_node = None;
@@ -117,17 +125,27 @@ fn extract_symbols(root: Node, src: &[u8]) -> Vec<RawSymbol> {
         let signature = text_range(src, item_node.start_byte(), sig_end);
         let is_pub = has_visibility_modifier(item_node);
 
-        out.push(RawSymbol {
-            name,
-            qualified_name,
-            sym_kind,
-            start_line,
-            end_line,
-            signature,
-            is_pub,
-        });
+        let key = (item_node.start_byte(), item_node.end_byte());
+        let is_method = matches!(sym_kind, SymKind::Method);
+        let already_method = by_range
+            .get(&key)
+            .is_some_and(|existing| matches!(existing.sym_kind, SymKind::Method));
+        if !already_method || is_method {
+            by_range.insert(
+                key,
+                RawSymbol {
+                    name,
+                    qualified_name,
+                    sym_kind,
+                    start_line,
+                    end_line,
+                    signature,
+                    is_pub,
+                },
+            );
+        }
     }
-    out
+    by_range.into_values().collect()
 }
 
 /// Whether `item_node` has a `pub`/`pub(crate)`/etc. visibility modifier.
@@ -271,6 +289,24 @@ mod tests {
     fn private_symbol_is_not_pub() {
         let out = extract("fn validate(input: &str) -> bool {\n    true\n}\n");
         assert!(!out.symbols[0].is_pub);
+    }
+
+    #[test]
+    fn impl_block_method_is_extracted_exactly_once_as_method_not_also_as_function() {
+        // Regression: an impl-block function_item used to match both the
+        // generic `symbol.function` pattern and the more specific
+        // `symbol.method` pattern, producing two RawSymbols for the same
+        // node — which then made every impl-block method spuriously
+        // ambiguous for cross-file call resolution (two "pub" candidates
+        // with the same name instead of one).
+        let out = extract(
+            "pub struct Order { pub id: u64 }\n\
+             impl Order {\n    pub fn summary(&self) -> String {\n        String::new()\n    }\n}\n",
+        );
+        let summaries: Vec<&RawSymbol> =
+            out.symbols.iter().filter(|s| s.name == "summary").collect();
+        assert_eq!(summaries.len(), 1, "expected exactly one `summary` symbol");
+        assert!(matches!(summaries[0].sym_kind, SymKind::Method));
     }
 
     #[test]

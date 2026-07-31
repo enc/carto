@@ -37,8 +37,9 @@ carto never calls an LLM and never needs an API key.
 ## Status
 
 Implementation in progress, milestone by milestone (spec §10). Currently:
-**M1.b.1 — walk + graph store + `carto index`** (`File` nodes only; no
-language parsing, no `Symbol` nodes, no `where`/`deps`/`map` yet). See
+**M1.b.2a — Rust extractor, full depth** (symbols, imports, calls, and
+the full §5.3 resolution policy for Rust; TS/TSX/JS/Python/Go extractors
+and `where`/`deps`/`map` not started yet). See
 [`docs/STATUS.md`](docs/STATUS.md) for the detailed handoff.
 
 ## Building

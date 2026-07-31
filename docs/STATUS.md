@@ -1,6 +1,6 @@
 # carto — status / handoff
 
-**Last updated:** 2026-07-31 · **Milestone:** M1.b.1 complete, M1.b.2 not started
+**Last updated:** 2026-07-31 · **Milestone:** M1.b.2a complete, M1.b.2b not started
 
 Read this first if you're picking up this work cold. Full product spec:
 [`docs/carto-design-spec.md`](carto-design-spec.md) (normative, MUST/SHOULD/MAY
@@ -9,176 +9,181 @@ so far and why: [`docs/adr/`](adr/).
 
 ## Where things stand
 
-`main` has 13 commits, working tree clean, `scripts/gates.sh` green:
+`main` has 19 commits, working tree clean, `scripts/gates.sh` green
+(86 unit tests + 12 CLI integration tests + 5 compile-fail cases):
 
 ```
+5916dc4 feat(cli): wire extraction into carto index
+cad41df feat(core): cross-file import/call resolution (spec §5.3)
+c25d127 feat(core): LangExtractor trait + Rust extractor (raw symbols/imports/calls)
+9df5ffb feat: carto-grammars crate (native tree-sitter, Rust grammar)
+d19f978 feat(core): SymbolNode/ModuleNode/SymKind; TaintedString PartialEq
+5e1d311 test: fixtures/mixed, determinism + pathguard CLI gates; docs update
 c9d0827 feat(cli): carto index, --out resolution, exit-code plumbing
 9a5ed4a feat(core): git HEAD provenance; pathguard checks out-root before creating it
 f9d887a feat(core): walk with built-in denylist, sensitive/binary/size handling
 b46c016 feat(core): graph data model — stable IDs, nodes, edges, persist choke-point
-666ac70 docs: ADR 0001-0004
-ae1281f test: taint, pathguard, and compile-fail suites; gates script
-5de3c07 feat(cli): carto binary with selfcheck
-b7c904b feat(core): pathguard, atomic writer, out-dir resolution (INV-3, INV-4)
-9991d65 feat(core): TaintedString with sanitizing constructor (INV-5)
-90bbf8e feat(core): consts, error type, exit-code contract
-4d2f482 chore: add deny.toml and clippy.toml (INV-1, INV-2)
-d684319 chore: scaffold workspace, license, spec into docs/
 ```
 
-(plus the fixtures/tests/doc commit landing alongside this file — see
-`git log` for the exact current head.)
+(plus one more commit landing alongside this file for
+`fixtures/rust-crate` + extraction acceptance tests — see `git log` for
+the exact current head.)
 
-This is **M1.b.1**: `carto index` produces `graph.json` + `manifest.json`
-containing **`File` nodes only** — no parsing, no `Symbol`/`Module` nodes,
-no `where`/`deps`/`map`. That's M1.b.2/M1.b.3, not started. M1.b.1 was
-scoped deliberately narrow (see "Decisions already made" below) as the
-shortest path to an end-to-end write path, chosen because it closes two
-gates that had no way to run until *some* command actually wrote a
-`graph.json` through `PathGuard`.
+This is **M1.b.2a**: a complete Rust extractor — symbols, imports, calls,
+and the full spec §5.3 resolution policy, one language end-to-end. TS/TSX,
+JS, Python, Go extractors (spec §5.2's remaining v1 language set) are
+**M1.b.2b, not started** — they reuse everything built here (the
+`LangExtractor` trait, `Symbol`/`Module` node types, edge/resolution
+machinery, `carto-grammars` crate structure); only new `.scm` queries and
+a `LangExtractor` impl per language are new work.
 
 ### What exists
 
+- `crates/carto-grammars`: new crate, the workspace's designated
+  `unsafe_code` exception (spec §3.1) for tree-sitter FFI — though in
+  practice, `tree-sitter` 0.26 / `tree-sitter-rust` 0.24's language
+  loading turned out not to need an actual `unsafe` block (verified
+  empirically; see ADR-0007). `rust_language()` behind the default-on
+  `native-grammars` feature (spec §5.4).
 - `crates/carto-core`:
-  - `consts`, `error`, `taint`, `pathguard`, `outdir` — unchanged since
-    M1.a (see below), except `pathguard::PathGuard::new` now checks the
-    INV-4 denylist *before* creating the out-dir (previously it created
-    first and only refused on the first write — a real, if short-lived,
-    invariant gap).
-  - `graph` — the spec §4 data model (`File` nodes this slice), the §4.3
-    stable-ID recipe, and the §6.5 persist choke-point. Backed by
-    `BTreeMap<NodeId, _>`/`BTreeMap<EdgeId, _>`, not `petgraph` (see
-    ADR-0005 — nothing traverses the graph yet).
-  - `lang` — just the `Lang` enum + extension mapping for
-    `FileNode.lang`; no `LangExtractor` trait or tree-sitter yet.
-  - `redact` — the §7.5/INV-6 interface, no-op stub (per spec §10 M1).
-  - `walk` — spec §5.1 in full: `ignore`-crate traversal, built-in
-    directory denylist (active even under `--no-gitignore`), `.cartoignore`
-    (always additive), the sensitive-file set (`excluded: "sensitive"`,
-    contents never read), binary sniff, size guard, `*.lock`/`*.min.js`
-    marked never-parsed. Uses the walker's own parallelism, funneled
-    through a channel to a single sorting collector (determinism).
-  - `gitinfo` — hand-rolled `.git/HEAD` reader (no subprocess, INV-2) for
-    `manifest.json`'s `commit_sha`; handles packed-refs and worktrees.
-    `dirty` stays `Option<bool> = None` — see ADR-0006.
-- `crates/carto-cli`: `carto` binary now has two commands — `selfcheck`
-  (M1.a) and `index [PATH] [--out DIR] [--no-gitignore] [--json]` (new).
-  `main.rs` refactored to a single `run(cli) -> Result<u8>` so exit-code
-  mapping happens in one place, not per-command.
-- `fixtures/mixed/`: the first fixture (spec §11.1 names `ts-app`,
-  `py-lib`, `rust-crate`, `go-svc`, `mixed`, and several infra fixtures —
-  only `mixed` exists so far, sized for `walk`'s acceptance tests
-  specifically, not yet the fuller corpus M1.b.2's extractors will need).
-  Deliberately excludes `.env`/`*.pem`-shaped files even as fake content —
-  this dev environment's own tooling refuses to write them; sensitive-file
-  classification is covered by `walk`'s unit tests instead (temp dirs, not
-  committed fixtures). See `fixtures/mixed/README.md`.
-- `crates/carto-cli/tests/cli.rs`: `assert_cmd`-based CLI integration
-  tests — determinism (double-index byte-compare), pathguard-refusal
-  (denylisted `--out` exits 3), `--json` stdout purity, repo-untouched,
-  and a golden-file check against `fixtures/mixed.graph.golden.json`
-  (`CARTO_UPDATE_GOLDEN=1` regenerates it; `carto_version` is normalized
-  to a placeholder so a version bump alone doesn't force a rewrite).
-- Tests: 63 unit tests in `carto-core` (up from 30 in M1.a), 5 CLI
-  integration tests, 5 trybuild compile-fail cases (unchanged).
-- `scripts/gates.sh`: unchanged commands, but now actually exercises §9.5
-  gates 3 (`test_determinism`) and 4 (`test_pathguard`, CLI-level) via
-  `cargo test --workspace`, closing both ADR-0004 deferrals.
+  - `graph::node`: `Symbol`/`Module` node types alongside the existing
+    `File` (spec §4.1), `SymKind` (spec's literal enum), `UnresolvedCall`.
+    `graph::id` gained `sym_id`/`module_id` (spec §4.3's recipe, extended
+    to a kind Module doesn't get an explicit format for).
+  - `taint::TaintedString` gained `PartialEq`/`Eq` (needed for
+    `SymbolNode.signature: Option<TaintedString>` to fit the existing
+    `Node`/`NodeData` derive chain — doesn't weaken INV-5, since equality
+    isn't one of the restricted accessors).
+  - `lang::extractor`: the `LangExtractor` trait (spec §5.2, simplified
+    to take `relpath: &str` instead of spec's literal `FileCtx` — nothing
+    needs more yet) and raw pre-resolution types (`RawSymbol`,
+    `RawImport`, `RawCallSite`).
+  - `lang::rust`: `RustExtractor` — tree-sitter queries
+    (`lang/queries/rust/{symbols,imports,calls}.scm`) for top-level/
+    impl-block items, `mod`/`use` declarations, and plain/method call
+    sites (never path-qualified calls — out of scope this slice).
+  - `lang::resolve`: whole-repo, single-threaded cross-file resolution
+    implementing spec §5.3's full policy — `mod` → sibling-file
+    `imports` edges, `use`-root → internal/external classification
+    (external → deduped `Module` node), the three-tier call-resolution
+    (same-file / imported / same-package, first match wins,
+    always `inferred`, never `certain`), and `unresolved_calls` for
+    anything that doesn't resolve unambiguously (INV-8).
+  - `lang::extract_and_resolve`: orchestrates the above over every walked
+    `File` node whose `Lang` has a registered extractor.
+- `crates/carto-cli`: `carto index` now inserts `Symbol`/`Module` nodes
+  and `contains`/`imports`/`calls` edges alongside `File` nodes, before
+  persisting.
+- `fixtures/rust-crate/`: new, purpose-built 3-file fixture exercising
+  every spec §5.3 resolution tier plus the impl-block/qualified-name
+  path and the "no guessing" honesty path — see its README for the exact
+  scenario-to-test-case mapping.
+- `crates/carto-cli/tests/cli_extraction.rs`: 7 semantic-assertion tests
+  against `fixtures/rust-crate`'s parsed `graph.json` (not a golden-file
+  byte-compare — too fragile to hand-review for a symbol-rich fixture),
+  plus its own determinism check.
+- `fixtures/mixed.graph.golden.json` regenerated: `src/main.rs` now
+  produces a `main` `Symbol` node + one `contains` edge.
+- Tests: 86 unit tests in `carto-core` (up from 63), 12 CLI integration
+  tests across `cli.rs` + `cli_extraction.rs` (up from 5), 1 unit test in
+  `carto-grammars`, 5 trybuild compile-fail cases (unchanged).
 
 ### What's deliberately NOT here yet
 
-Language extractors (TS/JS/Python/Rust/Go symbols/imports/calls, §5.3),
-tree-sitter/`carto-grammars`, `Symbol`/`Module` nodes, any real edges
-(`contains`/`imports`/`calls` — `edge.rs`'s types exist and are tested,
-but nothing produces one yet), `where`/`deps`/`map` commands, infra graph,
-join, MCP, ingest, real redaction (stub only). All M1.b.2+.
+TS/TSX, JS, Python, Go extractors (M1.b.2b). Path-qualified call
+resolution (`Type::method()`, `module::func()` — same-name-only matching
+this slice, spec §5.3 "deliberately modest"; see ADR-0008).
+`use_list`/`use_wildcard`/`use_as_clause` Rust import shapes.
+`where`/`deps`/`map` commands (M1.b.3 — needs real traversal, also when
+ADR-0005's "why not petgraph yet" gets revisited). Infra graph, join,
+MCP, ingest, real redaction. All later milestones.
 
 ## Decisions already made (don't re-litigate without new info)
 
-- **Name stays `carto`.** Binary + crate prefix.
-- **No `.github/` yet.** No remote, no Linux box, no `strace` available on
-  this dev host (macOS). CI gates run locally via `scripts/gates.sh`
-  instead. See ADR-0004 for exactly which of spec §9.5's 5 gates run today
-  (now 1, 3, 4) vs. are deferred (2, 5), and what unblocks each.
-- **Commit straight to `main`,** no feature branches, one commit per
-  logical unit.
-- **`cargo deny check advisories` is excluded even from the local gate** —
-  it fetches the RUSTSEC DB over the network, which would be dishonest for
-  a script whose job is enforcing "no network."
-- **Graph store is `BTreeMap`-keyed, not `petgraph`,** for now (ADR-0005).
-  Revisit when `deps`/`map` need real traversal (M1.b.3).
-- **`manifest.json`'s `commit_sha` is read by hand (no `gix` yet); `dirty`
-  is always `null`** (ADR-0006). `gix` arrives when `impact --diff` needs
-  it, on that feature's own merits.
-- **M1.b was split into sub-slices** (M1.b.1 = walk + graph + index,
-  M1.b.2 = extractors, M1.b.3 = query commands) rather than planned/built
-  as one large M1.b unit — not a spec deviation, just an implementation-
-  order choice within M1's scope.
+Carried over from M1.b.1 (still true): name stays `carto`; no `.github/`
+yet (ADR-0004, gates 1/3/4 run locally, 2/5 deferred); commit straight to
+`main`; `cargo deny check advisories` excluded from the local gate;
+graph store is `BTreeMap`-keyed, not `petgraph`, until real traversal
+exists (ADR-0005); `manifest.json`'s `commit_sha` is hand-read, `dirty`
+stays `null` (ADR-0006).
+
+New this milestone:
+
+- **M1.b.2 was split into M1.b.2a (Rust, full depth) / M1.b.2b (the
+  remaining 4 languages)** rather than built as one unit — same reasoning
+  as the M1.b.1/b.2/b.3 split: too large a single plan/execution unit.
+- **`carto-grammars` keeps its `unsafe_code`-exception role even though
+  zero `unsafe` code exists in it today** (ADR-0007) — the exception is
+  architectural (spec §3.1 names this crate as the seam), not contingent
+  on today's tree-sitter API surface.
+- **Rust's mapping of spec §5.3's generic resolution rules onto Rust's
+  actual module system is fully recorded in ADR-0008** — read this
+  before implementing TS/Python/Go's extractors; it's the template
+  (not a verbatim rule) for the same kind of decision each of those
+  languages will need to make for itself.
+- **"Same-package" (call resolution tier c) means "same walked repo,"
+  v1-wide** — no `Cargo.toml`/workspace parsing. Revisit only if a real
+  need surfaces (e.g. multi-crate workspace false-positives in practice).
 
 ## Known gotchas
 
-- **The sandbox denies writes to `.git`.** Every `git` command that
-  mutates state (`init`, `add`, `commit`) needs
-  `dangerouslyDisableSandbox: true` on the Bash call. Read-only git
-  commands (`status`, `log`, `diff`) work fine in-sandbox.
-- **This dev environment's write tooling refuses `.env`/`*.pem`-shaped
-  paths**, even for fixture data with fake content. Hit this while
-  building `fixtures/mixed`; worked around by not including those two
-  file kinds in the committed fixture (see `fixtures/mixed/README.md`).
-  If a future fixture genuinely needs one, expect to hit the same wall.
-- **Historical wart, not worth fixing:** the workspace `Cargo.toml` listed
-  `carto-cli` as a member starting at commit 1 (`d684319`), but
-  `carto-cli` itself didn't exist until commit `5de3c07`. Commits 2–5 do
-  not build standalone from a fresh checkout at that exact commit — a
-  full `cargo build --workspace` there fails with "no such file." HEAD
-  builds fine. Irrelevant unless someone starts bisecting.
-- Local dev machine has no `strace`, no `gh`, no `cargo-nextest`. `dtruss`
-  exists but needs SIP disabled — not attempted.
-- Crate versions were re-verified live against crates.io on 2026-07-31 for
-  this slice's new dependencies (`ignore`, `sha2`) — cargo resolved
-  `ignore` to 0.4.30 rather than the just-released 0.4.31, since the
-  latter needs a newer Rust than this workspace's declared MSRV
-  (`rust-version = "1.85"`); that's cargo respecting MSRV, not a mistake.
+Carried over from M1.b.1: sandbox denies direct `git` mutation without
+`dangerouslyDisableSandbox: true`; this dev environment's write tooling
+refuses to create `.env`/`*.pem`-shaped paths even for fake fixture
+content (hit again — not needed this milestone, no new instance); the
+`carto-cli` workspace-member historical wart in early commits; no
+`strace`/`gh`/`cargo-nextest` locally.
+
+New this milestone:
+
+- **A tree-sitter query can match the same underlying node more than
+  once** if two patterns both describe it at different specificity (an
+  impl-block method's `function_item` matched both the generic
+  `symbol.function` pattern and the specific `symbol.method` pattern).
+  Caught via manual inspection of a real `carto index` run against
+  `fixtures/rust-crate` (a call that should have resolved via
+  same-package was showing up unresolved — traced back to a spurious
+  duplicate `pub_by_name` entry making tier c look ambiguous when it
+  wasn't). Fixed by deduping `extract_symbols`'s output by item byte
+  range, preferring the more specific classification. Worth remembering
+  when writing TS/Python/Go's queries too — check for this class of bug
+  by eyeballing real extraction output, not just unit tests against
+  synthetic snippets (the unit tests here didn't catch it, since none of
+  them checked for *absence* of a duplicate).
+- `docs.rs` is not on this sandbox's network allowlist (crates.io/
+  static.crates.io/index.crates.io are) — API surface questions that
+  would normally be a docs.rs lookup get resolved empirically instead
+  (write the code, see if it compiles / behaves as expected).
 
 ## Verifying the current state works
 
 ```bash
 bash scripts/gates.sh                              # fmt, clippy, deny, tests — must be green
-cargo run -p carto-cli -- selfcheck                 # human output
-cargo run -p carto-cli -- selfcheck --json 2>/dev/null | python3 -m json.tool   # stdout is pure JSON
 
-# index a repo, twice, and confirm byte-identical output (INV-7)
-cargo run -p carto-cli -- index fixtures/mixed --out /tmp/carto-a
-cargo run -p carto-cli -- index fixtures/mixed --out /tmp/carto-b
-shasum -a 256 /tmp/carto-a/graph.json /tmp/carto-b/graph.json
+cargo run -p carto-cli -- index fixtures/rust-crate --out /tmp/carto-rust --json 2>/dev/null | python3 -m json.tool
+python3 -m json.tool /tmp/carto-rust/graph.json     # manual read-through against
+                                                     # fixtures/rust-crate/README.md's table
 
-cargo run -p carto-cli -- index fixtures/mixed --json 2>/dev/null | python3 -m json.tool
-
-# INV-4: refuses, exit 3, creates nothing
-cargo run -p carto-cli -- index fixtures/mixed --out ~/.claude/carto-test; echo "exit=$?"
-test -e ~/.claude/carto-test && echo "FAIL: created" || echo "ok: not created"
+cargo run -p carto-cli -- index fixtures/rust-crate --out /tmp/carto-rust-b
+diff /tmp/carto-rust/graph.json /tmp/carto-rust-b/graph.json   # INV-7 (note: the --json
+                                                     # run above used a different out
+                                                     # dir; this line re-runs plain)
 
 git log --oneline && git status                    # clean tree
 ```
 
-## Next step: M1.b.2
+## Next step: M1.b.2b
 
-Not yet planned in detail. Scope per spec §5.2–§5.4 and §10 M1 (minus what
-M1.b.1 already covered): `crates/carto-grammars` (native tree-sitter
-grammars behind `native-grammars`, per §5.4 — WASM is M5), the
-`LangExtractor` trait (§5.2) with `.scm` query files under
-`lang/queries/<lang>/`, and extractors for TS/JS, Python, Rust, Go
-producing `Symbol`/`Module` nodes and `contains`/`imports`/`calls` edges
-per §5.3's deliberately-modest resolution policy (first-match-wins import
-resolution; calls emit `inferred` confidence or no edge at all — "missing
-honestly beats guessing," INV-8).
+Not yet planned in detail. TS/TSX, JS, Python, Go `LangExtractor` impls,
+each with their own `.scm` queries and their own ADR-0008-style mapping
+of spec §5.3's generic rules onto that language's actual import/call
+semantics (TS's `import './x'` genuinely is file-relative, unlike
+anything in Rust's `mod`/`use` system — expect each language to need at
+least one real judgment call, not just mechanical repetition of Rust's
+approach). `fixtures/ts-app`/`py-lib`/`go-svc` (spec §11.1) will be
+needed once there's something per-language to meaningfully test.
 
-`fixtures/mixed` will likely need extending (or dedicated `fixtures/ts-app`
-/`py-lib`/`rust-crate`/`go-svc` fixtures per spec §11.1) once there's
-something for the extractors to meaningfully parse beyond the
-placeholder-sized files M1.b.1 needed.
-
-`where`/`deps`/`map` (M1.b.3) come after: they need `Symbol` nodes and real
-edges to be useful, and are also where the M1.b.1 ADR-0005 "why not
-petgraph yet" decision gets revisited against actual traversal
+After that, M1.b.3: `where`/`deps`/`map` commands — needs `Symbol` nodes
+and real edges to be useful (now available), and is also where ADR-0005's
+"why not petgraph yet" decision gets revisited against actual traversal
 requirements.
