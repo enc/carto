@@ -1,9 +1,10 @@
 //! carto: bin target for the `carto` CLI. clap root, exit-code mapping
-//! (spec §9.2). `selfcheck` (M1.a), `index` (M1.b.1), and `where`/`deps`
-//! (M1.b.3) exist; `map` arrives later in M1.b.3.
+//! (spec §9.2). `selfcheck` (M1.a), `index` (M1.b.1), and
+//! `where`/`deps`/`map` (M1.b.3) exist.
 
 mod deps_cmd;
 mod index;
+mod map_cmd;
 mod selfcheck;
 mod target;
 mod where_cmd;
@@ -36,6 +37,8 @@ enum Command {
     Where(where_cmd::WhereArgs),
     /// Adjacency listing with confidence (spec §7.1).
     Deps(deps_cmd::DepsArgs),
+    /// Layered overview, hard-capped at --budget lines (spec §7.1).
+    Map(map_cmd::MapArgs),
 }
 
 fn main() {
@@ -71,6 +74,10 @@ fn run(cli: &Cli) -> carto_core::Result<u8> {
         Command::Deps(args) => {
             let result = deps_cmd::run(args)?;
             emit(cli.json, &result, || deps_cmd::print_human(&result))?;
+        }
+        Command::Map(args) => {
+            let result = map_cmd::run(args)?;
+            emit(cli.json, &result, || map_cmd::print_human(&result))?;
         }
     }
     Ok(0)

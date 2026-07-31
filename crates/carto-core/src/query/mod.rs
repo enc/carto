@@ -19,6 +19,7 @@
 
 pub mod deps;
 pub mod find;
+pub mod map;
 
 use crate::graph::{Edge, EdgeId, GraphDocument, Node, NodeId, SymbolNode};
 use serde::{Deserialize, Serialize};
@@ -26,8 +27,7 @@ use std::collections::BTreeMap;
 
 pub use deps::{DepEdge, DepsQuery, DepsResult, Hop, NodeSummary, run as deps};
 pub use find::{FindQuery, FindResult, SymbolMatch, run as find};
-
-// `map` lands in the commit that implements it.
+pub use map::{MapCounts, MapQuery, MapResult, run as map};
 
 /// The spec §7.2 truncation contract every query result ends with:
 /// "Every response ends with `truncated: bool` and, if true, the exact
@@ -134,6 +134,13 @@ impl QueryGraph {
     /// All nodes, in ID-sorted order (`BTreeMap` iteration).
     pub fn nodes(&self) -> impl Iterator<Item = &Node> {
         self.nodes.values()
+    }
+
+    /// All edges, in ID-sorted order (`BTreeMap` iteration). Used by
+    /// `map`'s repo-wide scans (counts, fan-in/out ranking), which need
+    /// every edge once rather than per-node neighbor lookups.
+    pub fn edges(&self) -> impl Iterator<Item = &Edge> {
+        self.edges.values()
     }
 
     /// Edges touching `id` in the given direction, ID-sorted.

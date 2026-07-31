@@ -1,0 +1,31 @@
+{
+  "counts": {
+    "edges_by_kind": {
+      "calls": 5,
+      "contains": 7,
+      "imports": 2
+    },
+    "files": 4,
+    "modules": 0,
+    "symbols": 7
+  },
+  "lines": [
+    "files=4 symbols=7 modules=0",
+    "edges: calls=5 contains=7 imports=2",
+    "## top modules (imports fan-in/out)",
+    "  src/lib.rs  in=0 out=2",
+    "  src/handlers.rs  in=1 out=0",
+    "  src/orders.rs  in=1 out=0",
+    "## entry points (heuristic: no incoming imports, or named `main`)",
+    "  README.md",
+    "  src/lib.rs",
+    "## infra",
+    "  none — requires M2 (infrastructure graph)",
+    "## join",
+    "  none — requires M3 (code<->infra join)"
+  ],
+  "truncation": {
+    "next_call": null,
+    "truncated": false
+  }
+}

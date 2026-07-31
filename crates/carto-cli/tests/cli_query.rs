@@ -239,3 +239,60 @@ fn where_against_unindexed_dir_exits_1_and_names_index() {
         "expected stderr to name `carto index` as the fix, got: {stderr}"
     );
 }
+
+/// `map`'s output is prose (spec §7.1's "layered overview"), which is
+/// fragile to golden-file against — this asserts the budget contract
+/// (§7.1: "hard-capped at budget") at two different budgets instead of
+/// snapshotting exact text, same choice `cli.rs`'s pattern reserves
+/// golden files for structurally stable output.
+#[test]
+fn map_respects_budget_at_multiple_sizes() {
+    let out = TempDir::new("map-budget");
+    index(out.path());
+
+    for budget in [5u32, 50] {
+        let output = Command::cargo_bin("carto")
+            .unwrap()
+            .arg("map")
+            .arg(fixture_path())
+            .arg("--out")
+            .arg(out.path())
+            .arg("--budget")
+            .arg(budget.to_string())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        // The truncation notice (when present) isn't part of the
+        // budgeted overview itself, so only count lines up to it.
+        let overview_lines = stdout
+            .lines()
+            .take_while(|l| !l.starts_with("... truncated"))
+            .count();
+        assert!(
+            overview_lines <= budget as usize,
+            "budget {budget}: got {overview_lines} lines"
+        );
+    }
+}
+
+#[test]
+fn map_json_matches_golden_json() {
+    let out = TempDir::new("map-golden");
+    index(out.path());
+
+    let output = Command::cargo_bin("carto")
+        .unwrap()
+        .arg("map")
+        .arg(fixture_path())
+        .arg("--out")
+        .arg(out.path())
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let pretty = serde_json::to_string_pretty(&value).unwrap();
+    assert_matches_golden("map", &pretty);
+}

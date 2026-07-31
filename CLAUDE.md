@@ -29,10 +29,15 @@ cargo test -p carto-core lang::rust::tests::extracts_top_level_function  # one t
 
 cargo run -p carto-cli -- index fixtures/rust-crate --out /tmp/carto-out
 cargo run -p carto-cli -- index <repo> --json 2>/dev/null | python3 -m json.tool
+cargo run -p carto-cli -- where <name> <repo> --out /tmp/carto-out
+cargo run -p carto-cli -- deps <name|id> <repo> --out /tmp/carto-out --dir out --depth 2
+cargo run -p carto-cli -- map <repo> --out /tmp/carto-out --budget 50
 cargo run -p carto-cli -- selfcheck
 
-# Regenerate the walk-only golden file after an intentional change:
+# Regenerate a golden file after an intentional change (walk-only, or
+# where/deps/map against fixtures/rust-crate):
 CARTO_UPDATE_GOLDEN=1 cargo test -p carto-cli --test cli index_matches_golden_graph_json
+CARTO_UPDATE_GOLDEN=1 cargo test -p carto-cli --test cli_query
 ```
 
 `cargo deny check advisories` is deliberately **not** in `gates.sh` — it

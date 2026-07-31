@@ -1,6 +1,6 @@
 # carto — status / handoff
 
-**Milestone:** M1.b.3 (where/deps) in progress · map not started · M1.b.2b not started
+**Milestone:** M1.b.3 complete · M1.b.2b not started
 
 Where the implementation is in the milestone sequence, what's deliberately
 absent, and what's next. Everything else lives elsewhere on purpose:
@@ -21,10 +21,10 @@ so they've been subdivided. Current state:
 - **M1.b.1** — walk, graph store, persist choke-point, `carto index`. Done.
 - **M1.b.2a** — Rust extractor end-to-end: symbols, imports, calls, full
   spec §5.3 resolution policy. Done.
-- **M1.b.3** — `where`/`deps`/`map` commands. `where`/`deps` done
-  (`QueryGraph` adjacency index, ADR-0009/0010); `map --budget` next.
-  Taken ahead of M1.b.2b — no new deps/grammar work, and it closes
-  ADR-0005's traversal deferral against real requirements. **Current head.**
+- **M1.b.3** — `where`/`deps`/`map` commands, over the `QueryGraph`
+  adjacency index (ADR-0009/0010). Done — current head. Taken ahead of
+  M1.b.2b — no new deps/grammar work, and it closes ADR-0005's traversal
+  deferral against real requirements instead of speculatively.
 - **M1.b.2b** — TS/TSX, JS, Python, Go extractors. Not started.
 - **M2+** — infra graph, join, MCP, ingest, real redaction. Per spec §10.
 
@@ -56,6 +56,13 @@ Do not "fix" these without checking the linked reasoning first:
   subgraph** — each node listed once via the edge that first discovered
   it; a "cross edge" between two already-discovered nodes isn't shown
   separately. See `crates/carto-core/src/query/deps.rs`'s module doc.
+- **`map`'s "entry points" is a structural heuristic** (files with no
+  incoming `imports`, symbols named `main`), explicitly labeled as such —
+  not real per-language entry-point analysis (e.g. a `Cargo.toml`
+  `[[bin]]` table), which carto doesn't have in v1.
+- **`map`'s infra/join sections are explicit "requires M2"/"requires M3"
+  placeholders**, not omitted — an absent section would read as "no
+  infra found," which isn't yet a true statement either way.
 - **No stale-index detection** — `manifest.json` carries `commit_sha`/
   `file_sha256` but nothing compares them against the working tree.
   M5 incrementality territory.
@@ -66,18 +73,17 @@ Do not "fix" these without checking the linked reasoning first:
   fences once per section, not once per row** —
   [ADR-0010](adr/0010-tainted-text-in-query-output.md).
 
-## Next: `map --budget`, then M1.b.2b
+## Next: M1.b.2b
 
-`map` (spec §7.1: layered overview, top modules by fan-in/out, entry
-points, infra summary — hard-capped at `--budget` lines, default 200)
-finishes M1.b.3. `QueryGraph`, `find`, and `deps` are already in place
-for it to build on (`crates/carto-core/src/query/`).
+TS/TSX, JS, Python, Go `LangExtractor` impls, each needing its own
+`.scm` query set and its own ADR-0008-style mapping of spec §5.3's
+generic rules onto that language's actual import/call semantics. Expect
+each language to require at least one real judgment call rather than
+mechanical repetition — TS's `import './x'` is genuinely file-relative,
+which nothing in Rust's `mod`/`use` system is. `fixtures/ts-app`/
+`py-lib`/`go-svc` (spec §11.1) get built alongside the extractors that
+need them.
 
-After that, M1.b.2b: TS/TSX, JS, Python, Go `LangExtractor` impls, each
-needing its own `.scm` query set and its own ADR-0008-style mapping of
-spec §5.3's generic rules onto that language's actual import/call
-semantics. Expect each language to require at least one real judgment
-call rather than mechanical repetition — TS's `import './x'` is
-genuinely file-relative, which nothing in Rust's `mod`/`use` system is.
-`fixtures/ts-app`/`py-lib`/`go-svc` (spec §11.1) get built alongside the
-extractors that need them.
+`carto where`/`deps`/`map` all work end-to-end today, but only ever see
+Rust repos until this lands — every language's `.scm` set feeds the same
+`QueryGraph`/`find`/`deps`/`map` unchanged.
