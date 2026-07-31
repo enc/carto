@@ -138,10 +138,13 @@ name = "carto-core"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "carto-grammars",
  "ignore",
  "serde",
  "serde_json",
  "sha2",
+ "streaming-iterator",
+ "tree-sitter",
  "trybuild",
  "unicode-normalization",
 ]

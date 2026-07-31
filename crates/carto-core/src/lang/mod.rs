@@ -1,7 +1,12 @@
-//! Language identification (spec §5.2). This slice only needs `Lang` for
-//! `FileNode.lang` (spec §4.1) — the `LangExtractor` trait, tree-sitter
-//! queries, and `queries/` directory (spec §5.2) arrive in M1.b.2 with the
-//! extractors that use them.
+//! Language identification (spec §5.2) and, as of M1.b.2a, the
+//! `LangExtractor` trait + Rust's implementation. TS/TSX, JS, Python, Go
+//! extractors follow in a later slice, reusing [`extractor`]'s types.
+
+pub mod extractor;
+pub mod rust;
+
+pub use extractor::{ExtractOut, LangExtractor, RawCallSite, RawImport, RawSymbol};
+pub use rust::RustExtractor;
 
 use serde::{Deserialize, Serialize};
 
