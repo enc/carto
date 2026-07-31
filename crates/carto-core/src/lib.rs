@@ -10,5 +10,6 @@ pub mod outdir;
 pub mod pathguard;
 pub mod redact;
 pub mod taint;
+pub mod walk;
 
 pub use error::{Error, ErrorKind, Result};
