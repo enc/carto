@@ -4,6 +4,8 @@
 
 pub mod consts;
 pub mod error;
+pub mod outdir;
+pub mod pathguard;
 pub mod taint;
 
 pub use error::{Error, ErrorKind, Result};
