@@ -1,11 +1,12 @@
 //! `carto index` — spec §7.1: "repo path, infra flags" -> "manifest
-//! summary". M1.b.1 scope only: `File` nodes via `walk`, no parsing, no
-//! infra flags (those arrive with the language extractors in M1.b.2 and
-//! infra ingestion in M2 respectively).
+//! summary". `File` nodes via `walk`; `Symbol`/`Module` nodes and
+//! `contains`/`imports`/`calls` edges via `lang::extract_and_resolve`
+//! for every walked file whose language has a registered extractor
+//! (Rust only as of M1.b.2a). No infra flags yet (M2).
 
 use carto_core::error::{Error, ErrorKind, Result};
 use carto_core::graph::Graph;
-use carto_core::{gitinfo, graph, outdir, pathguard, walk};
+use carto_core::{gitinfo, graph, lang, outdir, pathguard, walk};
 use clap::Args;
 use serde::Serialize;
 use std::path::PathBuf;
@@ -71,9 +72,17 @@ pub fn run(args: &IndexArgs) -> Result<IndexSummary> {
     let walked = walk::walk(&repo_root, !args.no_gitignore)?;
     let file_count = walked.nodes.len();
 
+    let resolved = lang::extract_and_resolve(&repo_root, &walked.nodes);
+
     let mut g = Graph::new();
     for node in walked.nodes {
         g.insert_node(node);
+    }
+    for node in resolved.nodes {
+        g.insert_node(node);
+    }
+    for edge in resolved.edges {
+        g.insert_edge(edge);
     }
 
     let commit_sha = gitinfo::head_sha(&repo_root);

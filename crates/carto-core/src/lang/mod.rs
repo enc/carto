@@ -10,7 +10,9 @@ pub use extractor::{ExtractOut, LangExtractor, RawCallSite, RawImport, RawSymbol
 pub use resolve::{FileExtraction, ResolvedExtraction, resolve};
 pub use rust::RustExtractor;
 
+use crate::graph::Node;
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 /// The v1 language set (spec §5.2), plus `Other`/`PlainText` for anything
 /// `walk` sees that isn't in that set yet (M1.b.1 has no extractors, so
@@ -53,6 +55,45 @@ impl Lang {
             _ => Lang::Other,
         }
     }
+}
+
+/// Orchestrates extraction + resolution for every walked `File` node
+/// whose language has a registered extractor (Rust only, this slice —
+/// `file_nodes` is expected to be `walk::WalkOutput::nodes`, but this
+/// function only depends on the `Node` shape, not on `walk` itself).
+/// Files that are `skipped`/`excluded` (spec §5.1's walk classification)
+/// or whose `Lang` has no extractor yet are left alone — only their
+/// `File` node exists, same as before M1.b.2a.
+///
+/// Re-reads each eligible file's content from disk (`walk` already read
+/// it once, for hashing/binary-sniffing, but doesn't retain the bytes) —
+/// a second read is simpler than threading raw content through `walk`'s
+/// public output, and every file this touches already passed `walk`'s
+/// size cap. A file that becomes unreadable between the two reads
+/// (TOCTOU) is silently skipped, same tolerance `walk::classify`
+/// already has for the same race.
+pub fn extract_and_resolve(repo_root: &Path, file_nodes: &[Node]) -> ResolvedExtraction {
+    let extractor = RustExtractor;
+    let mut extractions = Vec::new();
+
+    for node in file_nodes {
+        let Some(file) = node.data.as_file() else {
+            continue;
+        };
+        if file.skipped.is_some() || file.excluded.is_some() || file.lang != extractor.lang() {
+            continue;
+        }
+        let Ok(content) = std::fs::read(repo_root.join(&file.path)) else {
+            continue;
+        };
+        extractions.push(FileExtraction {
+            file_id: node.id.clone(),
+            relpath: file.path.clone(),
+            extract: extractor.extract(&content, &file.path),
+        });
+    }
+
+    resolve(extractions)
 }
 
 #[cfg(test)]

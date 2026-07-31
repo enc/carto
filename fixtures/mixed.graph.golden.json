@@ -75,6 +75,19 @@
       "excluded": null
     },
     {
+      "id": "aeb5a0fc8cb1fa64",
+      "provenance": "syntactic",
+      "origin": "lang-rust@1",
+      "kind": "symbol",
+      "name": "main",
+      "sym_kind": "function",
+      "file": "219e7e007ca53849",
+      "start_line": 1,
+      "end_line": 3,
+      "signature": "fn main()",
+      "unresolved_calls": []
+    },
+    {
       "id": "bc205a23aada60b5",
       "provenance": "syntactic",
       "origin": "walk@1",
@@ -111,5 +124,16 @@
       "excluded": null
     }
   ],
-  "edges": []
+  "edges": [
+    {
+      "id": "24cb48900170fa0c",
+      "kind": "contains",
+      "from": "219e7e007ca53849",
+      "to": "aeb5a0fc8cb1fa64",
+      "confidence": "certain",
+      "evidence": [
+        "extractor:rust"
+      ]
+    }
+  ]
 }
