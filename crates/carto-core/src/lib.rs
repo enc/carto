@@ -9,6 +9,7 @@ pub mod graph;
 pub mod lang;
 pub mod outdir;
 pub mod pathguard;
+pub mod query;
 pub mod redact;
 pub mod taint;
 pub mod walk;
