@@ -1,16 +1,10 @@
 //! Resolves the default output root (INV-3): `${XDG_CACHE_HOME:-~/.cache}/carto/<repo-hash>/`.
 //! Spec §2 (INV-3), §4.3 (stable-ID hash recipe — reused here for the
 //! repo-hash component so there's one blake3-hex-prefix helper in the
-//! codebase, not two).
+//! codebase, not two: [`crate::graph::id::blake3_hex_prefix`]).
 
 use crate::error::{Error, ErrorKind, Result};
 use std::path::{Path, PathBuf};
-
-/// Length, in hex chars, of the repo-hash component of the default out-dir.
-/// Matches the 16-hex-char (64-bit) prefix used for stable node/edge IDs
-/// (spec §4.3): enough to make collisions between distinct repo paths
-/// practically impossible, short enough to keep paths readable.
-const REPO_HASH_HEX_LEN: usize = 16;
 
 /// Computes `${XDG_CACHE_HOME:-~/.cache}/carto/<repo-hash>/` for
 /// `repo_root`. `repo_root` is canonicalized first so that `.`, symlinks,
@@ -45,8 +39,7 @@ fn cache_home() -> Result<PathBuf> {
 }
 
 fn repo_hash(canonical_repo_path: &Path) -> String {
-    let hash = blake3::hash(canonical_repo_path.to_string_lossy().as_bytes());
-    hash.to_hex()[..REPO_HASH_HEX_LEN].to_string()
+    crate::graph::id::blake3_hex_prefix(canonical_repo_path.to_string_lossy().as_bytes())
 }
 
 #[cfg(test)]
@@ -69,7 +62,10 @@ mod tests {
 
     #[test]
     fn hash_is_expected_length() {
-        assert_eq!(repo_hash(Path::new("/x")).len(), REPO_HASH_HEX_LEN);
+        assert_eq!(
+            repo_hash(Path::new("/x")).len(),
+            crate::graph::id::ID_HEX_LEN
+        );
     }
 
     #[test]
