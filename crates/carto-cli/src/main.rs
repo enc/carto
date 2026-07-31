@@ -1,9 +1,11 @@
 //! carto: bin target for the `carto` CLI. clap root, exit-code mapping
-//! (spec §9.2). `selfcheck` (M1.a) and `index` (M1.b.1) exist;
-//! `where`/`deps`/`map` arrive with M1.b.3.
+//! (spec §9.2). `selfcheck` (M1.a), `index` (M1.b.1), and `where`
+//! (M1.b.3) exist; `deps`/`map` arrive later in M1.b.3.
 
 mod index;
 mod selfcheck;
+mod target;
+mod where_cmd;
 
 use clap::{Parser, Subcommand};
 
@@ -27,6 +29,10 @@ enum Command {
     Selfcheck,
     /// Build the structural graph of a repo (spec §7.1).
     Index(index::IndexArgs),
+    /// Find symbols by name (spec §7.1). Module name is `where_cmd`
+    /// (`where` is a Rust keyword) — the subcommand itself is `where`.
+    #[command(name = "where")]
+    Where(where_cmd::WhereArgs),
 }
 
 fn main() {
@@ -54,6 +60,10 @@ fn run(cli: &Cli) -> carto_core::Result<u8> {
         Command::Index(args) => {
             let summary = index::run(args)?;
             emit(cli.json, &summary, || index::print_human(&summary))?;
+        }
+        Command::Where(args) => {
+            let result = where_cmd::run(args)?;
+            emit(cli.json, &result, || where_cmd::print_human(&result))?;
         }
     }
     Ok(0)

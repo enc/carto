@@ -1,0 +1,16 @@
+{
+  "matches": [
+    {
+      "id": "6b3204814809105e",
+      "location": "src/orders.rs:6-8",
+      "name": "summary",
+      "provenance": "syntactic",
+      "signature": "pub fn summary(&self) -> String",
+      "sym_kind": "method"
+    }
+  ],
+  "truncation": {
+    "next_call": null,
+    "truncated": false
+  }
+}

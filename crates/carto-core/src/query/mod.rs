@@ -17,15 +17,41 @@
 //! "replacing `inferred` edges by ID") would need a `NodeId <-> NodeIndex`
 //! side map to use petgraph's index-addressed edges anyway.
 
+pub mod find;
+
 use crate::graph::{Edge, EdgeId, GraphDocument, Node, NodeId, SymbolNode};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-// `find`/`deps`/`map` submodules land in the commits that implement each
-// command (this module's doc comment describes the eventual shape);
-// declared here as each lands rather than all at once, so this commit
-// compiles and is independently testable before any of the three core
-// query functions exist.
+pub use find::{FindQuery, FindResult, SymbolMatch, run as find};
+
+// `deps`/`map` submodules land in the commits that implement each
+// command; declared here as each lands rather than all at once.
+
+/// The spec §7.2 truncation contract every query result ends with:
+/// "Every response ends with `truncated: bool` and, if true, the exact
+/// follow-up call to get more."
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Truncation {
+    pub truncated: bool,
+    pub next_call: Option<String>,
+}
+
+impl Truncation {
+    pub fn none() -> Self {
+        Truncation {
+            truncated: false,
+            next_call: None,
+        }
+    }
+
+    pub fn more(next_call: String) -> Self {
+        Truncation {
+            truncated: true,
+            next_call: Some(next_call),
+        }
+    }
+}
 
 /// Which direction to traverse an edge from a node: `out` follows edges
 /// where the node is `from` (spec §7.1's `deps --dir`: "what this depends

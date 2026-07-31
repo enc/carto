@@ -4,9 +4,10 @@
 //! for every walked file whose language has a registered extractor
 //! (Rust only as of M1.b.2a). No infra flags yet (M2).
 
-use carto_core::error::{Error, ErrorKind, Result};
+use crate::target;
+use carto_core::error::Result;
 use carto_core::graph::Graph;
-use carto_core::{gitinfo, graph, lang, outdir, pathguard, walk};
+use carto_core::{gitinfo, graph, lang, pathguard, walk};
 use clap::Args;
 use serde::Serialize;
 use std::path::PathBuf;
@@ -45,18 +46,9 @@ pub struct IndexSummary {
 }
 
 pub fn run(args: &IndexArgs) -> Result<IndexSummary> {
-    let repo_root = args.path.canonicalize().map_err(|e| {
-        Error::with_source(
-            ErrorKind::UserError,
-            format!("cannot resolve repo path `{}`", args.path.display()),
-            e,
-        )
-    })?;
-
-    let out_root = match &args.out {
-        Some(p) => p.clone(),
-        None => outdir::default_out_root(&repo_root)?,
-    };
+    let target = target::resolve(&args.path, &args.out)?;
+    let repo_root = target.repo_root;
+    let out_root = target.out_root;
 
     // Whether this --out counts as the spec §7.4 "explicit" in-repo
     // override: only when the user actually passed --out (never the
