@@ -1,0 +1,20 @@
+[package]
+name = "carto-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "carto: repo traversal, graph store, invariant types (taint, pathguard). No I/O besides fs; no clap/rmcp."
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+blake3 = "1.8"
+unicode-normalization = "0.1"
+
+[dev-dependencies]
+trybuild = "1"
