@@ -84,6 +84,30 @@ pub fn edge_id(kind: &str, from: &NodeId, to: &NodeId) -> EdgeId {
     ))
 }
 
+/// Stable ID for a `Symbol` node (spec §4.3): canonical key
+/// `sym:<relpath>:<sym_kind>:<qualified_name>:<start_line>`.
+/// `qualified_name` is computed by the caller (e.g. `Order::summary` for
+/// an impl-block method, spec §4.3's own example of why line is included
+/// — "moving a symbol changes its ID," accepted trade-off) — this
+/// function has no language-specific qualification logic of its own.
+pub fn sym_id(relpath: &str, sym_kind: &str, qualified_name: &str, start_line: u32) -> NodeId {
+    NodeId(blake3_hex_prefix(
+        format!("sym:{relpath}:{sym_kind}:{qualified_name}:{start_line}").as_bytes(),
+    ))
+}
+
+/// Stable ID for a `Module` node. Spec §4.3 doesn't give `Module` an
+/// explicit canonical-key format (only File/Symbol/IacResource/
+/// IamPolicyStmt/Note/Edge are listed) — follows the same `<kind>:<key>`
+/// convention as the others. `external` is part of the key so an
+/// unresolved external package name can never collide with an internal
+/// module path that happens to read the same.
+pub fn module_id(path: &str, external: bool) -> NodeId {
+    NodeId(blake3_hex_prefix(
+        format!("module:{external}:{path}").as_bytes(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

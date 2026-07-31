@@ -1,10 +1,10 @@
-//! Node kinds (spec §4.1). This slice implements `File` only — `Module`,
-//! `Symbol`, `IacResource`, `IamPolicyStmt`, `CloudResourceRef`, `Note`
-//! arrive with the extractors/infra ingestion that produce them.
+//! Node kinds (spec §4.1). `File`, `Symbol`, and `Module` exist as of
+//! M1.b.2a — `IacResource`, `IamPolicyStmt`, `CloudResourceRef`, `Note`
+//! arrive with infra ingestion/agent-ingest (M2/M4).
 
 use super::id::NodeId;
 use crate::lang::Lang;
-use crate::taint::Provenance;
+use crate::taint::{Provenance, TaintedString};
 use serde::{Deserialize, Serialize};
 
 /// Common fields on every node (spec §4.1): `id`, `kind` (carried by
@@ -37,12 +37,56 @@ impl Node {
             data: NodeData::File(file),
         }
     }
+
+    pub fn symbol(
+        id: NodeId,
+        provenance: Provenance,
+        origin: impl Into<String>,
+        symbol: SymbolNode,
+    ) -> Self {
+        Node {
+            id,
+            provenance,
+            origin: origin.into(),
+            data: NodeData::Symbol(symbol),
+        }
+    }
+
+    pub fn module(
+        id: NodeId,
+        provenance: Provenance,
+        origin: impl Into<String>,
+        module: ModuleNode,
+    ) -> Self {
+        Node {
+            id,
+            provenance,
+            origin: origin.into(),
+            data: NodeData::Module(module),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum NodeData {
     File(FileNode),
+    Symbol(SymbolNode),
+    Module(ModuleNode),
+}
+
+impl NodeData {
+    /// `Some` only for the `File` variant. Producers that only ever
+    /// build one variant themselves (e.g. `walk`, which only ever
+    /// constructs `File` nodes) use this instead of an irrefutable-
+    /// pattern `let`, which stops compiling the moment `NodeData` gains
+    /// another variant.
+    pub fn as_file(&self) -> Option<&FileNode> {
+        match self {
+            NodeData::File(f) => Some(f),
+            _ => None,
+        }
+    }
 }
 
 /// Why a file's contents were never parsed. Spec §5.1 (walk).
@@ -84,4 +128,89 @@ pub struct FileNode {
     pub sha256: Option<String>,
     pub skipped: Option<SkipReason>,
     pub excluded: Option<ExclusionReason>,
+}
+
+/// Spec §4.1's `Symbol.sym_kind` enum, verbatim. Extractors only ever
+/// produce the variants their language actually has — Rust's extractor
+/// (M1.b.2a) produces `Function`/`Method`/`Struct`/`Enum`/`Trait`/`Const`/
+/// `Type`; `Class`/`Interface`/`Var` wait for languages that have them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SymKind {
+    Function,
+    Method,
+    Class,
+    Struct,
+    Enum,
+    Trait,
+    Interface,
+    Type,
+    Const,
+    Var,
+}
+
+impl SymKind {
+    /// The string used in the symbol's canonical key (spec §4.3:
+    /// `sym:<relpath>:<sym_kind>:<qualified_name>:<start_line>`) and in
+    /// serde output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SymKind::Function => "function",
+            SymKind::Method => "method",
+            SymKind::Class => "class",
+            SymKind::Struct => "struct",
+            SymKind::Enum => "enum",
+            SymKind::Trait => "trait",
+            SymKind::Interface => "interface",
+            SymKind::Type => "type",
+            SymKind::Const => "const",
+            SymKind::Var => "var",
+        }
+    }
+}
+
+/// A call site that could not be resolved to a target symbol (spec §5.3
+/// rule 2: "If multiple candidates remain: emit NO edge; record the
+/// call-site under the caller symbol's `unresolved_calls` list" —
+/// extended here to cover the zero-candidate case too, since both are
+/// the same honesty principle, INV-8: "missing honestly beats guessing").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnresolvedCall {
+    pub name: String,
+    pub line: u32,
+}
+
+/// `Symbol` node (spec §4.1). `name` is the bare declared identifier —
+/// used both for display and as what call-resolution matches against
+/// (spec §5.3's matching is name-based, not qualified-path-based). The
+/// §4.3 ID recipe's `qualified_name` component (e.g. `Order::summary` for
+/// an impl-block method) is computed only when constructing the node's
+/// [`NodeId`] — it is not a separate field here, matching spec §4.1's
+/// literal field list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SymbolNode {
+    pub name: String,
+    pub sym_kind: SymKind,
+    pub file: NodeId,
+    /// 1-based, inclusive (spec §4.1: "range (`start_line..end_line`,
+    /// 1-based)").
+    pub start_line: u32,
+    pub end_line: u32,
+    /// ≤300 chars (spec §4.1). [`TaintedString`]'s `Serialize` impl
+    /// already caps at [`crate::consts::SIGNATURE_CAP`] on output, so no
+    /// separate truncation is needed here.
+    pub signature: Option<TaintedString>,
+    pub unresolved_calls: Vec<UnresolvedCall>,
+}
+
+/// `Module` node (spec §4.1): "logical module/package path". `external`
+/// distinguishes a resolved-internal reference (unused this slice — an
+/// internal `use` seeds call resolution rather than producing its own
+/// `Module` node, see `docs/adr/0008-rust-resolution-policy-mapping.md`)
+/// from a package import whose target carto never parses (spec §5.3 rule
+/// 1: "certain that it's imported, target unresolved").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModuleNode {
+    pub path: String,
+    pub external: bool,
 }

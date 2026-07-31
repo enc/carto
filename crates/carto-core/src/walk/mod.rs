@@ -143,8 +143,11 @@ struct WalkedFile {
 }
 
 fn path_of(node: &Node) -> &str {
-    let graph::NodeData::File(f) = &node.data;
-    &f.path
+    &node
+        .data
+        .as_file()
+        .expect("walk only ever constructs File nodes")
+        .path
 }
 
 /// Reads and classifies a single file at `abs_path` (already known to be
@@ -363,7 +366,7 @@ mod tests {
 
     fn node_path<'a>(out: &'a WalkOutput, path: &str) -> Option<&'a FileNode> {
         out.nodes.iter().find_map(|n| {
-            let graph::NodeData::File(f) = &n.data;
+            let f = n.data.as_file().unwrap();
             (f.path == path).then_some(f)
         })
     }
@@ -487,10 +490,7 @@ mod tests {
         let paths: Vec<&str> = out
             .nodes
             .iter()
-            .map(|n| {
-                let graph::NodeData::File(f) = &n.data;
-                f.path.as_str()
-            })
+            .map(|n| n.data.as_file().unwrap().path.as_str())
             .collect();
         let mut sorted = paths.clone();
         sorted.sort();

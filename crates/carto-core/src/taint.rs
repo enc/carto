@@ -33,7 +33,14 @@ pub enum Provenance {
 
 /// A string that must be treated as untrusted (INV-5). Fields are private;
 /// content can only leave through a fencing/capping accessor.
-#[derive(Clone)]
+///
+/// `PartialEq`/`Eq` compare the sanitized content and provenance directly
+/// (not through a fenced/capped accessor) — equality doesn't render or
+/// leak content anywhere, so it's outside the set of accessors INV-5
+/// restricts (`Display`/`Deref`/`AsRef<str>`/`Into<String>`). Needed so
+/// node types containing a `TaintedString` field (e.g. `SymbolNode`'s
+/// `signature`) can derive `PartialEq`/`Eq` themselves.
+#[derive(Clone, PartialEq, Eq)]
 pub struct TaintedString {
     sanitized: String,
     provenance: Provenance,
@@ -234,6 +241,18 @@ mod tests {
     fn whitespace_runs_collapse_and_trim() {
         let t = TaintedString::new("  lots   of\n\n\nspace   ", Provenance::Syntactic);
         assert_eq!(t.render_capped(100), "lots of space");
+    }
+
+    #[test]
+    fn equality_compares_sanitized_content_and_provenance() {
+        let a = TaintedString::new("hello world", Provenance::Syntactic);
+        let b = TaintedString::new("hello   world", Provenance::Syntactic); // collapses to the same sanitized text
+        let different_content = TaintedString::new("goodbye world", Provenance::Syntactic);
+        let different_provenance = TaintedString::new("hello world", Provenance::Ingested);
+
+        assert_eq!(a, b);
+        assert_ne!(a, different_content);
+        assert_ne!(a, different_provenance);
     }
 
     #[test]
