@@ -1,0 +1,8 @@
+# INV-2 enforcement: carto never executes repository content or build
+# systems. std::process::Command is banned workspace-wide except in
+# crates/carto-cli/src/selfcheck.rs, which is exempted via an inline
+# `#[allow(clippy::disallowed_methods)]` with a comment explaining why.
+# See docs/carto-design-spec.md §2 (INV-2), §7.1 (selfcheck).
+disallowed-methods = [
+    { path = "std::process::Command::new", reason = "INV-2: no foreign code execution. Only crates/carto-cli/src/selfcheck.rs may run external processes, and only to report tool versions." },
+]

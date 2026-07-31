@@ -1,0 +1,85 @@
+# INV-1 enforcement: no crate in the dependency graph may provide
+# sockets/HTTP/DNS. See docs/carto-design-spec.md §2, §9.5.
+#
+# `cargo deny check bans licenses sources` is run locally via scripts/gates.sh.
+# `cargo deny check advisories` is intentionally NOT run locally — it fetches
+# the RUSTSEC advisory database over the network, which would be a lie against
+# the invariant this file exists to enforce. It belongs in real CI once one
+# exists. See docs/adr/0004-deferred-security-gates.md.
+
+[graph]
+all-features = true
+
+[licenses]
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.8
+
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+allow-workspace = true
+
+deny = [
+    # HTTP clients / servers
+    { crate = "reqwest", reason = "INV-1: no network capability" },
+    { crate = "hyper", reason = "INV-1: no network capability" },
+    { crate = "hyper-util", reason = "INV-1: no network capability" },
+    { crate = "h2", reason = "INV-1: no network capability" },
+    { crate = "h3", reason = "INV-1: no network capability" },
+    { crate = "ureq", reason = "INV-1: no network capability" },
+    { crate = "curl", reason = "INV-1: no network capability" },
+    { crate = "curl-sys", reason = "INV-1: no network capability" },
+    { crate = "isahc", reason = "INV-1: no network capability" },
+    { crate = "surf", reason = "INV-1: no network capability" },
+    { crate = "attohttpc", reason = "INV-1: no network capability" },
+    { crate = "actix-web", reason = "INV-1: no network capability" },
+    { crate = "axum", reason = "INV-1: no network capability" },
+    { crate = "warp", reason = "INV-1: no network capability" },
+    { crate = "tiny_http", reason = "INV-1: no network capability" },
+    { crate = "tungstenite", reason = "INV-1: no network capability" },
+    { crate = "tokio-tungstenite", reason = "INV-1: no network capability" },
+
+    # Async runtimes with network reactors
+    { crate = "async-std", reason = "INV-1: no network capability" },
+    { crate = "smol", reason = "INV-1: no network capability" },
+
+    # TLS (client use implies network)
+    { crate = "native-tls", reason = "INV-1: no network capability" },
+    { crate = "openssl", reason = "INV-1: no network capability" },
+    { crate = "openssl-sys", reason = "INV-1: no network capability (also banned as build-script-fetch-prone)" },
+    { crate = "rustls", reason = "INV-1: no network capability (client TLS)" },
+    { crate = "tokio-rustls", reason = "INV-1: no network capability" },
+    { crate = "async-tls", reason = "INV-1: no network capability" },
+    { crate = "quinn", reason = "INV-1: no network capability (QUIC)" },
+
+    # DNS resolution
+    { crate = "trust-dns-resolver", reason = "INV-1: no network capability" },
+    { crate = "trust-dns-proto", reason = "INV-1: no network capability" },
+    { crate = "hickory-resolver", reason = "INV-1: no network capability" },
+    { crate = "hickory-proto", reason = "INV-1: no network capability" },
+
+    # Raw sockets / low-level networking
+    { crate = "socket2", reason = "INV-1: no network capability" },
+    { crate = "mio", reason = "INV-1: no network capability (async net reactor)" },
+    { crate = "net2", reason = "INV-1: no network capability" },
+]
+
+# Feature-level bans: crates we do need eventually (e.g. tokio, for rmcp in
+# M4) but only for their non-networking capabilities.
+[[bans.features]]
+crate = "tokio"
+deny = ["net", "process"]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
