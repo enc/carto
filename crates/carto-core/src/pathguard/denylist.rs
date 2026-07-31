@@ -23,6 +23,21 @@ const DENIED_FILE_NAMES: &[&str] = &[
     ".gitconfig",
 ];
 
+/// A short, stable digest of the denylist contents, for `carto selfcheck`
+/// to report (spec §7.1) — lets an operator confirm which build of carto
+/// they're running without printing the (short, non-secret) list itself out
+/// of proportion in normal output.
+pub fn digest() -> String {
+    let mut all: Vec<&str> = DENIED_DIR_COMPONENTS
+        .iter()
+        .chain(DENIED_FILE_NAMES.iter())
+        .copied()
+        .collect();
+    all.sort_unstable();
+    let joined = all.join(",");
+    blake3::hash(joined.as_bytes()).to_hex()[..16].to_string()
+}
+
 /// Refuses `path` if it matches the INV-4 denylist. Checked twice by
 /// [`super::PathGuard::writer`]: once on the caller-supplied relative path
 /// (fails fast, no fs touched) and once on the fully resolved canonical

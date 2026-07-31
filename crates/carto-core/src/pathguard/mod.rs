@@ -7,6 +7,7 @@ mod atomic;
 mod denylist;
 
 pub use atomic::AtomicFile;
+pub use denylist::digest as denylist_digest;
 
 use crate::error::{Error, Result};
 use std::path::{Component, Path, PathBuf};
