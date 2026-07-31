@@ -37,7 +37,9 @@ carto never calls an LLM and never needs an API key.
 ## Status
 
 Implementation in progress, milestone by milestone (spec §10). Currently:
-**M1.a — foundation scaffold** (workspace, invariant types, no parsing yet).
+**M1.b.1 — walk + graph store + `carto index`** (`File` nodes only; no
+language parsing, no `Symbol` nodes, no `where`/`deps`/`map` yet). See
+[`docs/STATUS.md`](docs/STATUS.md) for the detailed handoff.
 
 ## Building
 

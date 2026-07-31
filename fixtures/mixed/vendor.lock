@@ -1,0 +1,3 @@
+# fake lockfile fixture — recorded as a File node, never parsed
+pkg-a 1.0.0
+pkg-b 2.3.1

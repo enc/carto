@@ -1,0 +1,115 @@
+{
+  "carto_version": "<carto_version>",
+  "schema_version": 1,
+  "nodes": [
+    {
+      "id": "01b1bf1a08742486",
+      "provenance": "syntactic",
+      "origin": "walk@1",
+      "kind": "file",
+      "path": ".gitignore",
+      "lang": "other",
+      "size": 14,
+      "sha256": "bfbf87694250034fd5cb139e5a9562f71b3b0d748aa8bbbe293b08bc50ae391d",
+      "skipped": null,
+      "excluded": null
+    },
+    {
+      "id": "1ad26d3ccb966351",
+      "provenance": "syntactic",
+      "origin": "walk@1",
+      "kind": "file",
+      "path": ".cartoignore",
+      "lang": "other",
+      "size": 11,
+      "sha256": "f5c10da83055c0c3e72f3167971d1916e443dc90390e32b42844552cc37b81e0",
+      "skipped": null,
+      "excluded": null
+    },
+    {
+      "id": "219e7e007ca53849",
+      "provenance": "syntactic",
+      "origin": "walk@1",
+      "kind": "file",
+      "path": "src/main.rs",
+      "lang": "rust",
+      "size": 51,
+      "sha256": "2a8db4d92a15812825cc392bb1569f20a73f84633b51f3a8f242f663cf95fe60",
+      "skipped": null,
+      "excluded": null
+    },
+    {
+      "id": "600e84125eb01ca9",
+      "provenance": "syntactic",
+      "origin": "walk@1",
+      "kind": "file",
+      "path": "README.md",
+      "lang": "plain_text",
+      "size": 1354,
+      "sha256": "3487b7815944f75a80f6f099f464a29c1b47bd4dbe08e05510c73b528aca8ade",
+      "skipped": null,
+      "excluded": null
+    },
+    {
+      "id": "60111f341f31ccc7",
+      "provenance": "syntactic",
+      "origin": "walk@1",
+      "kind": "file",
+      "path": "lib.py",
+      "lang": "python",
+      "size": 48,
+      "sha256": "6b723ec775c5f8d2273cdc049a80ffaaa6232da49c508eef4a6afda549383f36",
+      "skipped": null,
+      "excluded": null
+    },
+    {
+      "id": "856f3e2d3ec9983a",
+      "provenance": "syntactic",
+      "origin": "walk@1",
+      "kind": "file",
+      "path": "vendor.min.js",
+      "lang": "java_script",
+      "size": 62,
+      "sha256": "4cb944556048bd5fb7078fb0522a2c6a730e5c8919076ad93e09b0d6855a41c2",
+      "skipped": "minified",
+      "excluded": null
+    },
+    {
+      "id": "bc205a23aada60b5",
+      "provenance": "syntactic",
+      "origin": "walk@1",
+      "kind": "file",
+      "path": "vendor.lock",
+      "lang": "plain_text",
+      "size": 90,
+      "sha256": "2d29116bef9b3fe6fca965f212fa97e5338dfbf8bb27f176e9c5fe2440351b9e",
+      "skipped": "lock_file",
+      "excluded": null
+    },
+    {
+      "id": "f5cefa8676aadccd",
+      "provenance": "syntactic",
+      "origin": "walk@1",
+      "kind": "file",
+      "path": "src/app.ts",
+      "lang": "type_script",
+      "size": 74,
+      "sha256": "aff06be225028406357171dc63de228c12c3f6a4087d0da733347acda56ecf71",
+      "skipped": null,
+      "excluded": null
+    },
+    {
+      "id": "f9571e9403180f37",
+      "provenance": "syntactic",
+      "origin": "walk@1",
+      "kind": "file",
+      "path": "binary.dat",
+      "lang": "other",
+      "size": 16,
+      "sha256": "9df40ae71740d0de7c8e925f72b8a18be1f55770122605db09ef44ffe6692448",
+      "skipped": "binary",
+      "excluded": null
+    }
+  ],
+  "edges": []
+}
