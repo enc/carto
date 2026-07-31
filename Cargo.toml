@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/carto-core",
     "crates/carto-cli",
+    "crates/carto-grammars",
 ]
 
 [workspace.package]

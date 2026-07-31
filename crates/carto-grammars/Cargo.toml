@@ -1,0 +1,33 @@
+[package]
+name = "carto-grammars"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "carto: tree-sitter grammar loading. The workspace's one unsafe_code exception (spec §3.1) — isolates and documents each grammar-loading block."
+
+# Deliberately does NOT do `[lints] workspace = true`: Cargo's workspace
+# lint inheritance is all-or-nothing per package (there's no way to
+# inherit only the clippy table), and the workspace forbids unsafe_code
+# (spec §3.1) — a level rustc's lint system makes un-downgradable even
+# locally. This crate is the spec-named exception for tree-sitter FFI, so
+# it sets its own (default, i.e. allowed) `unsafe_code` level and
+# restates (doesn't inherit) the one clippy lint INV-2 cares about;
+# there's no reason to relax it here even though this crate has no
+# `std::process::Command` call of its own.
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+disallowed_methods = "deny"
+
+[dependencies]
+tree-sitter = "0.26"
+tree-sitter-rust = { version = "0.24", optional = true }
+
+[features]
+default = ["native-grammars"]
+# M1-M4 (spec §5.4): native grammar crates. `wasm-grammars` (M5, default
+# from M5) is a reserved name, not implemented yet.
+native-grammars = ["dep:tree-sitter-rust"]
