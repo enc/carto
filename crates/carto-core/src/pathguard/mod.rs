@@ -23,11 +23,22 @@ pub struct PathGuard {
 
 impl PathGuard {
     /// `out_root` is created if it doesn't exist (that's the one directory
-    /// carto is allowed to create). `allow_writes_in_repo` is true only
-    /// when the user passed `--out` pointing explicitly inside the repo —
-    /// spec §7.4: "any path under repo root unless `--out` inside repo was
-    /// explicit".
+    /// carto is allowed to create) — but only *after* the INV-4 denylist
+    /// has cleared it, both lexically and (via the longest existing
+    /// ancestor, same trick [`Self::writer`] uses) on its canonical form.
+    /// Checking before creating matters: without this, `carto index --out
+    /// ~/.claude/carto` would create a directory inside `.claude` and only
+    /// refuse on the first actual write, in `writer()` — a real (if
+    /// short-lived) INV-4 violation, not just a reported one.
+    ///
+    /// `allow_writes_in_repo` is true only when the user passed `--out`
+    /// pointing explicitly inside the repo — spec §7.4: "any path under
+    /// repo root unless `--out` inside repo was explicit".
     pub fn new(repo_root: &Path, out_root: &Path, allow_writes_in_repo: bool) -> Result<Self> {
+        denylist::check(out_root)?;
+        let canonical_out_root = canonicalize_via_longest_existing_ancestor(out_root)?;
+        denylist::check(&canonical_out_root)?;
+
         std::fs::create_dir_all(out_root)?;
         let repo_root = repo_root.canonicalize()?;
         let out_root = out_root.canonicalize()?;
@@ -197,6 +208,21 @@ mod tests {
         assert!(guard.writer(Path::new("CLAUDE.md")).is_err());
         assert!(guard.writer(Path::new(".git/hooks/pre-commit")).is_err());
         assert!(guard.writer(Path::new(".zshrc")).is_err());
+    }
+
+    #[test]
+    fn refuses_a_denylisted_out_root_without_creating_it() {
+        let base = TempDir::new("denylisted-out-root");
+        let repo_root = base.path().join("repo");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        let out_root = base.path().join(".claude").join("carto");
+
+        assert!(PathGuard::new(&repo_root, &out_root, false).is_err());
+        assert!(
+            !out_root.exists(),
+            "a refused out-root must never be created, even partially"
+        );
+        assert!(!base.path().join(".claude").exists());
     }
 
     #[test]
