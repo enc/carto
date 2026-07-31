@@ -1,0 +1,5 @@
+error[E0599]: no method named `as_ref` found for struct `TaintedString` in the current scope
+ --> tests/ui/no_as_ref_str.rs:5:22
+  |
+5 |     let _s: &str = t.as_ref();
+  |                      ^^^^^^ method not found in `TaintedString`

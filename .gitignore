@@ -1,3 +1,5 @@
 /target
 **/*.snap.new
 .DS_Store
+# trybuild's scratch dir for in-progress compile-fail snapshots
+**/wip/

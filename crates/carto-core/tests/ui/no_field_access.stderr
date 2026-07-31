@@ -1,0 +1,5 @@
+error[E0616]: field `sanitized` of struct `TaintedString` is private
+ --> tests/ui/no_field_access.rs:7:23
+  |
+7 |     let _s: &str = &t.sanitized;
+  |                       ^^^^^^^^^ private field
