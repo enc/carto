@@ -9,9 +9,9 @@
 //! classification, "same-package" -> "same walked repo") is recorded in
 //! `docs/adr/0008-rust-resolution-policy-mapping.md`.
 
-use super::extractor::{ExtractOut, RawCallSite, RawImport};
+use super::extractor::{ExtractOut, RawCallSite, RawImport, RawSymbol};
 use crate::graph::{
-    self, Confidence, Edge, EdgeKind, ModuleNode, Node, NodeId, SymbolNode, UnresolvedCall,
+    self, Confidence, Edge, EdgeKind, ModuleNode, Node, NodeId, SymKind, SymbolNode, UnresolvedCall,
 };
 use crate::taint::{Provenance, TaintedString};
 use std::collections::{BTreeMap, BTreeSet};
@@ -59,6 +59,43 @@ pub fn resolve(extractions: Vec<FileExtraction>) -> ResolvedExtraction {
         .iter()
         .map(|fe| (fe.relpath.as_str(), &fe.file_id))
         .collect();
+
+    // PHP's `use App\Orders\Order;` (ADR-0012, `RawImport::Qualified`) —
+    // a fully-qualified name with no path semantics, resolved against a
+    // repo-wide index instead of a directory walk. `known_namespace_roots`
+    // is the first `\`-segment of every file's declared namespace (a
+    // `use` whose root matches one is internal-but-maybe-unresolvable,
+    // same "internal, no guessing" honesty as an unresolvable `mod`).
+    // `fqn_to_file` maps each *top-level* declaration's fully-qualified
+    // name (namespace + bare name; methods excluded — a `use` never
+    // names a method) to its declaring file. A file with no `namespace`
+    // declaration contributes its bare names under PHP's global
+    // namespace. A colliding key (two files illegally declaring the same
+    // FQN) keeps whichever file is encountered first rather than
+    // erroring — carto only reads source, it doesn't enforce PHP's own
+    // rules.
+    let known_namespace_roots: BTreeSet<&str> = extractions
+        .iter()
+        .filter_map(|fe| fe.extract.declared_namespace.as_deref())
+        .filter_map(|ns| ns.split('\\').next())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let mut fqn_to_file: BTreeMap<String, &NodeId> = BTreeMap::new();
+    for fe in &extractions {
+        let ns = fe.extract.declared_namespace.as_deref().unwrap_or("");
+        for sym in &fe.extract.symbols {
+            if matches!(sym.sym_kind, SymKind::Method) {
+                continue;
+            }
+            let fqn = if ns.is_empty() {
+                sym.name.clone()
+            } else {
+                format!("{ns}\\{}", sym.name)
+            };
+            fqn_to_file.entry(fqn).or_insert(&fe.file_id);
+        }
+    }
 
     // Each symbol's stable ID, indexed the same way as
     // `extractions[i].extract.symbols[j]` so the two stay in lockstep.
@@ -127,6 +164,13 @@ pub fn resolve(extractions: Vec<FileExtraction>) -> ResolvedExtraction {
                 .flat_map(|imp| match imp {
                     RawImport::Relative { imported_names, .. } => imported_names.iter(),
                     RawImport::Absolute { imported_names, .. } => imported_names.iter(),
+                    // A single name — the alias if aliased, else the
+                    // FQN's last segment (see `RawImport::Qualified`'s
+                    // doc comment) — sliced to match the other arms'
+                    // `std::slice::Iter<String>` type.
+                    RawImport::Qualified { bound_name, .. } => {
+                        std::slice::from_ref(bound_name).iter()
+                    }
                 })
                 .map(|s| s.as_str())
                 .collect()
@@ -138,14 +182,14 @@ pub fn resolve(extractions: Vec<FileExtraction>) -> ResolvedExtraction {
     let mut external_modules: BTreeMap<&str, NodeId> = BTreeMap::new();
 
     for (fi, fe) in extractions.iter().enumerate() {
+        let calls_by_symbol =
+            assign_calls_to_innermost_symbol(&fe.extract.symbols, &fe.extract.call_sites);
+
         for (si, sym) in fe.extract.symbols.iter().enumerate() {
             let id = symbol_ids[fi][si].clone();
 
             let mut unresolved_calls = Vec::new();
-            for call in &fe.extract.call_sites {
-                if call.line < sym.start_line || call.line > sym.end_line {
-                    continue; // not textually inside this symbol
-                }
+            for &call in &calls_by_symbol[si] {
                 match resolve_call(fi, call, &same_file_by_name, &imported_names, &pub_by_name) {
                     Some((target_fi, target_si, evidence)) => {
                         let to_id = symbol_ids[target_fi][target_si].clone();
@@ -301,11 +345,106 @@ pub fn resolve(extractions: Vec<FileExtraction>) -> ResolvedExtraction {
                         "external-package".to_string(),
                     ));
                 }
+                RawImport::Qualified { fqn, .. } => {
+                    // PHP's `use App\Orders\Order;` (ADR-0012) — resolved
+                    // against the repo-wide FQN index built above, not a
+                    // directory walk. Three outcomes, in order:
+                    let fqn = fqn.trim_start_matches('\\');
+                    if let Some(&target) = fqn_to_file.get(fqn) {
+                        // 1. Exact FQN match: certain edge to the
+                        //    declaring file.
+                        edges.push(Edge::new(
+                            EdgeKind::Imports,
+                            fe.file_id.clone(),
+                            target.clone(),
+                            Confidence::Certain,
+                            "namespace-import".to_string(),
+                        ));
+                    } else if fqn
+                        .split('\\')
+                        .next()
+                        .is_some_and(|root| known_namespace_roots.contains(root))
+                    {
+                        // 2. Internal namespace root, but no file
+                        //    declares this exact FQN: honest omission
+                        //    (INV-8) rather than a guess — no edge, no
+                        //    node.
+                    } else {
+                        // 3. Unknown root: an external package, same
+                        //    dedup-by-root treatment as `Absolute`.
+                        let root = fqn.split('\\').next().unwrap_or(fqn);
+                        let module_id = external_modules
+                            .entry(root)
+                            .or_insert_with(|| {
+                                let id = graph::module_id(root, true);
+                                nodes.push(Node::module(
+                                    id.clone(),
+                                    Provenance::Syntactic,
+                                    fe.origin,
+                                    ModuleNode {
+                                        path: root.to_string(),
+                                        external: true,
+                                    },
+                                ));
+                                id
+                            })
+                            .clone();
+                        edges.push(Edge::new(
+                            EdgeKind::Imports,
+                            fe.file_id.clone(),
+                            module_id,
+                            Confidence::Certain,
+                            "external-package".to_string(),
+                        ));
+                    }
+                }
             }
         }
     }
 
     ResolvedExtraction { nodes, edges }
+}
+
+/// Assigns each call site to the *innermost* symbol whose line range
+/// contains it, rather than every symbol whose range does. A
+/// class/interface/trait/enum symbol's own range spans its methods'
+/// bodies too (PHP, Python — a Rust `struct`/`impl` doesn't have this
+/// shape, since an `impl` block itself is never a symbol), so naive
+/// per-symbol containment would attribute a method's call to both the
+/// method *and* its enclosing class: two `calls` edges (or two
+/// `unresolved_calls` entries) for what is textually one call site —
+/// caught by eyeballing real `fixtures/php-app` output (ADR-0012), not
+/// by a unit test on an isolated snippet, since `fixtures/py-lib`
+/// happens to have no call site inside a class body's methods and never
+/// exercised this. Ties (two symbols with identical ranges) fall back to
+/// whichever is encountered first — doesn't arise from any current
+/// extractor, which never emits two symbols with identical ranges.
+fn assign_calls_to_innermost_symbol<'a>(
+    symbols: &[RawSymbol],
+    call_sites: &'a [RawCallSite],
+) -> Vec<Vec<&'a RawCallSite>> {
+    let mut by_symbol: Vec<Vec<&RawCallSite>> = vec![Vec::new(); symbols.len()];
+    for call in call_sites {
+        let mut best: Option<usize> = None;
+        for (si, sym) in symbols.iter().enumerate() {
+            if call.line < sym.start_line || call.line > sym.end_line {
+                continue; // not textually inside this symbol
+            }
+            let smaller = match best {
+                None => true,
+                Some(b) => {
+                    (sym.end_line - sym.start_line) < (symbols[b].end_line - symbols[b].start_line)
+                }
+            };
+            if smaller {
+                best = Some(si);
+            }
+        }
+        if let Some(si) = best {
+            by_symbol[si].push(call);
+        }
+    }
+    by_symbol
 }
 
 /// Spec §5.3 rule 2, in order, first match wins: (a) same-file, (b)
@@ -655,6 +794,125 @@ mod tests {
 
         let out = resolve(vec![python_file, orders, handlers]);
         assert_eq!(imports_edges(&out.edges).len(), 2);
+    }
+
+    #[test]
+    fn php_qualified_import_resolves_via_fqn_index() {
+        // `use App\Orders\Order;` in Handlers.php, matched against
+        // Orders.php's `namespace App\Orders; class Order { .. }` — the
+        // repo-wide FQN index (ADR-0012), not a directory walk.
+        let mut orders = file("src/Orders.php");
+        orders.origin = "lang-php@1";
+        orders.extract.declared_namespace = Some("App\\Orders".into());
+        orders.extract.symbols = vec![sym("Order", SymKind::Class, 1, 5, true)];
+
+        let mut handlers = file("src/Handlers.php");
+        handlers.origin = "lang-php@1";
+        handlers.extract.imports = vec![RawImport::Qualified {
+            fqn: "App\\Orders\\Order".into(),
+            bound_name: "Order".into(),
+        }];
+
+        let out = resolve(vec![handlers, orders]);
+        let imports = imports_edges(&out.edges);
+        assert_eq!(imports.len(), 1);
+        assert_eq!(imports[0].confidence, Confidence::Certain);
+        assert_eq!(imports[0].evidence, vec!["namespace-import".to_string()]);
+    }
+
+    #[test]
+    fn php_qualified_import_with_known_root_but_no_fqn_match_produces_no_edge() {
+        // `App` is a known namespace root (some file declares `namespace
+        // App\Orders;`), but no file declares exactly `App\Missing\Thing`
+        // -- internal but unresolvable, honest omission (INV-8), not an
+        // external module.
+        let mut orders = file("src/Orders.php");
+        orders.origin = "lang-php@1";
+        orders.extract.declared_namespace = Some("App\\Orders".into());
+        orders.extract.symbols = vec![sym("Order", SymKind::Class, 1, 5, true)];
+
+        let mut handlers = file("src/Handlers.php");
+        handlers.origin = "lang-php@1";
+        handlers.extract.imports = vec![RawImport::Qualified {
+            fqn: "App\\Missing\\Thing".into(),
+            bound_name: "Thing".into(),
+        }];
+
+        let out = resolve(vec![handlers, orders]);
+        assert!(imports_edges(&out.edges).is_empty());
+        assert!(
+            out.nodes
+                .iter()
+                .all(|n| !matches!(n.data, NodeData::Module(_)))
+        );
+    }
+
+    #[test]
+    fn php_qualified_import_with_unknown_root_produces_external_module_node() {
+        let mut handlers = file("src/Handlers.php");
+        handlers.origin = "lang-php@1";
+        handlers.extract.imports = vec![RawImport::Qualified {
+            fqn: "Psr\\Log\\LoggerInterface".into(),
+            bound_name: "LoggerInterface".into(),
+        }];
+
+        let out = resolve(vec![handlers]);
+        let module_nodes: Vec<&ModuleNode> = out
+            .nodes
+            .iter()
+            .filter_map(|n| match &n.data {
+                NodeData::Module(m) => Some(m),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(module_nodes.len(), 1);
+        assert_eq!(module_nodes[0].path, "Psr");
+        assert!(module_nodes[0].external);
+
+        let imports = imports_edges(&out.edges);
+        assert_eq!(imports.len(), 1);
+        assert_eq!(imports[0].confidence, Confidence::Certain);
+        assert_eq!(imports[0].evidence, vec!["external-package".to_string()]);
+    }
+
+    #[test]
+    fn php_qualified_import_resolves_call_via_tier_b() {
+        // `use App\Orders\parseOrder;` (unaliased) makes `parseOrder`
+        // resolve via tier (b) exactly like Rust's `use` / Python's
+        // `from .. import` — tier (b) matches the call site's own
+        // identifier against `pub_by_name`'s bare-name key, so it only
+        // works when the two spellings coincide, same as both other
+        // languages. An *aliased* `use ... as X` (`bound_name: "X"`)
+        // registers "X" as imported for `imported_names`, but a call
+        // written as `X(...)` still won't resolve through `pub_by_name`
+        // (keyed by the symbol's real declared name, "parseOrder", not
+        // its alias) -- a limitation this shares with Python's own
+        // aliased `from x import y as z`, not something new to PHP or
+        // fixed by this slice.
+        let mut orders = file("src/Orders.php");
+        orders.origin = "lang-php@1";
+        orders.extract.declared_namespace = Some("App\\Orders".into());
+        orders.extract.symbols = vec![sym("parseOrder", SymKind::Function, 1, 3, true)];
+
+        let mut handlers = file("src/Handlers.php");
+        handlers.origin = "lang-php@1";
+        handlers.extract.imports = vec![RawImport::Qualified {
+            fqn: "App\\Orders\\parseOrder".into(),
+            bound_name: "parseOrder".into(),
+        }];
+        handlers.extract.symbols = vec![sym("handle", SymKind::Function, 5, 8, true)];
+        handlers.extract.call_sites = vec![call("parseOrder", 6)];
+
+        let out = resolve(vec![handlers, orders]);
+        assert!(
+            find_symbol(&out.nodes, "handle")
+                .unresolved_calls
+                .is_empty()
+        );
+        assert_eq!(
+            calls_edges(&out.edges)[0].evidence,
+            vec!["imported".to_string()]
+        );
     }
 
     #[test]

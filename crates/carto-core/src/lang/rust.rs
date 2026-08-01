@@ -49,6 +49,7 @@ impl LangExtractor for RustExtractor {
             symbols: extract_symbols(root, src),
             imports: extract_imports(root, src),
             call_sites: extract_call_sites(root, src),
+            declared_namespace: None,
         }
     }
 }

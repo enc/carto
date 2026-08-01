@@ -81,6 +81,19 @@ pub enum RawImport {
         root: String,
         imported_names: Vec<String>,
     },
+    /// A fully-qualified-name import with no path semantics at all —
+    /// PHP's `use App\Orders\Order;` (ADR-0012). Unlike `Relative`
+    /// (path arithmetic from the declaring file) and `Absolute` (a
+    /// package root, classified internal/external by name alone), PHP's
+    /// `use` names a fully-qualified symbol resolved by composer
+    /// autoloading at runtime — there is no directory to walk and no
+    /// meaningful "root" to classify by itself. `resolve` matches `fqn`
+    /// against a repo-wide index built from every file's own `namespace`
+    /// declaration (see `resolve::resolve`'s `fqn_to_file`), not by
+    /// walking directories. `bound_name` is the alias if the `use` has
+    /// one, else the FQN's last segment — the identifier tier (b) calls
+    /// are actually written with in source.
+    Qualified { fqn: String, bound_name: String },
 }
 
 /// A call expression's callee, before resolution. `line` locates it for
@@ -100,6 +113,12 @@ pub struct ExtractOut {
     pub symbols: Vec<RawSymbol>,
     pub imports: Vec<RawImport>,
     pub call_sites: Vec<RawCallSite>,
+    /// The file's declared namespace, PHP's `namespace App\Orders;`
+    /// (ADR-0012) — `None` for a file with no namespace declaration
+    /// (PHP's global namespace) and always `None` for Rust/Python, which
+    /// have no equivalent. Feeds `resolve`'s repo-wide FQN index; not
+    /// itself a `RawImport`, since it isn't an import.
+    pub declared_namespace: Option<String>,
 }
 
 pub trait LangExtractor {
