@@ -1,13 +1,16 @@
 //! Language identification (spec §5.2) and the `LangExtractor` trait +
-//! its implementations. Rust (M1.b.2a) and Python (M1.b.2b) exist;
-//! TS/TSX, JS, Go follow in later slices, reusing [`extractor`]'s types.
+//! its implementations. Rust (M1.b.2a), Python (M1.b.2b), and PHP
+//! (ADR-0012) exist; TS/TSX, JS, Go follow in later slices, reusing
+//! [`extractor`]'s types.
 
 pub mod extractor;
+pub mod php;
 pub mod python;
 pub mod resolve;
 pub mod rust;
 
 pub use extractor::{ExtractOut, LangExtractor, RawCallSite, RawImport, RawSymbol};
+pub use php::PhpExtractor;
 pub use python::PythonExtractor;
 pub use resolve::{FileExtraction, ResolvedExtraction, resolve};
 pub use rust::RustExtractor;
@@ -16,9 +19,10 @@ use crate::graph::Node;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-/// The v1 language set (spec §5.2), plus `Other`/`PlainText` for anything
-/// `walk` sees that isn't in that set yet (M1.b.1 has no extractors, so
-/// every file is currently either recognized-by-extension or `Other`).
+/// The v1 language set (spec §5.2 — amended by ADR-0012 to include PHP),
+/// plus `Other`/`PlainText` for anything `walk` sees that isn't in that
+/// set yet (M1.b.1 has no extractors, so every file is currently either
+/// recognized-by-extension or `Other`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Lang {
@@ -28,6 +32,7 @@ pub enum Lang {
     Python,
     Rust,
     Go,
+    Php,
     Hcl,
     Yaml,
     Json,
@@ -50,6 +55,7 @@ impl Lang {
             "py" | "pyi" => Lang::Python,
             "rs" => Lang::Rust,
             "go" => Lang::Go,
+            "php" => Lang::Php,
             "tf" | "tfvars" | "hcl" => Lang::Hcl,
             "yaml" | "yml" => Lang::Yaml,
             "json" => Lang::Json,
@@ -66,7 +72,11 @@ impl Lang {
 /// regardless of extraction order, and a file only ever matches exactly
 /// one extractor (by `Lang`).
 fn extractors() -> Vec<Box<dyn LangExtractor>> {
-    vec![Box::new(RustExtractor), Box::new(PythonExtractor)]
+    vec![
+        Box::new(RustExtractor),
+        Box::new(PythonExtractor),
+        Box::new(PhpExtractor),
+    ]
 }
 
 /// Orchestrates extraction + resolution for every walked `File` node
@@ -124,6 +134,7 @@ mod tests {
         assert_eq!(Lang::from_extension("py"), Lang::Python);
         assert_eq!(Lang::from_extension("rs"), Lang::Rust);
         assert_eq!(Lang::from_extension("go"), Lang::Go);
+        assert_eq!(Lang::from_extension("php"), Lang::Php);
         assert_eq!(Lang::from_extension("tf"), Lang::Hcl);
         assert_eq!(Lang::from_extension("yaml"), Lang::Yaml);
         assert_eq!(Lang::from_extension("json"), Lang::Json);
