@@ -43,22 +43,41 @@ pub struct RawSymbol {
 /// A raw import, not yet resolved to a target file or classified as
 /// external (spec §5.3 rule 1 — `resolve`'s job, since it needs to know
 /// about every other file in the repo, not just this one).
+///
+/// Generalized (M1.b.2b) from an earlier Rust-only `ModDecl`/`UseDecl`
+/// shape to cover Python's genuinely different import model — real
+/// dotted-relative imports (`from ..pkg import x`) that nothing in
+/// Rust's `mod`/`use` system has — without a third, language-specific
+/// variant. See `docs/adr/0011-python-resolution-policy-mapping.md`.
 pub enum RawImport {
-    /// A Rust `mod <name>;` declaration (no body — an inline `mod foo {
-    /// .. }` is a namespace, not a file reference, and isn't resolved to
-    /// another `File` node this slice).
-    ModDecl { name: String },
-    /// A Rust `use <path>;` declaration. `root` is the path's first
-    /// segment (`crate`/`self`/`super`/a module name/a crate name);
-    /// `imported_name`, when the path names a single specific item
-    /// (`use a::b::c;` -> `Some("c")`), seeds spec §5.3 rule 2's
-    /// "imported into the file" call-resolution tier. `use_list`
-    /// (`use a::{b, c};`), `use_wildcard` (`use a::*;`), and
-    /// `use_as_clause` (`use a::b as c;`) are not extracted this slice —
-    /// deliberately modest (§5.3), documented in ADR-0008.
-    UseDecl {
+    /// Resolved relative to the *declaring file's own directory* —
+    /// Rust's `mod <name>;` (`levels_up: 0`, `module_path: name`,
+    /// `imported_names: vec![]` — the import refers to the module file
+    /// itself, not a name within it; an inline `mod foo { .. }` is a
+    /// namespace, not a file reference, and isn't extracted at all).
+    /// Python's `from .pkg import a, b` (`levels_up: 1`, `module_path:
+    /// "pkg"`, `imported_names: ["a", "b"]`) and `from . import pkg`
+    /// (`levels_up: 1`, `module_path: ""`, each entry of
+    /// `imported_names` itself a submodule name to resolve relative to
+    /// the current directory).
+    Relative {
+        levels_up: u32,
+        module_path: String,
+        imported_names: Vec<String>,
+    },
+    /// Not resolved relative to the declaring file. Rust's `use
+    /// crate::a::b;` (`root: "crate"`, `imported_names: ["b"]`) and
+    /// `use serde;` (`root: "serde"`, `imported_names: ["serde"]`).
+    /// Python's `import os` (`root: "os"`, `imported_names: ["os"]`)
+    /// and `from pkg import a, b` (`root: "pkg"`, `imported_names: ["a",
+    /// "b"]`). Rust's `use_list` (`use a::{b, c};`), `use_wildcard`
+    /// (`use a::*;`), and `use_as_clause` (`use a::b as c;`) are not
+    /// extracted — deliberately modest (§5.3), documented in ADR-0008;
+    /// Python's wildcard `from x import *` is excluded the same way,
+    /// documented in ADR-0011.
+    Absolute {
         root: String,
-        imported_name: Option<String>,
+        imported_names: Vec<String>,
     },
 }
 

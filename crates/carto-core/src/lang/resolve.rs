@@ -37,12 +37,19 @@ pub fn resolve(extractions: Vec<FileExtraction>) -> ResolvedExtraction {
     // Every top-level `mod <name>;` declared anywhere — a `use` path
     // whose root matches one of these is treated as internal (spec §5.3
     // rule 1's "package imports become Module nodes" only applies to the
-    // ones that don't).
+    // ones that don't). `Relative` with non-empty `imported_names` is
+    // Python's shape (`from .pkg import a`), not Rust's `mod` shape, so
+    // it's excluded here — Rust's `mod foo;` always has empty
+    // `imported_names` (see `RawImport::Relative`'s doc comment).
     let known_modules: BTreeSet<&str> = extractions
         .iter()
         .flat_map(|fe| &fe.extract.imports)
         .filter_map(|imp| match imp {
-            RawImport::ModDecl { name } => Some(name.as_str()),
+            RawImport::Relative {
+                module_path,
+                imported_names,
+                ..
+            } if imported_names.is_empty() => Some(module_path.as_str()),
             _ => None,
         })
         .collect();
@@ -103,21 +110,24 @@ pub fn resolve(extractions: Vec<FileExtraction>) -> ResolvedExtraction {
         }
     }
 
-    // Which bare names this file's `use` declarations mention (tier b's
-    // precondition — still needs a unique `pub_by_name` match to resolve).
+    // Which bare names this file's imports mention (tier b's
+    // precondition — still needs a unique `pub_by_name` match to
+    // resolve). Both variants carry `imported_names`; Rust's `Relative`
+    // (a `mod` declaration) always has it empty, so only `Absolute`
+    // (`use`) contributes for Rust today — same resulting set as
+    // before this field became `Vec<String>` instead of
+    // `Option<String>`.
     let imported_names: Vec<BTreeSet<&str>> = extractions
         .iter()
         .map(|fe| {
             fe.extract
                 .imports
                 .iter()
-                .filter_map(|imp| match imp {
-                    RawImport::UseDecl {
-                        imported_name: Some(n),
-                        ..
-                    } => Some(n.as_str()),
-                    _ => None,
+                .flat_map(|imp| match imp {
+                    RawImport::Relative { imported_names, .. } => imported_names.iter(),
+                    RawImport::Absolute { imported_names, .. } => imported_names.iter(),
                 })
+                .map(|s| s.as_str())
                 .collect()
         })
         .collect();
@@ -185,18 +195,37 @@ pub fn resolve(extractions: Vec<FileExtraction>) -> ResolvedExtraction {
 
         for imp in &fe.extract.imports {
             match imp {
-                RawImport::ModDecl { name } => {
-                    if let Some(target) = resolve_mod_decl(&fe.relpath, name, &relpath_to_file_id) {
-                        edges.push(Edge::new(
-                            EdgeKind::Imports,
-                            fe.file_id.clone(),
-                            target.clone(),
-                            Confidence::Certain,
-                            "mod-declaration".to_string(),
-                        ));
+                RawImport::Relative {
+                    levels_up,
+                    module_path,
+                    imported_names,
+                } => {
+                    // Rust's `mod foo;` shape: the import refers to the
+                    // module file itself, not a name within it.
+                    // `Relative` with non-empty `imported_names`
+                    // (Python's `from .pkg import a, b` / `from .
+                    // import pkg`) isn't produced by any extractor yet
+                    // — handled when the Python extractor lands
+                    // (M1.b.2b), designed against its own fixture
+                    // rather than guessed here.
+                    if imported_names.is_empty() {
+                        if let Some(target) = resolve_relative_import(
+                            &fe.relpath,
+                            *levels_up,
+                            module_path,
+                            &relpath_to_file_id,
+                        ) {
+                            edges.push(Edge::new(
+                                EdgeKind::Imports,
+                                fe.file_id.clone(),
+                                target.clone(),
+                                Confidence::Certain,
+                                "mod-declaration".to_string(),
+                            ));
+                        }
                     }
                 }
-                RawImport::UseDecl { root, .. } => {
+                RawImport::Absolute { root, .. } => {
                     let is_internal = root == "crate"
                         || root == "self"
                         || root == "super"
@@ -270,28 +299,49 @@ fn resolve_call(
     None
 }
 
-/// Resolves a `mod <name>;` declaration in `declaring_relpath` to a
-/// sibling file: `<dir>/<name>.rs` or `<dir>/<name>/mod.rs` (the common
-/// case — `#[path]` overrides and other edition-2018+ corner cases are
-/// out of scope, spec §5.3 "deliberately modest"). String-joined rather
-/// than `std::path::Path`-joined: repo-relative paths are always
+/// Resolves a relative import (Rust's `mod <name>;`, `levels_up` always
+/// 0; Python's `from <dots><module_path> import ...`, `levels_up` = dot
+/// count) to a sibling/ancestor file. Walks `levels_up` directories up
+/// from `declaring_relpath`'s own directory, then looks for
+/// `<dir>/<module_path>.<ext>` or `<dir>/<module_path>/<package-marker>`
+/// — the common case in either language (`#[path]` overrides, Python
+/// namespace packages, and other edition/interpreter-version corner
+/// cases are out of scope, spec §5.3 "deliberately modest"). Which
+/// suffix pair to try is inferred from `declaring_relpath`'s own
+/// extension: a `mod` declaration only ever appears in a `.rs` file, and
+/// a Python relative import only ever appears in a `.py` file, so the
+/// declaring file's extension is sufficient — no need to thread the
+/// caller's language through separately. String-joined rather than
+/// `std::path::Path`-joined: repo-relative paths are always
 /// `/`-separated regardless of host OS (spec §4.1), and `Path::join` on
 /// Windows would introduce a `\`-separated key that can't match the
 /// `/`-keyed lookup table built from `walk`'s output.
-fn resolve_mod_decl<'a>(
+fn resolve_relative_import<'a>(
     declaring_relpath: &str,
-    mod_name: &str,
+    levels_up: u32,
+    module_path: &str,
     relpath_to_file_id: &BTreeMap<&str, &'a NodeId>,
 ) -> Option<&'a NodeId> {
-    let dir = declaring_relpath
+    let mut dir = declaring_relpath
         .rsplit_once('/')
         .map(|(d, _)| d)
         .unwrap_or("");
-    let candidate_a = join(dir, &format!("{mod_name}.rs"));
-    let candidate_b = join(dir, &format!("{mod_name}/mod.rs"));
-    relpath_to_file_id
-        .get(candidate_a.as_str())
-        .or_else(|| relpath_to_file_id.get(candidate_b.as_str()))
+    for _ in 0..levels_up {
+        dir = dir.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
+    }
+
+    let ext = declaring_relpath.rsplit_once('.').map(|(_, e)| e);
+    let candidates = match ext {
+        Some("py") => [
+            format!("{module_path}.py"),
+            format!("{module_path}/__init__.py"),
+        ],
+        _ => [format!("{module_path}.rs"), format!("{module_path}/mod.rs")],
+    };
+
+    candidates
+        .iter()
+        .find_map(|c| relpath_to_file_id.get(join(dir, c).as_str()))
         .copied()
 }
 
@@ -382,9 +432,9 @@ mod tests {
     #[test]
     fn imported_call_resolves_via_use_when_unique() {
         let mut handlers = file("src/handlers.rs");
-        handlers.extract.imports = vec![RawImport::UseDecl {
+        handlers.extract.imports = vec![RawImport::Absolute {
             root: "crate".into(),
-            imported_name: Some("parse_order".into()),
+            imported_names: vec!["parse_order".into()],
         }];
         handlers.extract.symbols = vec![sym("handle", SymKind::Function, 1, 5, true)];
         handlers.extract.call_sites = vec![call("parse_order", 3)];
@@ -463,8 +513,10 @@ mod tests {
     #[test]
     fn mod_declaration_resolves_to_sibling_file() {
         let mut lib = file("src/lib.rs");
-        lib.extract.imports = vec![RawImport::ModDecl {
-            name: "orders".into(),
+        lib.extract.imports = vec![RawImport::Relative {
+            levels_up: 0,
+            module_path: "orders".into(),
+            imported_names: vec![],
         }];
         let orders = file("src/orders.rs");
 
@@ -478,8 +530,10 @@ mod tests {
     #[test]
     fn mod_declaration_resolves_to_mod_rs_in_subdirectory() {
         let mut lib = file("src/lib.rs");
-        lib.extract.imports = vec![RawImport::ModDecl {
-            name: "orders".into(),
+        lib.extract.imports = vec![RawImport::Relative {
+            levels_up: 0,
+            module_path: "orders".into(),
+            imported_names: vec![],
         }];
         let orders = file("src/orders/mod.rs");
 
@@ -490,8 +544,10 @@ mod tests {
     #[test]
     fn unresolvable_mod_declaration_produces_no_edge() {
         let mut lib = file("src/lib.rs");
-        lib.extract.imports = vec![RawImport::ModDecl {
-            name: "missing".into(),
+        lib.extract.imports = vec![RawImport::Relative {
+            levels_up: 0,
+            module_path: "missing".into(),
+            imported_names: vec![],
         }];
 
         let out = resolve(vec![lib]);
@@ -501,14 +557,14 @@ mod tests {
     #[test]
     fn external_use_produces_one_deduped_module_node_with_edges_from_each_file() {
         let mut a = file("src/a.rs");
-        a.extract.imports = vec![RawImport::UseDecl {
+        a.extract.imports = vec![RawImport::Absolute {
             root: "serde".into(),
-            imported_name: Some("Deserialize".into()),
+            imported_names: vec!["Deserialize".into()],
         }];
         let mut b = file("src/b.rs");
-        b.extract.imports = vec![RawImport::UseDecl {
+        b.extract.imports = vec![RawImport::Absolute {
             root: "serde".into(),
-            imported_name: Some("Serialize".into()),
+            imported_names: vec!["Serialize".into()],
         }];
 
         let out = resolve(vec![a, b]);
@@ -532,9 +588,9 @@ mod tests {
     #[test]
     fn crate_prefixed_use_does_not_produce_module_node_or_edge() {
         let mut f = file("src/handlers.rs");
-        f.extract.imports = vec![RawImport::UseDecl {
+        f.extract.imports = vec![RawImport::Absolute {
             root: "crate".into(),
-            imported_name: Some("parse_order".into()),
+            imported_names: vec!["parse_order".into()],
         }];
 
         let out = resolve(vec![f]);
@@ -549,13 +605,15 @@ mod tests {
     #[test]
     fn known_local_module_use_does_not_produce_module_node() {
         let mut lib = file("src/lib.rs");
-        lib.extract.imports = vec![RawImport::ModDecl {
-            name: "orders".into(),
+        lib.extract.imports = vec![RawImport::Relative {
+            levels_up: 0,
+            module_path: "orders".into(),
+            imported_names: vec![],
         }];
         let mut handlers = file("src/handlers.rs");
-        handlers.extract.imports = vec![RawImport::UseDecl {
+        handlers.extract.imports = vec![RawImport::Absolute {
             root: "orders".into(),
-            imported_name: Some("parse_order".into()),
+            imported_names: vec!["parse_order".into()],
         }];
 
         let out = resolve(vec![lib, handlers]);

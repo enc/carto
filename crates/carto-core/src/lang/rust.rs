@@ -175,8 +175,10 @@ fn extract_imports(root: Node, src: &[u8]) -> Vec<RawImport> {
                     // file reference — not extracted this slice.
                     if cap.node.child_by_field_name("body").is_none() {
                         if let Some(name_node) = cap.node.child_by_field_name("name") {
-                            out.push(RawImport::ModDecl {
-                                name: text(src, name_node),
+                            out.push(RawImport::Relative {
+                                levels_up: 0,
+                                module_path: text(src, name_node),
+                                imported_names: vec![],
                             });
                         }
                     }
@@ -184,9 +186,9 @@ fn extract_imports(root: Node, src: &[u8]) -> Vec<RawImport> {
                 "use.decl" => {
                     if let Some(arg) = cap.node.child_by_field_name("argument") {
                         if let Some((root_seg, imported_name)) = walk_use_tree(arg, src) {
-                            out.push(RawImport::UseDecl {
+                            out.push(RawImport::Absolute {
                                 root: root_seg,
-                                imported_name,
+                                imported_names: vec![imported_name],
                             });
                         }
                     }
@@ -198,7 +200,9 @@ fn extract_imports(root: Node, src: &[u8]) -> Vec<RawImport> {
     out
 }
 
-/// Walks a `use` argument tree, returning `(root_segment, imported_name)`.
+/// Walks a `use` argument tree, returning `(root_segment, imported_name)`
+/// — both always present when this returns `Some` at all (a `use`
+/// declaration this function recognizes always names exactly one item).
 /// Handles plain paths (`use crate::orders::parse_order;`,
 /// `use serde;`) at arbitrary depth by following the `scoped_identifier`
 /// chain's `path` field to its leftmost leaf. Deliberately does not
@@ -206,14 +210,14 @@ fn extract_imports(root: Node, src: &[u8]) -> Vec<RawImport> {
 /// `use_as_clause` (`use a::b as c;`) — returns `None`, extracting
 /// nothing for that declaration rather than guessing (spec §5.3
 /// "deliberately modest"; ADR-0008).
-fn walk_use_tree(node: Node, src: &[u8]) -> Option<(String, Option<String>)> {
+fn walk_use_tree(node: Node, src: &[u8]) -> Option<(String, String)> {
     if node.kind() == "scoped_identifier" {
         let path = node.child_by_field_name("path")?;
         let name = node.child_by_field_name("name")?;
-        Some((leftmost_text(path, src), Some(text(src, name))))
+        Some((leftmost_text(path, src), text(src, name)))
     } else if node.kind() == "identifier" || node.kind() == "crate" || node.kind() == "self" {
         let t = text(src, node);
-        Some((t.clone(), Some(t)))
+        Some((t.clone(), t))
     } else {
         None
     }
@@ -352,7 +356,7 @@ mod tests {
             .imports
             .iter()
             .filter_map(|i| match i {
-                RawImport::ModDecl { name } => Some(name.as_str()),
+                RawImport::Relative { module_path, .. } => Some(module_path.as_str()),
                 _ => None,
             })
             .collect();
@@ -362,19 +366,19 @@ mod tests {
     #[test]
     fn extracts_use_declaration_root_and_imported_name() {
         let out = extract("use crate::orders::parse_order;\nuse serde;\n");
-        let uses: Vec<(&str, Option<&str>)> = out
+        let uses: Vec<(&str, &str)> = out
             .imports
             .iter()
             .filter_map(|i| match i {
-                RawImport::UseDecl {
+                RawImport::Absolute {
                     root,
-                    imported_name,
-                } => Some((root.as_str(), imported_name.as_deref())),
+                    imported_names,
+                } => Some((root.as_str(), imported_names[0].as_str())),
                 _ => None,
             })
             .collect();
-        assert!(uses.contains(&("crate", Some("parse_order"))));
-        assert!(uses.contains(&("serde", Some("serde"))));
+        assert!(uses.contains(&("crate", "parse_order")));
+        assert!(uses.contains(&("serde", "serde")));
     }
 
     #[test]
