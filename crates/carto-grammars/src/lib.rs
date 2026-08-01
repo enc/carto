@@ -36,6 +36,31 @@ pub fn php_language() -> tree_sitter::Language {
     tree_sitter_php::LANGUAGE_PHP.into()
 }
 
+/// TypeScript grammar (fourth/fifth/sixth languages, ADR-0013).
+/// `tree-sitter-typescript` exposes two grammars from one crate —
+/// `LANGUAGE_TYPESCRIPT` (no JSX) and `LANGUAGE_TSX` (JSX; see
+/// [`tsx_language`]) — verified structurally near-identical for
+/// symbols/imports/calls, which is why `lang::ecma` shares one
+/// extraction module across both plus JavaScript. Same
+/// `LanguageFn -> Language` conversion as the others, no `unsafe`
+/// needed for the same reason.
+#[cfg(feature = "native-grammars")]
+pub fn typescript_language() -> tree_sitter::Language {
+    tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
+}
+
+/// TSX grammar — see [`typescript_language`].
+#[cfg(feature = "native-grammars")]
+pub fn tsx_language() -> tree_sitter::Language {
+    tree_sitter_typescript::LANGUAGE_TSX.into()
+}
+
+/// JavaScript grammar — see [`typescript_language`].
+#[cfg(feature = "native-grammars")]
+pub fn javascript_language() -> tree_sitter::Language {
+    tree_sitter_javascript::LANGUAGE.into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -65,6 +90,30 @@ mod tests {
         let mut parser = tree_sitter::Parser::new();
         parser.set_language(&php_language()).expect(
             "tree-sitter-php's language must be compatible with the linked tree-sitter runtime",
+        );
+    }
+
+    #[test]
+    fn typescript_language_loads_without_panicking() {
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&typescript_language()).expect(
+            "tree-sitter-typescript's language must be compatible with the linked tree-sitter runtime",
+        );
+    }
+
+    #[test]
+    fn tsx_language_loads_without_panicking() {
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&tsx_language()).expect(
+            "tree-sitter-typescript's TSX language must be compatible with the linked tree-sitter runtime",
+        );
+    }
+
+    #[test]
+    fn javascript_language_loads_without_panicking() {
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&javascript_language()).expect(
+            "tree-sitter-javascript's language must be compatible with the linked tree-sitter runtime",
         );
     }
 }
