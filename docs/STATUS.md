@@ -32,6 +32,15 @@ so they've been subdivided. Current state:
   unfixed) — current head. Go not started.
 - **M2+** — infra graph, join, MCP, ingest, real redaction. Per spec §10.
 
+Post-M1.b.2b hardening (2026-08-01): real-world PHP field-testing
+against a TYPO3 codebase surfaced two query-layer gaps, both fixed —
+`deps` now surfaces the root symbol's `unresolved_calls` (a large
+static-utility-class root returning zero outbound edges was previously
+indistinguishable from "calls nothing"), and `where`/`deps`/`map` gained
+`--subpath <dir>` scoping (the positional `PATH` argument never scoped
+an already-built `--out` index; there was no subtree-scoping mechanism
+at all). See [ADR-0014](adr/0014-subpath-scoping.md).
+
 ## Deliberately absent — not gaps, not bugs
 
 Do not "fix" these without checking the linked reasoning first:
@@ -134,6 +143,24 @@ Do not "fix" these without checking the linked reasoning first:
   Relative-import extension-guessing (`.ts`/`.tsx`/`.js`/`.jsx`/
   `/index.*`) is a fixed priority order, not real bundler/tsconfig
   resolution. ADR-0013.
+- **`deps` surfaces `unresolved_calls` on the root symbol only, not
+  per-hop** — directly answers "why is `--dir out` empty" without
+  bloating every row of a possibly-large traversal. Broaden to
+  per-node only if a concrete need shows up. ADR-0014 (recorded
+  alongside `--subpath` since both came from the same round of
+  real-world feedback).
+- **`--subpath` restricts which rows get listed, never what a
+  command's underlying computation is based on** — a file's fan-in/out
+  in `map`'s ranking is always its real, whole-repo connectivity, not
+  clipped at the subtree boundary; `deps`'s BFS traversal itself is
+  never scoped, only which discovered nodes get reported. The one
+  deliberate exception: `map`'s external-package fan-in *is* scoped
+  (counts only edges from in-scope files) — the opposite rule from the
+  file ranking, on purpose, not an inconsistency. ADR-0014.
+- **`Module` nodes are never excluded by `--subpath`** — packages have
+  no directory, so path-prefix filtering doesn't apply to them
+  directly; they only disappear from a scoped `map` ranking by having
+  zero edges with an in-scope endpoint. ADR-0014.
 
 ## Next: M1.b.2b continued (Go)
 
