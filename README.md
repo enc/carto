@@ -67,7 +67,7 @@ the CLI by adding a short note to the *target* repo's own `CLAUDE.md`
 ```markdown
 ## Code navigation
 
-This repo is indexed with `carto` (github.com/carto/carto). Prefer it
+This repo is indexed with `carto` (github.com/enc/carto). Prefer it
 over grep/rg for symbol lookups and call-graph questions:
 
     carto index . --out /tmp/carto-out           # once per session, or after a large change
