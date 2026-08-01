@@ -1,6 +1,6 @@
 # carto — status / handoff
 
-**Milestone:** M1.b.2b in progress (Python done; TS/TSX, JS, Go not started)
+**Milestone:** M1.b.2b in progress (Python, PHP done; TS/TSX, JS, Go not started)
 
 Where the implementation is in the milestone sequence, what's deliberately
 absent, and what's next. Everything else lives elsewhere on purpose:
@@ -25,8 +25,9 @@ so they've been subdivided. Current state:
   adjacency index (ADR-0009/0010). Done. Taken ahead of M1.b.2b — no new
   deps/grammar work, and it closes ADR-0005's traversal deferral against
   real requirements instead of speculatively.
-- **M1.b.2b** — TS/TSX, JS, Python, Go extractors. **Python done**
-  (ADR-0011) — current head. TS/TSX, JS, Go not started.
+- **M1.b.2b** — TS/TSX, JS, Python, Go, PHP extractors (PHP added to the
+  v1 set post-M1.b.2a, ADR-0012). **Python done** (ADR-0011), **PHP
+  done** (ADR-0012) — current head. TS/TSX, JS, Go not started.
 - **M2+** — infra graph, join, MCP, ingest, real redaction. Per spec §10.
 
 ## Deliberately absent — not gaps, not bugs
@@ -91,22 +92,49 @@ Do not "fix" these without checking the linked reasoning first:
 - **Query-layer `--json` output never fences tainted text; human output
   fences once per section, not once per row** —
   [ADR-0010](adr/0010-tainted-text-in-query-output.md).
+- **PHP `require`/`include` are not extracted** — the argument is an
+  arbitrary runtime expression in the general case; the FQN index
+  already covers real (autoloaded) dependency structure — ADR-0012.
+- **PHP anonymous classes' methods are never extracted** — anonymous
+  classes have no `name:` field, so they never match `symbols.scm`'s
+  four class-like-container patterns. ADR-0012.
+- **An aliased `use ... as X` import doesn't make a call written as
+  `X(...)` resolve via tier (b)**, for PHP or Python — `resolve.rs`
+  matches the call site's own identifier against `pub_by_name`, keyed by
+  the symbol's *declared* name, not its alias. A real, shared gap in the
+  bare-name matching architecture (ADR-0012), not something this slice
+  fixes.
+- **A colliding FQN (two PHP files illegally declaring the same
+  namespace+name) keeps whichever file `resolve` encounters first**,
+  not an error — carto only reads source, it doesn't enforce PHP's own
+  uniqueness rules. ADR-0012.
 
 ## Next: M1.b.2b continued (TS/TSX, JS, Go)
 
-Python (ADR-0011) is the second data point after Rust (ADR-0008) for
-what varies per language: relative-import semantics, what "exported"
-means, whether path-qualified calls are even syntactically
-distinguishable, what "same-package" should mean. TS/TSX, JS, and Go
-each still need their own version of that ADR — expect at least one
-real judgment call per language, not mechanical repetition. TS's
-`import './x'` is genuinely file-relative with extension-guessing
-(`.ts`/`.tsx`/`.js`/`index.ts`) and `package.json`/`node_modules` for
-external packages — meaningfully more resolution machinery than either
-Rust's or Python's import model needed. `fixtures/ts-app`/`go-svc`
-(spec §11.1) get built alongside the extractors that need them.
+Python (ADR-0011) and PHP (ADR-0012) are the second and third data
+points after Rust (ADR-0008) for what varies per language:
+relative-import vs. FQN-based import semantics, what "exported" means,
+whether path-qualified calls are even syntactically distinguishable
+(and, PHP shows, distinguishable ≠ excluded — that's an independent
+call), what "same-package" should mean. TS/TSX, JS, and Go each still
+need their own version of that ADR — expect at least one real judgment
+call per language, not mechanical repetition. TS's `import './x'` is
+genuinely file-relative with extension-guessing (`.ts`/`.tsx`/`.js`/
+`index.ts`) and `package.json`/`node_modules` for external packages —
+meaningfully more resolution machinery than any of Rust's, Python's, or
+PHP's import models needed. `fixtures/ts-app`/`go-svc` (spec §11.1) get
+built alongside the extractors that need them.
 
 `carto where`/`deps`/`map` need no changes for any of this — confirmed
-end-to-end against `fixtures/py-lib` with zero py-lib-specific code in
-`crates/carto-core/src/query/`, and expected to hold for every future
-language the same way.
+end-to-end against `fixtures/py-lib` and `fixtures/php-app` with zero
+language-specific code in `crates/carto-core/src/query/`, and expected
+to hold for every future language the same way.
+
+Also worth knowing before touching `resolve.rs` again: building
+`fixtures/php-app` surfaced a real, language-agnostic bug in call
+attribution (a symbol whose range nests another symbol's — PHP/Python
+classes containing methods — used to get every nested call's edges/
+`unresolved_calls` double-counted onto itself too). Fixed by
+`assign_calls_to_innermost_symbol`, verified behavior-preserving for
+Rust/Python (full pre-existing suite green, both golden files
+untouched) — see ADR-0012's "shared bug" section for the detail.

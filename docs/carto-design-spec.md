@@ -68,8 +68,9 @@ A single static Rust binary that:
 - No agent-config mutation: never write CLAUDE.md, settings.json, hooks of any
   kind, git hooks, or merge drivers (INV-4).
 - No watch daemon in v1 milestones M1–M4 (M5 adds incremental re-index only).
-- Languages beyond the v1 set (§5.2) — the design must allow adding grammars, but
-  do not add them.
+- Languages beyond the v1 set (§5.2) — the design must allow adding grammars,
+  but do not add them without an ADR justifying the addition (PHP added,
+  ADR-0012).
 
 ### 1.4 Users & primary scenarios
 
@@ -251,9 +252,10 @@ hard error advising `.cartoignore`.
 
 ### 5.2 v1 language set
 
-TypeScript/TSX, JavaScript, Python, Rust, Go, HCL (syntax-level only; the real
-Terraform graph comes from tf-json §6), YAML (structure only: top-level keys,
-k8s `kind`/`metadata.name`, GitHub Actions job names), JSON (structure only).
+TypeScript/TSX, JavaScript, Python, Rust, Go, PHP (added post-M1.b.2a,
+ADR-0012), HCL (syntax-level only; the real Terraform graph comes from
+tf-json §6), YAML (structure only: top-level keys, k8s `kind`/`metadata.name`,
+GitHub Actions job names), JSON (structure only).
 
 Per language implement a `LangExtractor` trait:
 
@@ -536,14 +538,16 @@ invariant conflict is discovered — surface those).
 ### M1 — Structural core (est. 4–6 wks)
 
 **Scope:** workspace scaffold incl. `deny.toml` FIRST; pathguard + taint types;
-walk; extractors for TS/JS, Python, Rust, Go (symbols+imports+calls per §5.3);
-graph store, stable IDs, persist choke-point (redact stub = no-op pass with the
-interface in place); commands `index`, `where`, `deps`, `map` (code-only);
-`--json`; CI gates §9.5 (1–4).
+walk; extractors for TS/JS, Python, Rust, Go, PHP (symbols+imports+calls per
+§5.3; PHP added post-M1.b.2a, ADR-0012); graph store, stable IDs, persist
+choke-point (redact stub = no-op pass with the interface in place); commands
+`index`, `where`, `deps`, `map` (code-only); `--json`; CI gates §9.5 (1–4).
 **Non-goals:** infra, join, MCP, ingest, YAML/HCL, redaction logic, WASM.
-**Acceptance:** fixtures/ts-app, fixtures/py-lib, fixtures/mixed index correctly
-(golden-file tests on graph.json); determinism test; no-network test;
-pathguard test; `where`/`deps` golden outputs; `map` respects `--budget`.
+**Acceptance:** fixtures/ts-app, fixtures/py-lib, fixtures/php-app,
+fixtures/mixed index correctly (golden-file tests on graph.json where
+practical — PHP uses semantic JSON assertions instead, same as Python);
+determinism test; no-network test; pathguard test; `where`/`deps` golden
+outputs; `map` respects `--budget`.
 **Exists at end:** all files under crates/carto-core/{walk,lang,graph,taint,
 pathguard}, carto-cli with 4 commands, fixtures, .github/workflows/ci.yml.
 
@@ -596,8 +600,9 @@ build for all targets.
 
 ### 11.1 Fixtures (committed, synthetic, small — never real customer code)
 
-`ts-app` (Express-ish, 30 files), `py-lib` (20), `rust-crate` (workspace, 15),
-`go-svc` (15), `mixed` (all of the above + noise dirs that must be ignored),
+`ts-app` (Express-ish, 30 files), `py-lib` (20), `php-app` (3, ADR-0012),
+`rust-crate` (workspace, 15), `go-svc` (15), `mixed` (all of the above +
+noise dirs that must be ignored),
 `tf-app` (VPC+Lambda+DDB+APIGW plan JSON recorded via `terraform show -json`,
 checked in as JSON — no terraform needed in CI), `cfn-sam` (SAM template),
 `cdk-app` (recorded cdk.out), `lambda-ts` (TF + TS handlers for J1),

@@ -38,8 +38,8 @@ carto never calls an LLM and never needs an API key.
 
 Implementation in progress, milestone by milestone (spec §10). Currently:
 **M1.b.2b in progress** — `carto index`/`where`/`deps`/`map` work
-end-to-end against Rust and Python repos; TS/TSX/JS/Go extractors not
-started yet. See [`docs/STATUS.md`](docs/STATUS.md) for the detailed
+end-to-end against Rust, Python, and PHP repos; TS/TSX/JS/Go extractors
+not started yet. See [`docs/STATUS.md`](docs/STATUS.md) for the detailed
 handoff.
 
 ## Building
@@ -49,6 +49,43 @@ cargo build --workspace
 cargo test --workspace
 bash scripts/gates.sh   # fmt, clippy, cargo-deny, tests
 ```
+
+Build a `carto` binary you can actually run against a project:
+
+```
+cargo build --release -p carto-cli
+# binary at target/release/carto — put it on PATH, or reference the
+# full path in the CLAUDE.md snippet below.
+```
+
+## Using with Claude Code
+
+There's no MCP server yet (that's M4) — for now, point Claude Code at
+the CLI by adding a short note to the *target* repo's own `CLAUDE.md`
+(the repo you want indexed, not this one):
+
+```markdown
+## Code navigation
+
+This repo is indexed with `carto` (github.com/carto/carto). Prefer it
+over grep/rg for symbol lookups and call-graph questions:
+
+    carto index . --out /tmp/carto-out           # once per session, or after a large change
+    carto where <symbol> . --out /tmp/carto-out   # find a symbol by name (substring or --exact)
+    carto deps <symbol> . --out /tmp/carto-out --dir in --depth 2   # what calls this
+    carto map . --out /tmp/carto-out --budget 50  # layered overview: top modules, entry points
+
+Every edge carries a confidence (`certain`/`inferred`); `inferred` means
+verify before acting on it. Symbol IDs change when code moves — re-run
+`where` after edits rather than reusing an old one.
+```
+
+Claude Code picks this up automatically and runs the commands itself via
+its Bash tool when the note tells it to. This is a stopgap: spec §9.3's
+real integration point is a single `skill/carto.skill.md` file the user
+copies in themselves (M4), and §7.3's MCP server exposes the same core
+functions as the CLI — the manual `CLAUDE.md` pointer above works today
+because `where`/`deps`/`map` already *are* those same functions.
 
 ## License
 
