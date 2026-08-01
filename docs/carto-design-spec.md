@@ -602,7 +602,7 @@ build for all targets.
 ### 11.1 Fixtures (committed, synthetic, small — never real customer code)
 
 `ts-app` (7, mixes `.ts`/`.tsx`/`.js`, ADR-0013), `py-lib` (20), `php-app` (3, ADR-0012),
-`rust-crate` (workspace, 15), `go-svc` (15), `mixed` (all of the above +
+`rust-crate` (workspace, 15), `go-svc` (5, ADR-0015), `mixed` (all of the above +
 noise dirs that must be ignored),
 `tf-app` (VPC+Lambda+DDB+APIGW plan JSON recorded via `terraform show -json`,
 checked in as JSON — no terraform needed in CI), `cfn-sam` (SAM template),

@@ -1,6 +1,6 @@
 # carto — status / handoff
 
-**Milestone:** M1.b.2b in progress (Python, PHP, TS/TSX/JS done; Go not started)
+**Milestone:** M1.b.2b done (Rust, Python, PHP, TS/TSX/JS, Go — spec §5.2's full v1 language set)
 
 Where the implementation is in the milestone sequence, what's deliberately
 absent, and what's next. Everything else lives elsewhere on purpose:
@@ -29,8 +29,12 @@ so they've been subdivided. Current state:
   v1 set post-M1.b.2a, ADR-0012). **Python done** (ADR-0011), **PHP
   done** (ADR-0012), **TS/TSX/JS done** (ADR-0013, which also fixed a
   cross-language alias-resolution gap ADR-0012 had documented but left
-  unfixed) — current head. Go not started.
-- **M2+** — infra graph, join, MCP, ingest, real redaction. Per spec §10.
+  unfixed), **Go done** (ADR-0015 — the closing slice; new
+  `RawImport::PackagePath` for Go's directory-shaped, module-qualified
+  import paths, and a new opt-in directory-scoped resolution tier for
+  Go's file-independent package visibility). Spec §5.2's v1 language
+  set is now fully implemented.
+- **M2+** — infra graph, join, MCP, ingest, real redaction. Per spec §10. **Current head.**
 
 Post-M1.b.2b hardening (2026-08-01): real-world PHP field-testing
 against a TYPO3 codebase surfaced two query-layer gaps, both fixed —
@@ -161,25 +165,55 @@ Do not "fix" these without checking the linked reasoning first:
   no directory, so path-prefix filtering doesn't apply to them
   directly; they only disappear from a scoped `map` ranking by having
   zero edges with an in-scope endpoint. ADR-0014.
+- **Go's cross-package calls always resolve via tier (c)
+  (`"same-package"`), never tier (b) (`"imported"`), even when reached
+  through a real `import`** — a Go import binds a *package* name, not
+  a symbol name, so there's nothing for `RawImport::PackagePath` to
+  offer tier (b): `resolve.rs`'s `alias_to_declared` map is never
+  populated for Go files. The same class of cosmetic evidence-label
+  quirk ADR-0013 already accepted for TS/JS's `"mod-declaration"`
+  label. ADR-0015.
+- **No `go.mod` parsing.** `RawImport::PackagePath` resolves a Go
+  import path against every walked directory containing a Go file by
+  **longest-suffix match**, not an exact prefix computed from
+  `go.mod`'s `module` line — same "no manifest parsing" precedent as
+  Rust's/Python's/PHP's/TS-JS's own absolute-import simplifications.
+  Accepted false-positive: an external import whose path coincidentally
+  ends with a local directory's path resolves as internal. `go.mod`
+  is still committed in `fixtures/go-svc` for realism and indexed as a
+  plain `File` node. ADR-0015; revisit only if this causes a real false
+  positive in practice.
+- **The package qualifier in a Go selector call (`pkg.Func()`) is
+  discarded** — `RawCallSite` carries only the bare callee name
+  (`Func`), the same grammar-level ambiguity Python's/TS-JS's
+  attribute/member calls already have, not a Go-specific gap. ADR-0015.
 
-## Next: M1.b.2b continued (Go)
+## Next: M2 (infra graph, join, MCP, ingest, real redaction)
 
-Rust (ADR-0008), Python (ADR-0011), PHP (ADR-0012), and TS/TSX/JS
-(ADR-0013) are four data points for what varies per language:
-relative-import vs. FQN-based vs. literal-path import semantics, what
-"exported" means, whether path-qualified calls are even syntactically
-distinguishable (and, PHP/TS show, distinguishable ≠ excluded — that's
-an independent call each language gets to make on its own), what
-"same-package" should mean. Go still needs its own version of that
-ADR — expect at least one real judgment call, not mechanical
-repetition. `fixtures/go-svc` (spec §11.1) gets built alongside it.
+M1.b.2b is done — spec §5.2's full v1 language set (TypeScript, TSX,
+JavaScript, Python, Rust, Go, PHP) is implemented, `carto index` extracts
+symbols/imports/calls for all seven `Lang` variants, and
+`where`/`deps`/`map` work against every one of them with zero
+language-specific code in `crates/carto-core/src/query/` — reconfirmed
+for Go (ADR-0015), the seventh and final data point for that claim.
 
-`carto where`/`deps`/`map` need no changes for any of this — confirmed
-end-to-end against `fixtures/py-lib`, `fixtures/php-app`, and
-`fixtures/ts-app` (the first fixture mixing more than one `Lang`
-variant) with zero language-specific code in
-`crates/carto-core/src/query/`, and expected to hold for Go the same
-way.
+Seven languages across six ADRs (Rust/ADR-0008, Python/ADR-0011,
+PHP/ADR-0012, TS-TSX-JS/ADR-0013, Go/ADR-0015) are enough data points to
+say what varies per language with some confidence: relative-import vs.
+FQN-based vs. literal-path vs. directory-path import semantics, what
+"exported" means (a keyword, a convention, or a hard first-letter-case
+rule), whether path-qualified calls are even syntactically
+distinguishable from plain ones (and, PHP/TS/Go all show,
+distinguishable ≠ excluded — an independent call each language gets to
+make), and what "same-package" should mean (same walked repo for
+Rust/Python/TS-JS, same FQN-namespace for PHP, same *directory* for Go
+— the one language so far where package scope needed a genuinely new
+resolution tier, not just a new `RawImport` variant).
+
+Next per spec §10 is M2: the infrastructure graph (Terraform/CFN/CDK),
+the code↔infra join, and real redaction (`redact::redact()` is
+currently a no-op stub with the real signature). Read spec §6/§7 before
+planning M2's first slice — it hasn't been sliced yet the way M1.b was.
 
 Also worth knowing before touching `resolve.rs` again: building
 `fixtures/php-app` surfaced a real, language-agnostic bug in call
@@ -195,5 +229,8 @@ non-exported symbol — invalid TS/JS — and a function named `log`
 coincidentally colliding with `console.log`) — see ADR-0013's own
 "what building the fixture caught" section. Both were only found by
 eyeballing real `carto index` output, never by unit tests on isolated
-snippets — keep doing that for every new language, per CLAUDE.md's own
-documented gotcha.
+snippets — keep doing that for every new milestone, per CLAUDE.md's own
+documented gotcha. `fixtures/go-svc` (ADR-0015) broke that streak in a
+good way: the fixture matched real output on the first run, with
+nothing to fix — recorded in ADR-0015 rather than left unmentioned, so
+"nothing was wrong" reads as verified, not skipped.

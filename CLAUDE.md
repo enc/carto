@@ -31,6 +31,7 @@ cargo run -p carto-cli -- index fixtures/rust-crate --out /tmp/carto-out
 cargo run -p carto-cli -- index fixtures/py-lib --out /tmp/carto-out
 cargo run -p carto-cli -- index fixtures/php-app --out /tmp/carto-out
 cargo run -p carto-cli -- index fixtures/ts-app --out /tmp/carto-out
+cargo run -p carto-cli -- index fixtures/go-svc --out /tmp/carto-out
 cargo run -p carto-cli -- index <repo> --json 2>/dev/null | python3 -m json.tool
 cargo run -p carto-cli -- where <name> <repo> --out /tmp/carto-out
 cargo run -p carto-cli -- deps <name|id> <repo> --out /tmp/carto-out --dir out --depth 2
@@ -120,11 +121,11 @@ detail to reshape freely.
 ### Language extraction is two-phase
 
 Per-file extraction and whole-repo resolution are deliberately separate
-(`lang/extractor.rs` → `lang/{rust,python,php,ecma}.rs` →
+(`lang/extractor.rs` → `lang/{rust,python,php,ecma,go}.rs` →
 `lang/resolve.rs`). `ecma.rs` houses three `LangExtractor`s
 (TypeScript/TSX/JavaScript) in one module, not one file each — see its
 own module doc comment for why (they're dialects of one grammar
-family; Rust/Python/PHP aren't). `lang::extract_and_resolve` dispatches
+family; Rust/Python/PHP/Go aren't). `lang::extract_and_resolve` dispatches
 each file to its extractor by `Lang` (a small registry,
 `lang/mod.rs::extractors()`), not a hard-coded single language:
 
@@ -133,23 +134,31 @@ each file to its extractor by `Lang` (a small registry,
    `lang/queries/<lang>/`, embedded via `include_str!`.
 2. **Resolve** runs whole-repo — a call can't be judged unambiguous until
    every other file's exported symbols are known. Spec §5.3's policy is
-   deliberately modest: first-match-wins across three tiers, `calls` edges
+   deliberately modest: first-match-wins across tiers, `calls` edges
    are **always `inferred`, never `certain`**, and zero-or-multiple
    candidates produce **no edge**, recorded in the caller's
    `unresolved_calls` instead. Missing honestly beats guessing. The
    tier-resolution logic itself is language-agnostic; only import
-   handling (`RawImport::Relative`/`Absolute`/`Qualified`, spanning
-   every language today) and each extractor's own `is_pub`-equivalent
-   gate are per-language. A call is attributed to the *innermost*
-   symbol containing it (`assign_calls_to_innermost_symbol`), not every
-   symbol whose range contains it — matters for any language whose
-   class-like symbol's own range spans its methods' bodies (PHP,
-   Python; not Rust, where an `impl` block is never itself a symbol).
-   Tier (b) is alias-aware (`ImportedName { bound_name, declared_name
-   }`, `alias_to_declared`) — a call site's own spelling and the
-   target's actual declared name are tracked separately, not collapsed
-   to one string, so `import { foo as bar }`/`from x import foo as
-   bar`/`use Foo as X;` all resolve correctly (ADR-0013).
+   handling (`RawImport::Relative`/`Absolute`/`Qualified`/`PackagePath`,
+   spanning every language today) and each extractor's own
+   `is_pub`-equivalent gate are per-language. One tier is opt-in per
+   extractor rather than universal: `LangExtractor::
+   package_scope_is_directory()` (default `false`) enables a
+   directory-scoped tier between same-file and imported, for Go's
+   file-independent package visibility — see ADR-0015; every other
+   extractor's tiers are exactly spec §5.3's original three. A call is
+   attributed to the *innermost* symbol containing it
+   (`assign_calls_to_innermost_symbol`), not every symbol whose range
+   contains it — matters for any language whose class-like symbol's
+   own range spans its methods' bodies (PHP, Python; not Rust, where
+   an `impl` block is never itself a symbol). Tier (b) is alias-aware
+   (`ImportedName { bound_name, declared_name }`, `alias_to_declared`)
+   — a call site's own spelling and the target's actual declared name
+   are tracked separately, not collapsed to one string, so `import {
+   foo as bar }`/`from x import foo as bar`/`use Foo as X;` all
+   resolve correctly (ADR-0013); Go's `PackagePath` imports never
+   populate this map at all, since a Go import binds a package name,
+   never a symbol name (ADR-0015).
 
 Adding a language means: a `.scm` query set, a `LangExtractor` impl
 (registered in `extractors()`), and an ADR mapping §5.3's generic rules
@@ -157,18 +166,23 @@ onto that language's actual import/call semantics.
 [ADR-0008](docs/adr/0008-rust-resolution-policy-mapping.md) (Rust),
 [ADR-0011](docs/adr/0011-python-resolution-policy-mapping.md) (Python),
 [ADR-0012](docs/adr/0012-php-resolution-policy-mapping.md) (PHP — also
-the ADR that added PHP to spec §5.2's v1 set), and
+the ADR that added PHP to spec §5.2's v1 set),
 [ADR-0013](docs/adr/0013-typescript-javascript-resolution-policy-mapping.md)
 (TypeScript/TSX/JavaScript — also the ADR that fixed the alias-
-resolution gap above) are the worked examples so far — templates, not
-rules that transfer verbatim (Python's attribute-call syntax can't even
-distinguish a module-qualified call from an instance call the way
-Rust's, PHP's, and TS/JS's grammars all can; PHP and TS/JS capture
-their path-qualified/member calls anyway, unlike Rust, since they're
+resolution gap above), and
+[ADR-0015](docs/adr/0015-go-resolution-policy-mapping.md) (Go — the
+ADR that added `RawImport::PackagePath` and the opt-in directory-scoped
+resolution tier above; closes spec §5.2's full v1 language set) are the
+worked examples so far — templates, not rules that transfer verbatim
+(Python's attribute-call syntax can't even distinguish a
+module-qualified call from an instance call the way Rust's, PHP's,
+TS/JS's, and Go's grammars all can; PHP, TS/JS, and Go capture their
+path-qualified/member/selector calls anyway, unlike Rust, since they're
 too common to drop; TS/JS's relative imports are genuinely file-relative
 with extension-guessing in a way none of Rust's, Python's, or PHP's
 import models are, yet still fit the existing `RawImport::Relative`
-shape with no new variant).
+shape with no new variant, while Go's directory-shaped, module-qualified
+import paths didn't fit any existing variant and needed a new one).
 
 ## Conventions
 
