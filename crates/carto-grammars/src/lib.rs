@@ -61,6 +61,15 @@ pub fn javascript_language() -> tree_sitter::Language {
     tree_sitter_javascript::LANGUAGE.into()
 }
 
+/// Go grammar (seventh language, M1.b.2b's closing slice — see
+/// `docs/adr/0015-go-resolution-policy-mapping.md`). Same
+/// `LanguageFn -> Language` conversion as the others, no `unsafe` needed
+/// for the same reason.
+#[cfg(feature = "native-grammars")]
+pub fn go_language() -> tree_sitter::Language {
+    tree_sitter_go::LANGUAGE.into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,6 +123,14 @@ mod tests {
         let mut parser = tree_sitter::Parser::new();
         parser.set_language(&javascript_language()).expect(
             "tree-sitter-javascript's language must be compatible with the linked tree-sitter runtime",
+        );
+    }
+
+    #[test]
+    fn go_language_loads_without_panicking() {
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&go_language()).expect(
+            "tree-sitter-go's language must be compatible with the linked tree-sitter runtime",
         );
     }
 }
