@@ -39,6 +39,19 @@
       "excluded": null
     },
     {
+      "id": "32c73a3477e36e4b",
+      "provenance": "syntactic",
+      "origin": "lang-python@1",
+      "kind": "symbol",
+      "name": "hello",
+      "sym_kind": "function",
+      "file": "60111f341f31ccc7",
+      "start_line": 1,
+      "end_line": 2,
+      "signature": "def hello():",
+      "unresolved_calls": []
+    },
+    {
       "id": "600e84125eb01ca9",
       "provenance": "syntactic",
       "origin": "walk@1",
@@ -132,7 +145,17 @@
       "to": "aeb5a0fc8cb1fa64",
       "confidence": "certain",
       "evidence": [
-        "extractor:rust"
+        "lang-rust@1"
+      ]
+    },
+    {
+      "id": "71beb6af3fe5150a",
+      "kind": "contains",
+      "from": "60111f341f31ccc7",
+      "to": "32c73a3477e36e4b",
+      "confidence": "certain",
+      "evidence": [
+        "lang-python@1"
       ]
     }
   ]

@@ -22,16 +22,17 @@ pub struct FileExtraction {
     pub file_id: NodeId,
     pub relpath: String,
     pub extract: ExtractOut,
+    /// The producing extractor's [`super::LangExtractor::origin`] (spec
+    /// §4.1's node `origin` field). Per-file rather than a single
+    /// module-wide constant since `resolve` processes files from more
+    /// than one extractor in a single pass (M1.b.2b).
+    pub origin: &'static str,
 }
 
 pub struct ResolvedExtraction {
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
 }
-
-/// The extractor name + version recorded on every `Symbol`/`Module` node
-/// this pass produces (spec §4.1's `origin` field).
-const ORIGIN: &str = "lang-rust@1";
 
 pub fn resolve(extractions: Vec<FileExtraction>) -> ResolvedExtraction {
     // Every top-level `mod <name>;` declared anywhere — a `use` path
@@ -172,7 +173,7 @@ pub fn resolve(extractions: Vec<FileExtraction>) -> ResolvedExtraction {
             nodes.push(Node::symbol(
                 id.clone(),
                 Provenance::Syntactic,
-                ORIGIN,
+                fe.origin,
                 SymbolNode {
                     name: sym.name.clone(),
                     sym_kind: sym.sym_kind,
@@ -189,7 +190,7 @@ pub fn resolve(extractions: Vec<FileExtraction>) -> ResolvedExtraction {
                 fe.file_id.clone(),
                 id,
                 Confidence::Certain,
-                "extractor:rust".to_string(),
+                fe.origin.to_string(),
             ));
         }
 
@@ -200,15 +201,9 @@ pub fn resolve(extractions: Vec<FileExtraction>) -> ResolvedExtraction {
                     module_path,
                     imported_names,
                 } => {
-                    // Rust's `mod foo;` shape: the import refers to the
-                    // module file itself, not a name within it.
-                    // `Relative` with non-empty `imported_names`
-                    // (Python's `from .pkg import a, b` / `from .
-                    // import pkg`) isn't produced by any extractor yet
-                    // — handled when the Python extractor lands
-                    // (M1.b.2b), designed against its own fixture
-                    // rather than guessed here.
                     if imported_names.is_empty() {
+                        // Rust's `mod foo;` shape: the import refers to
+                        // the module file itself, not a name within it.
                         if let Some(target) = resolve_relative_import(
                             &fe.relpath,
                             *levels_up,
@@ -223,9 +218,58 @@ pub fn resolve(extractions: Vec<FileExtraction>) -> ResolvedExtraction {
                                 "mod-declaration".to_string(),
                             ));
                         }
+                    } else if !module_path.is_empty() {
+                        // Python's `from .pkg import a, b` — the module
+                        // itself is the file-level target; one edge,
+                        // certain per spec rule 1, regardless of how
+                        // many names are drawn from it.
+                        if let Some(target) = resolve_relative_import(
+                            &fe.relpath,
+                            *levels_up,
+                            module_path,
+                            &relpath_to_file_id,
+                        ) {
+                            edges.push(Edge::new(
+                                EdgeKind::Imports,
+                                fe.file_id.clone(),
+                                target.clone(),
+                                Confidence::Certain,
+                                "relative-import".to_string(),
+                            ));
+                        }
+                    } else {
+                        // Python's `from . import pkg[, pkg2]` — each
+                        // name IS itself a submodule to resolve relative
+                        // to the current directory (no separate
+                        // `module_path` to anchor on).
+                        for name in imported_names {
+                            if let Some(target) = resolve_relative_import(
+                                &fe.relpath,
+                                *levels_up,
+                                name,
+                                &relpath_to_file_id,
+                            ) {
+                                edges.push(Edge::new(
+                                    EdgeKind::Imports,
+                                    fe.file_id.clone(),
+                                    target.clone(),
+                                    Confidence::Certain,
+                                    "relative-import".to_string(),
+                                ));
+                            }
+                        }
                     }
                 }
                 RawImport::Absolute { root, .. } => {
+                    // `known_modules` only ever contains Rust `mod`
+                    // names (see its own doc comment) — Python has no
+                    // walked-repo equivalent (no explicit module
+                    // declaration to collect), so every Python absolute
+                    // import is classified external here, even when it
+                    // actually names a local top-level package. A known
+                    // v1 simplification (ADR-0011), analogous to but
+                    // distinct from Rust's own "same-package = same
+                    // walked repo" one.
                     let is_internal = root == "crate"
                         || root == "self"
                         || root == "super"
@@ -240,7 +284,7 @@ pub fn resolve(extractions: Vec<FileExtraction>) -> ResolvedExtraction {
                             nodes.push(Node::module(
                                 id.clone(),
                                 Provenance::Syntactic,
-                                ORIGIN,
+                                fe.origin,
                                 ModuleNode {
                                     path: root.clone(),
                                     external: true,
@@ -254,7 +298,7 @@ pub fn resolve(extractions: Vec<FileExtraction>) -> ResolvedExtraction {
                         fe.file_id.clone(),
                         module_id,
                         Confidence::Certain,
-                        "external-crate".to_string(),
+                        "external-package".to_string(),
                     ));
                 }
             }
@@ -364,6 +408,7 @@ mod tests {
             file_id: graph::file_id(relpath),
             relpath: relpath.to_string(),
             extract: ExtractOut::default(),
+            origin: "lang-rust@1",
         }
     }
 
@@ -552,6 +597,64 @@ mod tests {
 
         let out = resolve(vec![lib]);
         assert!(imports_edges(&out.edges).is_empty());
+    }
+
+    #[test]
+    fn python_relative_import_with_named_symbols_resolves_the_module_file() {
+        // `from .orders import parse_order, validate` in pkg/handlers.py
+        // -- one dot means "the current package" (levels_up: 0), so
+        // `orders` resolves as a same-directory sibling of handlers.py.
+        let mut python_file = file("pkg/handlers.py");
+        python_file.origin = "lang-python@1";
+        python_file.extract.imports = vec![RawImport::Relative {
+            levels_up: 0,
+            module_path: "orders".into(),
+            imported_names: vec!["parse_order".into(), "validate".into()],
+        }];
+        let orders = file("pkg/orders.py");
+
+        let out = resolve(vec![python_file, orders]);
+        let imports = imports_edges(&out.edges);
+        assert_eq!(imports.len(), 1); // one edge to the module, not one per name
+        assert_eq!(imports[0].confidence, Confidence::Certain);
+        assert_eq!(imports[0].evidence, vec!["relative-import".to_string()]);
+    }
+
+    #[test]
+    fn python_relative_import_walks_up_one_directory_for_two_dots() {
+        // `from ..orders import parse_order` in pkg/sub/handlers.py --
+        // two dots means "the parent package" (levels_up: 1): walk up
+        // from pkg/sub/ to pkg/, then find orders.py there.
+        let mut python_file = file("pkg/sub/handlers.py");
+        python_file.origin = "lang-python@1";
+        python_file.extract.imports = vec![RawImport::Relative {
+            levels_up: 1,
+            module_path: "orders".into(),
+            imported_names: vec!["parse_order".into()],
+        }];
+        let orders = file("pkg/orders.py");
+
+        let out = resolve(vec![python_file, orders]);
+        assert_eq!(imports_edges(&out.edges).len(), 1);
+    }
+
+    #[test]
+    fn python_bare_relative_submodule_import_resolves_each_name_as_a_submodule() {
+        // `from . import a, b` -- each imported name IS itself a
+        // submodule to resolve relative to the current directory
+        // (no separate module_path to anchor on).
+        let mut python_file = file("pkg/__init__.py");
+        python_file.origin = "lang-python@1";
+        python_file.extract.imports = vec![RawImport::Relative {
+            levels_up: 0,
+            module_path: "".into(),
+            imported_names: vec!["orders".into(), "handlers".into()],
+        }];
+        let orders = file("pkg/orders.py");
+        let handlers = file("pkg/handlers.py");
+
+        let out = resolve(vec![python_file, orders, handlers]);
+        assert_eq!(imports_edges(&out.edges).len(), 2);
     }
 
     #[test]

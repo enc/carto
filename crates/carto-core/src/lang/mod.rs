@@ -1,12 +1,14 @@
-//! Language identification (spec §5.2) and, as of M1.b.2a, the
-//! `LangExtractor` trait + Rust's implementation. TS/TSX, JS, Python, Go
-//! extractors follow in a later slice, reusing [`extractor`]'s types.
+//! Language identification (spec §5.2) and the `LangExtractor` trait +
+//! its implementations. Rust (M1.b.2a) and Python (M1.b.2b) exist;
+//! TS/TSX, JS, Go follow in later slices, reusing [`extractor`]'s types.
 
 pub mod extractor;
+pub mod python;
 pub mod resolve;
 pub mod rust;
 
 pub use extractor::{ExtractOut, LangExtractor, RawCallSite, RawImport, RawSymbol};
+pub use python::PythonExtractor;
 pub use resolve::{FileExtraction, ResolvedExtraction, resolve};
 pub use rust::RustExtractor;
 
@@ -57,13 +59,23 @@ impl Lang {
     }
 }
 
+/// Every registered `LangExtractor` (M1.b.2b: a small registry, not a
+/// single hard-coded extractor — `extract_and_resolve` looks each file
+/// up by its own `Lang`). Order here has no bearing on output
+/// determinism: `resolve`'s output nodes/edges are `Graph`-sorted
+/// regardless of extraction order, and a file only ever matches exactly
+/// one extractor (by `Lang`).
+fn extractors() -> Vec<Box<dyn LangExtractor>> {
+    vec![Box::new(RustExtractor), Box::new(PythonExtractor)]
+}
+
 /// Orchestrates extraction + resolution for every walked `File` node
-/// whose language has a registered extractor (Rust only, this slice —
-/// `file_nodes` is expected to be `walk::WalkOutput::nodes`, but this
-/// function only depends on the `Node` shape, not on `walk` itself).
-/// Files that are `skipped`/`excluded` (spec §5.1's walk classification)
-/// or whose `Lang` has no extractor yet are left alone — only their
-/// `File` node exists, same as before M1.b.2a.
+/// whose language has a registered extractor (`file_nodes` is expected
+/// to be `walk::WalkOutput::nodes`, but this function only depends on
+/// the `Node` shape, not on `walk` itself). Files that are
+/// `skipped`/`excluded` (spec §5.1's walk classification) or whose
+/// `Lang` has no extractor yet are left alone — only their `File` node
+/// exists, same as before any extractor existed.
 ///
 /// Re-reads each eligible file's content from disk (`walk` already read
 /// it once, for hashing/binary-sniffing, but doesn't retain the bytes) —
@@ -73,16 +85,19 @@ impl Lang {
 /// (TOCTOU) is silently skipped, same tolerance `walk::classify`
 /// already has for the same race.
 pub fn extract_and_resolve(repo_root: &Path, file_nodes: &[Node]) -> ResolvedExtraction {
-    let extractor = RustExtractor;
+    let extractors = extractors();
     let mut extractions = Vec::new();
 
     for node in file_nodes {
         let Some(file) = node.data.as_file() else {
             continue;
         };
-        if file.skipped.is_some() || file.excluded.is_some() || file.lang != extractor.lang() {
+        if file.skipped.is_some() || file.excluded.is_some() {
             continue;
         }
+        let Some(extractor) = extractors.iter().find(|e| e.lang() == file.lang) else {
+            continue;
+        };
         let Ok(content) = std::fs::read(repo_root.join(&file.path)) else {
             continue;
         };
@@ -90,6 +105,7 @@ pub fn extract_and_resolve(repo_root: &Path, file_nodes: &[Node]) -> ResolvedExt
             file_id: node.id.clone(),
             relpath: file.path.clone(),
             extract: extractor.extract(&content, &file.path),
+            origin: extractor.origin(),
         });
     }
 

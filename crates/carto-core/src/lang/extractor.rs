@@ -55,11 +55,13 @@ pub enum RawImport {
     /// `imported_names: vec![]` — the import refers to the module file
     /// itself, not a name within it; an inline `mod foo { .. }` is a
     /// namespace, not a file reference, and isn't extracted at all).
-    /// Python's `from .pkg import a, b` (`levels_up: 1`, `module_path:
-    /// "pkg"`, `imported_names: ["a", "b"]`) and `from . import pkg`
-    /// (`levels_up: 1`, `module_path: ""`, each entry of
-    /// `imported_names` itself a submodule name to resolve relative to
-    /// the current directory).
+    /// Python's `from .pkg import a, b` (`levels_up: 0` — a single dot
+    /// means "the current package", i.e. the declaring file's own
+    /// directory; `module_path: "pkg"`, `imported_names: ["a", "b"]`)
+    /// and `from . import pkg` (`levels_up: 0`, `module_path: ""`, each
+    /// entry of `imported_names` itself a submodule name to resolve
+    /// relative to the current directory). Each additional leading dot
+    /// adds one more level (`from ..pkg import x` -> `levels_up: 1`).
     Relative {
         levels_up: u32,
         module_path: String,
@@ -104,4 +106,11 @@ pub trait LangExtractor {
     fn lang(&self) -> Lang;
     fn extensions(&self) -> &'static [&'static str];
     fn extract(&self, src: &[u8], relpath: &str) -> ExtractOut;
+    /// Extractor name + version recorded on every `Symbol`/`Module` node
+    /// this extractor's output produces (spec §4.1's `origin` field),
+    /// e.g. `"lang-rust@1"`. Added in M1.b.2b when `resolve` started
+    /// processing files from more than one extractor per repo — a single
+    /// hard-coded `ORIGIN` constant stopped being accurate once a
+    /// Python symbol could otherwise claim `lang-rust@1`.
+    fn origin(&self) -> &'static str;
 }
