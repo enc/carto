@@ -52,6 +52,19 @@
       "unresolved_calls": []
     },
     {
+      "id": "4f63a759c60441a5",
+      "provenance": "syntactic",
+      "origin": "lang-ts@1",
+      "kind": "symbol",
+      "name": "hello",
+      "sym_kind": "function",
+      "file": "f5cefa8676aadccd",
+      "start_line": 1,
+      "end_line": 3,
+      "signature": "function hello(): string",
+      "unresolved_calls": []
+    },
+    {
       "id": "600e84125eb01ca9",
       "provenance": "syntactic",
       "origin": "walk@1",
@@ -146,6 +159,16 @@
       "confidence": "certain",
       "evidence": [
         "lang-rust@1"
+      ]
+    },
+    {
+      "id": "684a48ef98e5c12c",
+      "kind": "contains",
+      "from": "f5cefa8676aadccd",
+      "to": "4f63a759c60441a5",
+      "confidence": "certain",
+      "evidence": [
+        "lang-ts@1"
       ]
     },
     {

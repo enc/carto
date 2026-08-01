@@ -505,16 +505,19 @@ fn resolve_call(
 
 /// Resolves a relative import (Rust's `mod <name>;`, `levels_up` always
 /// 0; Python's `from <dots><module_path> import ...`, `levels_up` = dot
-/// count) to a sibling/ancestor file. Walks `levels_up` directories up
-/// from `declaring_relpath`'s own directory, then looks for
-/// `<dir>/<module_path>.<ext>` or `<dir>/<module_path>/<package-marker>`
-/// — the common case in either language (`#[path]` overrides, Python
-/// namespace packages, and other edition/interpreter-version corner
-/// cases are out of scope, spec §5.3 "deliberately modest"). Which
-/// suffix pair to try is inferred from `declaring_relpath`'s own
-/// extension: a `mod` declaration only ever appears in a `.rs` file, and
-/// a Python relative import only ever appears in a `.py` file, so the
-/// declaring file's extension is sufficient — no need to thread the
+/// count; TS/JS's `import x from '<dots><module_path>'`, `levels_up` =
+/// leading `../` count — ADR-0013) to a sibling/ancestor file. Walks
+/// `levels_up` directories up from `declaring_relpath`'s own directory,
+/// then looks for `<dir>/<module_path>.<ext>` or
+/// `<dir>/<module_path>/<package-marker>` — the common case in each
+/// language (`#[path]` overrides, Python namespace packages, and
+/// TS/JS's real bundler/tsconfig-driven resolution order are all out of
+/// scope, spec §5.3 "deliberately modest"). Which candidate suffixes to
+/// try is inferred from `declaring_relpath`'s own extension: a `mod`
+/// declaration only ever appears in a `.rs` file, a Python relative
+/// import only ever in a `.py` file, and a TS/JS one only ever in a
+/// `.ts`/`.tsx`/`.js`/`.jsx`/`.mts`/`.cts`/`.mjs`/`.cjs` file — so the
+/// declaring file's extension is sufficient, no need to thread the
 /// caller's language through separately. String-joined rather than
 /// `std::path::Path`-joined: repo-relative paths are always
 /// `/`-separated regardless of host OS (spec §4.1), and `Path::join` on
@@ -535,12 +538,28 @@ fn resolve_relative_import<'a>(
     }
 
     let ext = declaring_relpath.rsplit_once('.').map(|(_, e)| e);
-    let candidates = match ext {
-        Some("py") => [
+    let candidates: Vec<String> = match ext {
+        Some("py") => vec![
             format!("{module_path}.py"),
             format!("{module_path}/__init__.py"),
         ],
-        _ => [format!("{module_path}.rs"), format!("{module_path}/mod.rs")],
+        // TS-first priority order (the user-facing language this
+        // extractor was built to serve best), first match wins — real
+        // bundler resolution can differ per tsconfig/bundler config,
+        // out of scope. Tried regardless of the declaring file's own
+        // exact extension within this family: a .ts file importing a
+        // .jsx sibling (or vice versa) is common in mixed repos.
+        Some("ts" | "tsx" | "js" | "jsx" | "mts" | "cts" | "mjs" | "cjs") => vec![
+            format!("{module_path}.ts"),
+            format!("{module_path}.tsx"),
+            format!("{module_path}.js"),
+            format!("{module_path}.jsx"),
+            format!("{module_path}/index.ts"),
+            format!("{module_path}/index.tsx"),
+            format!("{module_path}/index.js"),
+            format!("{module_path}/index.jsx"),
+        ],
+        _ => vec![format!("{module_path}.rs"), format!("{module_path}/mod.rs")],
     };
 
     candidates

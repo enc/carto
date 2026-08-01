@@ -1,14 +1,16 @@
 //! Language identification (spec §5.2) and the `LangExtractor` trait +
-//! its implementations. Rust (M1.b.2a), Python (M1.b.2b), and PHP
-//! (ADR-0012) exist; TS/TSX, JS, Go follow in later slices, reusing
-//! [`extractor`]'s types.
+//! its implementations. Rust (M1.b.2a), Python (M1.b.2b), PHP
+//! (ADR-0012), and TypeScript/TSX/JavaScript (ADR-0013) exist; Go
+//! follows in a later slice, reusing [`extractor`]'s types.
 
+pub mod ecma;
 pub mod extractor;
 pub mod php;
 pub mod python;
 pub mod resolve;
 pub mod rust;
 
+pub use ecma::{JavaScriptExtractor, TsxExtractor, TypeScriptExtractor};
 pub use extractor::{ExtractOut, ImportedName, LangExtractor, RawCallSite, RawImport, RawSymbol};
 pub use php::PhpExtractor;
 pub use python::PythonExtractor;
@@ -76,6 +78,9 @@ fn extractors() -> Vec<Box<dyn LangExtractor>> {
         Box::new(RustExtractor),
         Box::new(PythonExtractor),
         Box::new(PhpExtractor),
+        Box::new(TypeScriptExtractor),
+        Box::new(TsxExtractor),
+        Box::new(JavaScriptExtractor),
     ]
 }
 
