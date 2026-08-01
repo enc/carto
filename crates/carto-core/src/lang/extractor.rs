@@ -40,6 +40,27 @@ pub struct RawSymbol {
     pub is_pub: bool,
 }
 
+/// One name brought into scope by an import — the identifier a call
+/// site in *this* file actually spells (`bound_name`) paired with the
+/// name the target symbol is declared under in *its own* file
+/// (`declared_name`, what `resolve`'s `pub_by_name` is keyed by).
+/// Equal for an unaliased import (`import { foo } from './x'`, `from
+/// .pkg import foo`); differ for an aliased one (`import { foo as bar
+/// } from './x'`, `from .pkg import foo as bar`). Carrying both,
+/// instead of collapsing to the one name a naive "imported names" set
+/// would keep, is what makes spec §5.3 tier (b) alias-aware — a real,
+/// pre-existing gap for Python's aliased imports (never fixed when
+/// PHP shipped, since PHP's own `RawImport::Qualified` already carried
+/// both pieces separately) fixed generically here because TypeScript/
+/// JavaScript's `import { foo as bar }` is common enough that shipping
+/// the extractor without this would make it far less useful. See
+/// `docs/adr/0013-typescript-javascript-resolution-policy-mapping.md`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportedName {
+    pub bound_name: String,
+    pub declared_name: String,
+}
+
 /// A raw import, not yet resolved to a target file or classified as
 /// external (spec §5.3 rule 1 — `resolve`'s job, since it needs to know
 /// about every other file in the repo, not just this one).
@@ -57,29 +78,39 @@ pub enum RawImport {
     /// namespace, not a file reference, and isn't extracted at all).
     /// Python's `from .pkg import a, b` (`levels_up: 0` — a single dot
     /// means "the current package", i.e. the declaring file's own
-    /// directory; `module_path: "pkg"`, `imported_names: ["a", "b"]`)
+    /// directory; `module_path: "pkg"`, `imported_names: [a, b]`)
     /// and `from . import pkg` (`levels_up: 0`, `module_path: ""`, each
     /// entry of `imported_names` itself a submodule name to resolve
     /// relative to the current directory). Each additional leading dot
     /// adds one more level (`from ..pkg import x` -> `levels_up: 1`).
+    /// TypeScript/JavaScript's `import x from './orders'` /
+    /// `../shared/utils` decompose the same way: each leading `../`
+    /// segment is one `levels_up`, and whatever remains after stripping
+    /// a single leading `./`/`../` is `module_path` — which may itself
+    /// contain internal slashes (`"shared/utils"`), tolerated as an
+    /// opaque suffix by `resolve::resolve_relative_import` already.
+    /// See ADR-0013.
     Relative {
         levels_up: u32,
         module_path: String,
-        imported_names: Vec<String>,
+        imported_names: Vec<ImportedName>,
     },
     /// Not resolved relative to the declaring file. Rust's `use
-    /// crate::a::b;` (`root: "crate"`, `imported_names: ["b"]`) and
-    /// `use serde;` (`root: "serde"`, `imported_names: ["serde"]`).
-    /// Python's `import os` (`root: "os"`, `imported_names: ["os"]`)
-    /// and `from pkg import a, b` (`root: "pkg"`, `imported_names: ["a",
-    /// "b"]`). Rust's `use_list` (`use a::{b, c};`), `use_wildcard`
+    /// crate::a::b;` (`root: "crate"`, `imported_names: [b]`) and
+    /// `use serde;` (`root: "serde"`, `imported_names: [serde]`).
+    /// Python's `import os` (`root: "os"`, `imported_names: [os]`)
+    /// and `from pkg import a, b` (`root: "pkg"`, `imported_names: [a,
+    /// b]`). Rust's `use_list` (`use a::{b, c};`), `use_wildcard`
     /// (`use a::*;`), and `use_as_clause` (`use a::b as c;`) are not
     /// extracted — deliberately modest (§5.3), documented in ADR-0008;
     /// Python's wildcard `from x import *` is excluded the same way,
-    /// documented in ADR-0011.
+    /// documented in ADR-0011. TypeScript/JavaScript's bare package
+    /// specifiers (`import x from 'lodash'`, `root: "lodash"`; a scoped
+    /// package `@scope/pkg` roots at its first *two* `/`-separated
+    /// segments) use this too — ADR-0013.
     Absolute {
         root: String,
-        imported_names: Vec<String>,
+        imported_names: Vec<ImportedName>,
     },
     /// A fully-qualified-name import with no path semantics at all —
     /// PHP's `use App\Orders\Order;` (ADR-0012). Unlike `Relative`
@@ -92,7 +123,10 @@ pub enum RawImport {
     /// declaration (see `resolve::resolve`'s `fqn_to_file`), not by
     /// walking directories. `bound_name` is the alias if the `use` has
     /// one, else the FQN's last segment — the identifier tier (b) calls
-    /// are actually written with in source.
+    /// are actually written with in source. No separate `ImportedName`
+    /// needed here: the FQN's own last segment already *is* the
+    /// declared name, derived where it's used (`resolve::resolve`)
+    /// instead of duplicated into this struct.
     Qualified { fqn: String, bound_name: String },
 }
 

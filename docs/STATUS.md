@@ -98,12 +98,13 @@ Do not "fix" these without checking the linked reasoning first:
 - **PHP anonymous classes' methods are never extracted** — anonymous
   classes have no `name:` field, so they never match `symbols.scm`'s
   four class-like-container patterns. ADR-0012.
-- **An aliased `use ... as X` import doesn't make a call written as
-  `X(...)` resolve via tier (b)**, for PHP or Python — `resolve.rs`
-  matches the call site's own identifier against `pub_by_name`, keyed by
-  the symbol's *declared* name, not its alias. A real, shared gap in the
-  bare-name matching architecture (ADR-0012), not something this slice
-  fixes.
+- ~~An aliased `use ... as X` import doesn't make a call written as
+  `X(...)` resolve via tier (b)~~ — **fixed** (ADR-0013): `RawImport`'s
+  `imported_names` now carries `ImportedName { bound_name,
+  declared_name }` pairs instead of a single flat name, and
+  `resolve.rs`'s tier (b) looks a call site's identifier up in a
+  per-file `alias_to_declared` map before consulting `pub_by_name` —
+  alias-aware for Rust, Python, PHP, and TS/JS alike.
 - **A colliding FQN (two PHP files illegally declaring the same
   namespace+name) keeps whichever file `resolve` encounters first**,
   not an error — carto only reads source, it doesn't enforce PHP's own

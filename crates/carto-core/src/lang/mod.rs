@@ -9,7 +9,7 @@ pub mod python;
 pub mod resolve;
 pub mod rust;
 
-pub use extractor::{ExtractOut, LangExtractor, RawCallSite, RawImport, RawSymbol};
+pub use extractor::{ExtractOut, ImportedName, LangExtractor, RawCallSite, RawImport, RawSymbol};
 pub use php::PhpExtractor;
 pub use python::PythonExtractor;
 pub use resolve::{FileExtraction, ResolvedExtraction, resolve};

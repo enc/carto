@@ -3,7 +3,9 @@
 //! `lang/queries/rust/*.scm`, embedded via `include_str!` so they're
 //! reviewable independently of this file (spec §5.2).
 
-use super::extractor::{ExtractOut, LangExtractor, RawCallSite, RawImport, RawSymbol};
+use super::extractor::{
+    ExtractOut, ImportedName, LangExtractor, RawCallSite, RawImport, RawSymbol,
+};
 use crate::graph::SymKind;
 use crate::lang::Lang;
 use std::collections::BTreeMap;
@@ -193,7 +195,15 @@ fn extract_imports(root: Node, src: &[u8]) -> Vec<RawImport> {
                         if let Some((root_seg, imported_name)) = walk_use_tree(arg, src) {
                             out.push(RawImport::Absolute {
                                 root: root_seg,
-                                imported_names: vec![imported_name],
+                                // `use_as_clause` isn't walked (see
+                                // `walk_use_tree`'s doc comment), so a
+                                // `use` this extractor recognizes never
+                                // aliases — bound and declared name are
+                                // always the same string.
+                                imported_names: vec![ImportedName {
+                                    declared_name: imported_name.clone(),
+                                    bound_name: imported_name,
+                                }],
                             });
                         }
                     }
@@ -378,7 +388,7 @@ mod tests {
                 RawImport::Absolute {
                     root,
                     imported_names,
-                } => Some((root.as_str(), imported_names[0].as_str())),
+                } => Some((root.as_str(), imported_names[0].bound_name.as_str())),
                 _ => None,
             })
             .collect();

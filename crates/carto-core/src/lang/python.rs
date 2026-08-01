@@ -9,7 +9,9 @@
 //! handling) is recorded in
 //! `docs/adr/0011-python-resolution-policy-mapping.md`.
 
-use super::extractor::{ExtractOut, LangExtractor, RawCallSite, RawImport, RawSymbol};
+use super::extractor::{
+    ExtractOut, ImportedName, LangExtractor, RawCallSite, RawImport, RawSymbol,
+};
 use crate::graph::SymKind;
 use crate::lang::Lang;
 use std::collections::BTreeMap;
@@ -200,7 +202,11 @@ fn extract_imports(root: Node, src: &[u8]) -> Vec<RawImport> {
 
 /// `import os` / `import pkg.sub` / `import pkg.sub as ps`. Always
 /// absolute — Python has no relative form of plain `import`, only
-/// `from`.
+/// `from`. This binds a whole *module*, not a specific declared symbol
+/// — there's no separate "declared name" to distinguish from the local
+/// binding the way a symbol import has, so `bound_name`/`declared_name`
+/// are the same string here (matches this import's pre-alias-fix
+/// behavior exactly; see `ImportedName`'s doc comment).
 fn extract_import_statement(node: Node, src: &[u8]) -> Option<RawImport> {
     let name_field = node.child_by_field_name("name")?;
     let (root, bound_name) = if name_field.kind() == "aliased_import" {
@@ -215,7 +221,10 @@ fn extract_import_statement(node: Node, src: &[u8]) -> Option<RawImport> {
     };
     Some(RawImport::Absolute {
         root,
-        imported_names: vec![bound_name],
+        imported_names: vec![ImportedName {
+            declared_name: bound_name.clone(),
+            bound_name,
+        }],
     })
 }
 
@@ -224,18 +233,31 @@ fn extract_import_statement(node: Node, src: &[u8]) -> Option<RawImport> {
 /// imported name is itself a submodule) / `from x import *` (wildcard,
 /// not extracted — no `name:` field to find, so this returns `None`
 /// exactly like an unrecognized shape would, the same "extract nothing"
-/// honesty as Rust's `use_wildcard` exclusion).
+/// honesty as Rust's `use_wildcard` exclusion). Each `name:` field's
+/// real declared name and (if aliased, `from pkg import real as
+/// alias`) its local bound name are both kept — `declared_name` is
+/// what `resolve`'s `pub_by_name`/submodule-file lookups are keyed by;
+/// `bound_name` is what a call site in *this* file actually spells.
 fn extract_import_from_statement(node: Node, src: &[u8]) -> Option<RawImport> {
     let module_name = node.child_by_field_name("module_name")?;
 
     let mut cursor = node.walk();
-    let imported_names: Vec<String> = node
+    let imported_names: Vec<ImportedName> = node
         .children_by_field_name("name", &mut cursor)
         .filter_map(|n| {
             if n.kind() == "aliased_import" {
-                n.child_by_field_name("alias").map(|a| text(src, a))
+                let declared = n.child_by_field_name("name").map(|d| text(src, d))?;
+                let bound = n.child_by_field_name("alias").map(|a| text(src, a))?;
+                Some(ImportedName {
+                    bound_name: bound,
+                    declared_name: declared,
+                })
             } else {
-                Some(text(src, n))
+                let t = text(src, n);
+                Some(ImportedName {
+                    bound_name: t.clone(),
+                    declared_name: t,
+                })
             }
         })
         .collect();
@@ -397,6 +419,17 @@ mod tests {
         assert_eq!(out.symbols[0].start_line, 1);
     }
 
+    /// Test-only shorthand for an unaliased `ImportedName` — bound and
+    /// declared name are the same string, the common case exercised by
+    /// most of these tests; the aliased case gets its own assertions
+    /// where it matters (`extracts_aliased_from_import`).
+    fn name(s: &str) -> ImportedName {
+        ImportedName {
+            bound_name: s.to_string(),
+            declared_name: s.to_string(),
+        }
+    }
+
     #[test]
     fn extracts_absolute_import_and_bound_name() {
         let out = extract("import os\nimport pkg.sub as ps\n");
@@ -407,7 +440,7 @@ mod tests {
                 RawImport::Absolute {
                     root,
                     imported_names,
-                } => Some((root.as_str(), imported_names[0].as_str())),
+                } => Some((root.as_str(), imported_names[0].bound_name.as_str())),
                 _ => None,
             })
             .collect();
@@ -434,9 +467,29 @@ mod tests {
             .expect("relative import must be extracted");
         assert_eq!(rel.0, 0);
         assert_eq!(rel.1, "orders");
+        assert_eq!(rel.2, vec![name("parse_order"), name("validate")]);
+    }
+
+    #[test]
+    fn extracts_aliased_from_import_with_distinct_bound_and_declared_names() {
+        // `from .orders import parse_order as po` -- the declared name
+        // (what `pub_by_name` is keyed by) and the bound name (what a
+        // call site in this file actually spells) genuinely differ.
+        let out = extract("from .orders import parse_order as po\n");
+        let rel = out
+            .imports
+            .iter()
+            .find_map(|i| match i {
+                RawImport::Relative { imported_names, .. } => Some(imported_names.clone()),
+                _ => None,
+            })
+            .expect("relative import must be extracted");
         assert_eq!(
-            rel.2,
-            vec!["parse_order".to_string(), "validate".to_string()]
+            rel,
+            vec![ImportedName {
+                bound_name: "po".to_string(),
+                declared_name: "parse_order".to_string(),
+            }]
         );
     }
 
@@ -473,7 +526,7 @@ mod tests {
             .unwrap();
         assert_eq!(rel.0, 0);
         assert_eq!(rel.1, "");
-        assert_eq!(rel.2, vec!["orders".to_string()]);
+        assert_eq!(rel.2, vec![name("orders")]);
     }
 
     #[test]

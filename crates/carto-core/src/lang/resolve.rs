@@ -148,32 +148,38 @@ pub fn resolve(extractions: Vec<FileExtraction>) -> ResolvedExtraction {
         }
     }
 
-    // Which bare names this file's imports mention (tier b's
-    // precondition — still needs a unique `pub_by_name` match to
-    // resolve). Both variants carry `imported_names`; Rust's `Relative`
-    // (a `mod` declaration) always has it empty, so only `Absolute`
-    // (`use`) contributes for Rust today — same resulting set as
-    // before this field became `Vec<String>` instead of
-    // `Option<String>`.
-    let imported_names: Vec<BTreeSet<&str>> = extractions
+    // Bound-name -> declared-name, per file — tier (b)'s precondition
+    // *and* its resolution key in a single map, not two independently-
+    // matched strings the way an `imported_names` set + a same-string
+    // `pub_by_name.get` used to be. A call site's own identifier is
+    // checked against this map's keys; a hit's *value* is what's
+    // actually looked up in `pub_by_name` below — the same string only
+    // for an unaliased import (`bound_name == declared_name`), which is
+    // exactly what makes this alias-aware without changing behavior for
+    // every import that isn't aliased. `Relative`/`Absolute` carry
+    // `ImportedName` pairs directly; `Qualified`'s FQN's own last
+    // segment already *is* the declared name, so nothing extra is
+    // needed there. See
+    // `docs/adr/0013-typescript-javascript-resolution-policy-mapping.md`.
+    let alias_to_declared: Vec<BTreeMap<&str, &str>> = extractions
         .iter()
         .map(|fe| {
-            fe.extract
-                .imports
-                .iter()
-                .flat_map(|imp| match imp {
-                    RawImport::Relative { imported_names, .. } => imported_names.iter(),
-                    RawImport::Absolute { imported_names, .. } => imported_names.iter(),
-                    // A single name — the alias if aliased, else the
-                    // FQN's last segment (see `RawImport::Qualified`'s
-                    // doc comment) — sliced to match the other arms'
-                    // `std::slice::Iter<String>` type.
-                    RawImport::Qualified { bound_name, .. } => {
-                        std::slice::from_ref(bound_name).iter()
+            let mut m = BTreeMap::new();
+            for imp in &fe.extract.imports {
+                match imp {
+                    RawImport::Relative { imported_names, .. }
+                    | RawImport::Absolute { imported_names, .. } => {
+                        for n in imported_names {
+                            m.insert(n.bound_name.as_str(), n.declared_name.as_str());
+                        }
                     }
-                })
-                .map(|s| s.as_str())
-                .collect()
+                    RawImport::Qualified { fqn, bound_name } => {
+                        let declared = fqn.rsplit('\\').next().unwrap_or(fqn.as_str());
+                        m.insert(bound_name.as_str(), declared);
+                    }
+                }
+            }
+            m
         })
         .collect();
 
@@ -190,7 +196,13 @@ pub fn resolve(extractions: Vec<FileExtraction>) -> ResolvedExtraction {
 
             let mut unresolved_calls = Vec::new();
             for &call in &calls_by_symbol[si] {
-                match resolve_call(fi, call, &same_file_by_name, &imported_names, &pub_by_name) {
+                match resolve_call(
+                    fi,
+                    call,
+                    &same_file_by_name,
+                    &alias_to_declared,
+                    &pub_by_name,
+                ) {
                     Some((target_fi, target_si, evidence)) => {
                         let to_id = symbol_ids[target_fi][target_si].clone();
                         edges.push(Edge::new(
@@ -285,12 +297,16 @@ pub fn resolve(extractions: Vec<FileExtraction>) -> ResolvedExtraction {
                         // Python's `from . import pkg[, pkg2]` — each
                         // name IS itself a submodule to resolve relative
                         // to the current directory (no separate
-                        // `module_path` to anchor on).
+                        // `module_path` to anchor on). Resolved by
+                        // `declared_name` (the real submodule/file name),
+                        // not `bound_name` — an alias (`from . import
+                        // pkg as p`) renames the local binding, not the
+                        // file on disk.
                         for name in imported_names {
                             if let Some(target) = resolve_relative_import(
                                 &fe.relpath,
                                 *levels_up,
-                                name,
+                                &name.declared_name,
                                 &relpath_to_file_id,
                             ) {
                                 edges.push(Edge::new(
@@ -455,7 +471,7 @@ fn resolve_call(
     caller_file_idx: usize,
     call: &RawCallSite,
     same_file_by_name: &[BTreeMap<&str, usize>],
-    imported_names: &[BTreeSet<&str>],
+    alias_to_declared: &[BTreeMap<&str, &str>],
     pub_by_name: &BTreeMap<&str, Vec<(usize, usize)>>,
 ) -> Option<(usize, usize, &'static str)> {
     let name = call.callee_name.as_str();
@@ -464,8 +480,13 @@ fn resolve_call(
         return Some((caller_file_idx, si, "same-file"));
     }
 
-    if imported_names[caller_file_idx].contains(name) {
-        if let Some(candidates) = pub_by_name.get(name) {
+    // Alias-aware: `name` is what the call site spells; the map's
+    // value (if any) is the *declared* name `pub_by_name` is keyed by
+    // — the same string for an unaliased import, a different one for
+    // `import { foo as bar }`/`from x import foo as bar`/`use Foo as
+    // X;`. See `ImportedName`'s doc comment.
+    if let Some(&declared) = alias_to_declared[caller_file_idx].get(name) {
+        if let Some(candidates) = pub_by_name.get(declared) {
             if let [(fi, si)] = candidates[..] {
                 return Some((fi, si, "imported"));
             }
@@ -540,7 +561,7 @@ fn join(dir: &str, name: &str) -> String {
 mod tests {
     use super::*;
     use crate::graph::{NodeData, SymKind};
-    use crate::lang::extractor::RawSymbol;
+    use crate::lang::extractor::{ImportedName, RawSymbol};
 
     fn file(relpath: &str) -> FileExtraction {
         FileExtraction {
@@ -567,6 +588,16 @@ mod tests {
         RawCallSite {
             callee_name: name.to_string(),
             line,
+        }
+    }
+
+    /// Test-only shorthand for an unaliased `ImportedName` — bound and
+    /// declared name are the same string, the common case for these
+    /// tests; the alias-specific tests build `ImportedName` directly.
+    fn name(s: &str) -> ImportedName {
+        ImportedName {
+            bound_name: s.to_string(),
+            declared_name: s.to_string(),
         }
     }
 
@@ -618,13 +649,82 @@ mod tests {
         let mut handlers = file("src/handlers.rs");
         handlers.extract.imports = vec![RawImport::Absolute {
             root: "crate".into(),
-            imported_names: vec!["parse_order".into()],
+            imported_names: vec![name("parse_order")],
         }];
         handlers.extract.symbols = vec![sym("handle", SymKind::Function, 1, 5, true)];
         handlers.extract.call_sites = vec![call("parse_order", 3)];
 
         let mut orders = file("src/orders.rs");
         orders.extract.symbols = vec![sym("parse_order", SymKind::Function, 1, 3, true)];
+
+        let out = resolve(vec![handlers, orders]);
+        assert!(
+            find_symbol(&out.nodes, "handle")
+                .unresolved_calls
+                .is_empty()
+        );
+        assert_eq!(
+            calls_edges(&out.edges)[0].evidence,
+            vec!["imported".to_string()]
+        );
+    }
+
+    #[test]
+    fn aliased_relative_import_resolves_a_call_written_as_the_alias() {
+        // `from .orders import parse_order as po` — the fix this test
+        // pins: before `ImportedName`/`alias_to_declared`, tier (b)
+        // matched the call site's own identifier ("po") against
+        // `pub_by_name`, which is keyed by the *declared* name
+        // ("parse_order") — a guaranteed miss for any aliased import.
+        // Shared machinery with the PHP case below (both go through
+        // `resolve_call`'s single `alias_to_declared` lookup) — see
+        // `docs/adr/0013-typescript-javascript-resolution-policy-mapping.md`.
+        let mut handlers = file("src/handlers.py");
+        handlers.origin = "lang-python@1";
+        handlers.extract.imports = vec![RawImport::Relative {
+            levels_up: 0,
+            module_path: "orders".into(),
+            imported_names: vec![ImportedName {
+                bound_name: "po".into(),
+                declared_name: "parse_order".into(),
+            }],
+        }];
+        handlers.extract.symbols = vec![sym("handle", SymKind::Function, 1, 5, true)];
+        handlers.extract.call_sites = vec![call("po", 3)];
+
+        let mut orders = file("src/orders.py");
+        orders.origin = "lang-python@1";
+        orders.extract.symbols = vec![sym("parse_order", SymKind::Function, 1, 3, true)];
+
+        let out = resolve(vec![handlers, orders]);
+        assert!(
+            find_symbol(&out.nodes, "handle")
+                .unresolved_calls
+                .is_empty()
+        );
+        assert_eq!(
+            calls_edges(&out.edges)[0].evidence,
+            vec!["imported".to_string()]
+        );
+    }
+
+    #[test]
+    fn aliased_qualified_import_resolves_a_call_written_as_the_alias() {
+        // PHP's `use App\Orders\parseOrder as po;` — same fix, exercised
+        // through `RawImport::Qualified` instead of `Relative`.
+        let mut orders = file("src/Orders.php");
+        orders.origin = "lang-php@1";
+        orders.extract.declared_namespace = Some("App\\Orders".into());
+        orders.extract.symbols = vec![sym("parseOrder", SymKind::Function, 1, 3, true)];
+
+        let mut handlers = file("src/Handlers.php");
+        handlers.origin = "lang-php@1";
+        handlers.extract.imports = vec![RawImport::Qualified {
+            fqn: "App\\Orders\\parseOrder".into(),
+            bound_name: "po".into(),
+        }];
+        handlers.extract.symbols = vec![sym("handle", SymKind::Function, 5, 8, true)];
+        handlers.extract.call_sites = vec![call("po", 6)];
 
         let out = resolve(vec![handlers, orders]);
         assert!(
@@ -748,7 +848,7 @@ mod tests {
         python_file.extract.imports = vec![RawImport::Relative {
             levels_up: 0,
             module_path: "orders".into(),
-            imported_names: vec!["parse_order".into(), "validate".into()],
+            imported_names: vec![name("parse_order"), name("validate")],
         }];
         let orders = file("pkg/orders.py");
 
@@ -769,7 +869,7 @@ mod tests {
         python_file.extract.imports = vec![RawImport::Relative {
             levels_up: 1,
             module_path: "orders".into(),
-            imported_names: vec!["parse_order".into()],
+            imported_names: vec![name("parse_order")],
         }];
         let orders = file("pkg/orders.py");
 
@@ -787,7 +887,7 @@ mod tests {
         python_file.extract.imports = vec![RawImport::Relative {
             levels_up: 0,
             module_path: "".into(),
-            imported_names: vec!["orders".into(), "handlers".into()],
+            imported_names: vec![name("orders"), name("handlers")],
         }];
         let orders = file("pkg/orders.py");
         let handlers = file("pkg/handlers.py");
@@ -879,16 +979,11 @@ mod tests {
     fn php_qualified_import_resolves_call_via_tier_b() {
         // `use App\Orders\parseOrder;` (unaliased) makes `parseOrder`
         // resolve via tier (b) exactly like Rust's `use` / Python's
-        // `from .. import` — tier (b) matches the call site's own
-        // identifier against `pub_by_name`'s bare-name key, so it only
-        // works when the two spellings coincide, same as both other
-        // languages. An *aliased* `use ... as X` (`bound_name: "X"`)
-        // registers "X" as imported for `imported_names`, but a call
-        // written as `X(...)` still won't resolve through `pub_by_name`
-        // (keyed by the symbol's real declared name, "parseOrder", not
-        // its alias) -- a limitation this shares with Python's own
-        // aliased `from x import y as z`, not something new to PHP or
-        // fixed by this slice.
+        // `from .. import` — the unaliased baseline, `bound_name ==
+        // declared_name`, still works after the `alias_to_declared`
+        // rework. The *aliased* case (`use ... as X`), once a
+        // documented gap here, is now covered by
+        // `aliased_qualified_import_resolves_a_call_written_as_the_alias`.
         let mut orders = file("src/Orders.php");
         orders.origin = "lang-php@1";
         orders.extract.declared_namespace = Some("App\\Orders".into());
@@ -920,12 +1015,12 @@ mod tests {
         let mut a = file("src/a.rs");
         a.extract.imports = vec![RawImport::Absolute {
             root: "serde".into(),
-            imported_names: vec!["Deserialize".into()],
+            imported_names: vec![name("Deserialize")],
         }];
         let mut b = file("src/b.rs");
         b.extract.imports = vec![RawImport::Absolute {
             root: "serde".into(),
-            imported_names: vec!["Serialize".into()],
+            imported_names: vec![name("Serialize")],
         }];
 
         let out = resolve(vec![a, b]);
@@ -951,7 +1046,7 @@ mod tests {
         let mut f = file("src/handlers.rs");
         f.extract.imports = vec![RawImport::Absolute {
             root: "crate".into(),
-            imported_names: vec!["parse_order".into()],
+            imported_names: vec![name("parse_order")],
         }];
 
         let out = resolve(vec![f]);
@@ -974,7 +1069,7 @@ mod tests {
         let mut handlers = file("src/handlers.rs");
         handlers.extract.imports = vec![RawImport::Absolute {
             root: "orders".into(),
-            imported_names: vec!["parse_order".into()],
+            imported_names: vec![name("parse_order")],
         }];
 
         let out = resolve(vec![lib, handlers]);
