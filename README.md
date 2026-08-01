@@ -37,9 +37,10 @@ carto never calls an LLM and never needs an API key.
 ## Status
 
 Implementation in progress, milestone by milestone (spec §10). Currently:
-**M1.b.3 complete** — `carto index`/`where`/`deps`/`map` work end-to-end
-against an indexed Rust repo; TS/TSX/JS/Python/Go extractors not started
-yet. See [`docs/STATUS.md`](docs/STATUS.md) for the detailed handoff.
+**M1.b.2b in progress** — `carto index`/`where`/`deps`/`map` work
+end-to-end against Rust and Python repos; TS/TSX/JS/Go extractors not
+started yet. See [`docs/STATUS.md`](docs/STATUS.md) for the detailed
+handoff.
 
 ## Building
 

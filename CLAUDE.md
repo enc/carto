@@ -28,6 +28,7 @@ cargo test -p carto-cli --test cli_extraction # one integration test file
 cargo test -p carto-core lang::rust::tests::extracts_top_level_function  # one test
 
 cargo run -p carto-cli -- index fixtures/rust-crate --out /tmp/carto-out
+cargo run -p carto-cli -- index fixtures/py-lib --out /tmp/carto-out
 cargo run -p carto-cli -- index <repo> --json 2>/dev/null | python3 -m json.tool
 cargo run -p carto-cli -- where <name> <repo> --out /tmp/carto-out
 cargo run -p carto-cli -- deps <name|id> <repo> --out /tmp/carto-out --dir out --depth 2
@@ -117,7 +118,10 @@ detail to reshape freely.
 ### Language extraction is two-phase
 
 Per-file extraction and whole-repo resolution are deliberately separate
-(`lang/extractor.rs` → `lang/rust.rs` → `lang/resolve.rs`):
+(`lang/extractor.rs` → `lang/{rust,python}.rs` → `lang/resolve.rs`).
+`lang::extract_and_resolve` dispatches each file to its extractor by
+`Lang` (a small registry, `lang/mod.rs::extractors()`), not a
+hard-coded single language:
 
 1. **Extract** parses one file into `RawSymbol`/`RawImport`/`RawCallSite`
    using tree-sitter queries kept as reviewable `.scm` files under
@@ -127,13 +131,22 @@ Per-file extraction and whole-repo resolution are deliberately separate
    deliberately modest: first-match-wins across three tiers, `calls` edges
    are **always `inferred`, never `certain`**, and zero-or-multiple
    candidates produce **no edge**, recorded in the caller's
-   `unresolved_calls` instead. Missing honestly beats guessing.
+   `unresolved_calls` instead. Missing honestly beats guessing. The
+   tier-resolution logic itself is language-agnostic; only import
+   handling (`RawImport::Relative`/`Absolute`, spanning both languages
+   today) and each extractor's own `is_pub`-equivalent gate are
+   per-language.
 
-Adding a language means: a `.scm` query set, a `LangExtractor` impl, and an
-ADR mapping §5.3's generic rules onto that language's actual import/call
-semantics. [ADR-0008](docs/adr/0008-rust-resolution-policy-mapping.md) does
-this for Rust and is the template — but not a rule that transfers verbatim
-(TS's `import './x'` is genuinely file-relative; nothing in Rust is).
+Adding a language means: a `.scm` query set, a `LangExtractor` impl
+(registered in `extractors()`), and an ADR mapping §5.3's generic rules
+onto that language's actual import/call semantics.
+[ADR-0008](docs/adr/0008-rust-resolution-policy-mapping.md) (Rust) and
+[ADR-0011](docs/adr/0011-python-resolution-policy-mapping.md) (Python)
+are the two worked examples so far — templates, not rules that transfer
+verbatim (Python's attribute-call syntax can't even distinguish a
+module-qualified call from an instance call the way Rust's grammar
+does; TS's `import './x'` is genuinely file-relative in a way neither
+Rust's nor Python's import model is).
 
 ## Conventions
 
