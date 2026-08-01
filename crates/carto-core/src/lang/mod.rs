@@ -121,6 +121,7 @@ pub fn extract_and_resolve(repo_root: &Path, file_nodes: &[Node]) -> ResolvedExt
             relpath: file.path.clone(),
             extract: extractor.extract(&content, &file.path),
             origin: extractor.origin(),
+            dir_scoped: extractor.package_scope_is_directory(),
         });
     }
 

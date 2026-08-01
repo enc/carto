@@ -27,6 +27,10 @@ pub struct FileExtraction {
     /// module-wide constant since `resolve` processes files from more
     /// than one extractor in a single pass (M1.b.2b).
     pub origin: &'static str,
+    /// [`super::LangExtractor::package_scope_is_directory`]'s value for
+    /// the producing extractor — `true` only for Go (ADR-0015). Enables
+    /// tier (a′) for this file's calls.
+    pub dir_scoped: bool,
 }
 
 pub struct ResolvedExtraction {
@@ -177,11 +181,46 @@ pub fn resolve(extractions: Vec<FileExtraction>) -> ResolvedExtraction {
                         let declared = fqn.rsplit('\\').next().unwrap_or(fqn.as_str());
                         m.insert(bound_name.as_str(), declared);
                     }
+                    // Go's package-import binds a *package* name, never a
+                    // symbol name — nothing to pair here. See
+                    // `RawImport::PackagePath`'s own doc comment
+                    // (ADR-0015): Go can never feed tier (b).
+                    RawImport::PackagePath { .. } => {}
                 }
             }
             m
         })
         .collect();
+
+    // Go's directory-scoped visibility (ADR-0015): files in one directory
+    // see each other's symbols regardless of visibility, with no import
+    // at all — a shape none of Rust/Python/PHP/TS/JS have. Built only
+    // from `dir_scoped` files (every other language's extractor leaves
+    // this `false`, so these maps are empty and tier (a′) never fires for
+    // them). `file_dir` also backs `RawImport::PackagePath` resolution
+    // below, which needs "every directory containing a Go file" the same
+    // shape describes.
+    let file_dir: Vec<&str> = extractions
+        .iter()
+        .map(|fe| relpath_dir(&fe.relpath))
+        .collect();
+    let dir_scoped: Vec<bool> = extractions.iter().map(|fe| fe.dir_scoped).collect();
+
+    let mut same_dir_by_name: BTreeMap<(&str, &str), Vec<(usize, usize)>> = BTreeMap::new();
+    let mut dir_files: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    for (fi, fe) in extractions.iter().enumerate() {
+        if !fe.dir_scoped {
+            continue;
+        }
+        let dir = file_dir[fi];
+        dir_files.entry(dir).or_default().push(fi);
+        for (si, sym) in fe.extract.symbols.iter().enumerate() {
+            same_dir_by_name
+                .entry((dir, sym.name.as_str()))
+                .or_default()
+                .push((fi, si));
+        }
+    }
 
     let mut nodes = Vec::new();
     let mut edges = Vec::new();
@@ -202,6 +241,9 @@ pub fn resolve(extractions: Vec<FileExtraction>) -> ResolvedExtraction {
                     &same_file_by_name,
                     &alias_to_declared,
                     &pub_by_name,
+                    &dir_scoped,
+                    &file_dir,
+                    &same_dir_by_name,
                 ) {
                     Some((target_fi, target_si, evidence)) => {
                         let to_id = symbol_ids[target_fi][target_si].clone();
@@ -414,6 +456,64 @@ pub fn resolve(extractions: Vec<FileExtraction>) -> ResolvedExtraction {
                         ));
                     }
                 }
+                RawImport::PackagePath { path } => {
+                    // Go's `import "github.com/acme/svc/internal/orders"`
+                    // (ADR-0015) — resolved against `dir_files` (every
+                    // walked directory containing a Go file) by longest
+                    // suffix match, not a `go.mod`-anchored exact path.
+                    match resolve_go_package_path(path, &dir_files) {
+                        Some(dir) => {
+                            // One edge per file in the target directory:
+                            // Go's import unit is the package (directory),
+                            // not a single file the way every other
+                            // language's import target is.
+                            for &target_fi in &dir_files[dir] {
+                                if target_fi == fi {
+                                    continue; // no self-edge
+                                }
+                                edges.push(Edge::new(
+                                    EdgeKind::Imports,
+                                    fe.file_id.clone(),
+                                    extractions[target_fi].file_id.clone(),
+                                    Confidence::Certain,
+                                    "package-import".to_string(),
+                                ));
+                            }
+                        }
+                        None => {
+                            // No walked directory's path matches: an
+                            // external package. Keyed by the *full*
+                            // import path, not a truncated root — a Go
+                            // import path is canonical package identity
+                            // (unlike npm's `@scope/pkg/subpath`
+                            // convention, where a sub-path is the same
+                            // package), so no truncation is correct here.
+                            let module_id = external_modules
+                                .entry(path.as_str())
+                                .or_insert_with(|| {
+                                    let id = graph::module_id(path, true);
+                                    nodes.push(Node::module(
+                                        id.clone(),
+                                        Provenance::Syntactic,
+                                        fe.origin,
+                                        ModuleNode {
+                                            path: path.clone(),
+                                            external: true,
+                                        },
+                                    ));
+                                    id
+                                })
+                                .clone();
+                            edges.push(Edge::new(
+                                EdgeKind::Imports,
+                                fe.file_id.clone(),
+                                module_id,
+                                Confidence::Certain,
+                                "external-package".to_string(),
+                            ));
+                        }
+                    }
+                }
             }
         }
     }
@@ -463,21 +563,41 @@ fn assign_calls_to_innermost_symbol<'a>(
     by_symbol
 }
 
-/// Spec §5.3 rule 2, in order, first match wins: (a) same-file, (b)
-/// imported into the file, (c) same-package (v1: same walked repo).
-/// Returns `(target_file_index, target_symbol_index, evidence)` or
-/// `None` if no tier produced exactly one candidate.
+/// Spec §5.3 rule 2, in order, first match wins: (a) same-file, (a′)
+/// same-directory (Go only, ADR-0015), (b) imported into the file, (c)
+/// same-package (v1: same walked repo). Returns `(target_file_index,
+/// target_symbol_index, evidence)` or `None` if no tier produced exactly
+/// one candidate.
+#[allow(clippy::too_many_arguments)]
 fn resolve_call(
     caller_file_idx: usize,
     call: &RawCallSite,
     same_file_by_name: &[BTreeMap<&str, usize>],
     alias_to_declared: &[BTreeMap<&str, &str>],
     pub_by_name: &BTreeMap<&str, Vec<(usize, usize)>>,
+    dir_scoped: &[bool],
+    file_dir: &[&str],
+    same_dir_by_name: &BTreeMap<(&str, &str), Vec<(usize, usize)>>,
 ) -> Option<(usize, usize, &'static str)> {
     let name = call.callee_name.as_str();
 
     if let Some(&si) = same_file_by_name[caller_file_idx].get(name) {
         return Some((caller_file_idx, si, "same-file"));
+    }
+
+    // Tier (a′), Go only (ADR-0015): same directory, any visibility —
+    // files in one Go package see each other's unexported symbols with
+    // no import at all. Gated on `dir_scoped` so a non-Go file that
+    // happens to share a directory with a Go file (an unusual mixed-repo
+    // layout) never picks up this tier.
+    if dir_scoped[caller_file_idx] {
+        let dir = file_dir[caller_file_idx];
+        if let Some(candidates) = same_dir_by_name.get(&(dir, name)) {
+            let mut others = candidates.iter().filter(|(fi, _)| *fi != caller_file_idx);
+            if let (Some(&(fi, si)), None) = (others.next(), others.next()) {
+                return Some((fi, si, "same-directory"));
+            }
+        }
     }
 
     // Alias-aware: `name` is what the call site spells; the map's
@@ -529,10 +649,7 @@ fn resolve_relative_import<'a>(
     module_path: &str,
     relpath_to_file_id: &BTreeMap<&str, &'a NodeId>,
 ) -> Option<&'a NodeId> {
-    let mut dir = declaring_relpath
-        .rsplit_once('/')
-        .map(|(d, _)| d)
-        .unwrap_or("");
+    let mut dir = relpath_dir(declaring_relpath);
     for _ in 0..levels_up {
         dir = dir.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
     }
@@ -576,6 +693,40 @@ fn join(dir: &str, name: &str) -> String {
     }
 }
 
+/// The repo-relative directory containing `relpath` — everything before
+/// the last `/`, or `""` for a repo-root file. Shared by
+/// `resolve_relative_import`'s own directory-walking and Go's
+/// directory-scoped resolution (ADR-0015), both of which need a file's
+/// own containing directory as their starting point.
+fn relpath_dir(relpath: &str) -> &str {
+    relpath.rsplit_once('/').map(|(d, _)| d).unwrap_or("")
+}
+
+/// Resolves a Go import path (`RawImport::PackagePath`, ADR-0015) to a
+/// walked directory by longest suffix match against every directory
+/// containing a `dir_scoped` (Go) file — no `go.mod` parsing.
+/// `github.com/acme/svc/internal/orders` matches a walked
+/// `internal/orders` directory because the import path ends with
+/// `/internal/orders` (or equals it exactly, for a top-level package
+/// directory with no further nesting). Longest match wins so a deeper,
+/// more-specific directory is preferred over a coincidentally-matching
+/// shorter one. A coincidental suffix match — an external import whose
+/// path happens to end with a local directory's own path — is a known,
+/// accepted false positive: the cost of not parsing `go.mod`'s module
+/// declaration to compute an exact prefix instead.
+fn resolve_go_package_path<'a>(
+    import_path: &str,
+    dir_files: &BTreeMap<&'a str, Vec<usize>>,
+) -> Option<&'a str> {
+    dir_files
+        .keys()
+        .filter(|&&dir| {
+            !dir.is_empty() && (import_path == dir || import_path.ends_with(&format!("/{dir}")))
+        })
+        .max_by_key(|dir| dir.len())
+        .copied()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -588,6 +739,7 @@ mod tests {
             relpath: relpath.to_string(),
             extract: ExtractOut::default(),
             origin: "lang-rust@1",
+            dir_scoped: false,
         }
     }
 
@@ -1112,5 +1264,158 @@ mod tests {
             .collect();
         assert_eq!(contains.len(), 1);
         assert_eq!(contains[0].confidence, Confidence::Certain);
+    }
+
+    /// Test-only shorthand for a Go file (ADR-0015): `dir_scoped: true`,
+    /// distinguishing it from every other language's `file()` helper
+    /// above, which defaults `dir_scoped` to `false`.
+    fn go_file(relpath: &str) -> FileExtraction {
+        let mut f = file(relpath);
+        f.origin = "lang-go@1";
+        f.dir_scoped = true;
+        f
+    }
+
+    #[test]
+    fn same_directory_call_resolves_an_unexported_go_callee() {
+        // Go's tier (a′): `normalize` is unexported (no import needed)
+        // but declared in a sibling file in the same directory.
+        let mut order = go_file("internal/orders/order.go");
+        order.extract.symbols = vec![sym("ParseOrder", SymKind::Function, 1, 5, true)];
+        order.extract.call_sites = vec![call("normalize", 3)];
+
+        let mut helpers = go_file("internal/orders/helpers.go");
+        helpers.extract.symbols = vec![sym("normalize", SymKind::Function, 1, 2, false)];
+
+        let out = resolve(vec![order, helpers]);
+        assert!(
+            find_symbol(&out.nodes, "ParseOrder")
+                .unresolved_calls
+                .is_empty()
+        );
+        assert_eq!(
+            calls_edges(&out.edges)[0].evidence,
+            vec!["same-directory".to_string()]
+        );
+    }
+
+    #[test]
+    fn ambiguous_same_directory_candidates_produce_no_edge() {
+        let mut caller = go_file("pkg/a.go");
+        caller.extract.symbols = vec![sym("run", SymKind::Function, 1, 5, true)];
+        caller.extract.call_sites = vec![call("helper", 3)];
+
+        let mut b = go_file("pkg/b.go");
+        b.extract.symbols = vec![sym("helper", SymKind::Function, 1, 2, false)];
+        let mut c = go_file("pkg/c.go");
+        c.extract.symbols = vec![sym("helper", SymKind::Function, 1, 2, false)];
+
+        let out = resolve(vec![caller, b, c]);
+        let run = find_symbol(&out.nodes, "run");
+        assert_eq!(run.unresolved_calls.len(), 1);
+        assert_eq!(run.unresolved_calls[0].name, "helper");
+        assert!(calls_edges(&out.edges).is_empty());
+    }
+
+    #[test]
+    fn a_non_go_file_sharing_a_directory_with_a_go_file_never_gets_tier_a_prime() {
+        // Guards the `dir_scoped[caller_file_idx]` gate itself: a
+        // same-directory unexported symbol must NOT resolve for a caller
+        // whose own extractor never opted into directory scoping, even
+        // if (unrealistically) it shares a directory with a Go file.
+        let mut caller = file("pkg/a.rs"); // NOT go_file — dir_scoped: false
+        caller.extract.symbols = vec![sym("run", SymKind::Function, 1, 5, true)];
+        caller.extract.call_sites = vec![call("helper", 3)];
+
+        let mut sibling = go_file("pkg/b.go");
+        sibling.extract.symbols = vec![sym("helper", SymKind::Function, 1, 2, false)];
+
+        let out = resolve(vec![caller, sibling]);
+        let run = find_symbol(&out.nodes, "run");
+        assert_eq!(run.unresolved_calls.len(), 1);
+        assert_eq!(run.unresolved_calls[0].name, "helper");
+    }
+
+    #[test]
+    fn go_package_path_import_fans_out_to_every_file_in_the_target_directory() {
+        let mut main = go_file("cmd/server/main.go");
+        main.extract.imports = vec![RawImport::PackagePath {
+            path: "github.com/acme/svc/internal/orders".into(),
+        }];
+
+        let order = go_file("internal/orders/order.go");
+        let helpers = go_file("internal/orders/helpers.go");
+
+        let out = resolve(vec![main, order, helpers]);
+        let imports = imports_edges(&out.edges);
+        assert_eq!(imports.len(), 2, "one edge per file in the target dir");
+        assert!(imports.iter().all(|e| e.confidence == Confidence::Certain));
+        assert!(
+            imports
+                .iter()
+                .all(|e| e.evidence == vec!["package-import".to_string()])
+        );
+    }
+
+    #[test]
+    fn longest_suffix_match_wins_for_go_package_path() {
+        // Both "pkg/orders" and "orders" would match a naive single-
+        // segment suffix check; the deeper, more specific directory must
+        // win over the shallower coincidental one.
+        let mut main = go_file("cmd/main.go");
+        main.extract.imports = vec![RawImport::PackagePath {
+            path: "github.com/acme/svc/pkg/orders".into(),
+        }];
+
+        let deep = go_file("pkg/orders/order.go");
+        let shallow = go_file("orders/order.go");
+
+        let out = resolve(vec![main, deep, shallow]);
+        let imports = imports_edges(&out.edges);
+        assert_eq!(imports.len(), 1);
+        assert_eq!(imports[0].to, graph::file_id("pkg/orders/order.go"));
+    }
+
+    #[test]
+    fn unmatched_go_package_path_produces_a_full_path_external_module_node() {
+        let mut main = go_file("cmd/main.go");
+        main.extract.imports = vec![RawImport::PackagePath {
+            path: "github.com/lib/pq".into(),
+        }];
+
+        let out = resolve(vec![main]);
+        let module_nodes: Vec<&ModuleNode> = out
+            .nodes
+            .iter()
+            .filter_map(|n| match &n.data {
+                NodeData::Module(m) => Some(m),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(module_nodes.len(), 1);
+        assert_eq!(module_nodes[0].path, "github.com/lib/pq");
+        assert!(module_nodes[0].external);
+
+        let imports = imports_edges(&out.edges);
+        assert_eq!(imports.len(), 1);
+        assert_eq!(imports[0].confidence, Confidence::Certain);
+        assert_eq!(imports[0].evidence, vec!["external-package".to_string()]);
+    }
+
+    #[test]
+    fn blank_go_import_still_produces_a_dependency_edge() {
+        // `import _ "github.com/acme/svc/internal/orders"` — the local
+        // binding is discarded by Go itself, but the dependency is real.
+        // `PackagePath` carries no bound-name field at all, so a blank
+        // import is indistinguishable from (and handled identically to)
+        // a normal one — nothing extractor-side to special-case.
+        let mut main = go_file("cmd/main.go");
+        main.extract.imports = vec![RawImport::PackagePath {
+            path: "internal/orders".into(),
+        }];
+        let order = go_file("internal/orders/order.go");
+
+        let out = resolve(vec![main, order]);
+        assert_eq!(imports_edges(&out.edges).len(), 1);
     }
 }

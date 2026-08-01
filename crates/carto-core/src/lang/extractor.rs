@@ -128,6 +128,30 @@ pub enum RawImport {
     /// declared name, derived where it's used (`resolve::resolve`)
     /// instead of duplicated into this struct.
     Qualified { fqn: String, bound_name: String },
+    /// A Go import path — `import "github.com/acme/svc/internal/orders"`
+    /// (ADR-0015). None of the three variants above fit: there's no path
+    /// arithmetic from the declaring file (`Relative`), no meaningful root
+    /// to classify by itself (`Absolute` — `github.com` is useless),
+    /// and no FQN-to-single-file index (`Qualified`, PHP's `\`-separated
+    /// model, where the *whole* name identifies one declaration). A Go
+    /// import path instead names a *directory* — `resolve` matches it
+    /// against every walked directory's repo-relative path by longest
+    /// suffix (no `go.mod` parsing, same "no manifest parsing" precedent
+    /// as Python/PHP/TS's absolute imports) and, on a hit, produces one
+    /// edge per Go file in that directory, since Go's import unit is the
+    /// package (directory), not a single file the way every other
+    /// language's import target is.
+    ///
+    /// No `imported_names`/`bound_name` here, unlike `Absolute`/
+    /// `Qualified`: an import binds the *package* name (`orders`), never
+    /// a symbol name, so there is nothing to pair with a call site's own
+    /// identifier the way tier (b) needs — a Go import can never feed
+    /// tier (b) at all (ADR-0015's "never uses tier (b)" consequence). A
+    /// dot import (`import . "fmt"`) and a blank import (`import _ "x"`)
+    /// use this same variant with no special casing: a blank import is
+    /// still a real dependency edge, and a dot import's local-binding
+    /// behavior isn't consumed by anything here anyway.
+    PackagePath { path: String },
 }
 
 /// A call expression's callee, before resolution. `line` locates it for
@@ -166,4 +190,15 @@ pub trait LangExtractor {
     /// hard-coded `ORIGIN` constant stopped being accurate once a
     /// Python symbol could otherwise claim `lang-rust@1`.
     fn origin(&self) -> &'static str;
+
+    /// Whether this language's package scope is the declaring file's own
+    /// *directory* rather than the file itself (Go: files in one
+    /// directory see each other's unexported symbols with no import at
+    /// all — ADR-0015). Enables `resolve`'s directory-scoped resolution
+    /// tier (a′) for this extractor's files. Defaults to `false` so every
+    /// existing extractor is unaffected — Rust/Python/PHP/TS/TSX/JS all
+    /// scope visibility at the file, not the directory.
+    fn package_scope_is_directory(&self) -> bool {
+        false
+    }
 }
