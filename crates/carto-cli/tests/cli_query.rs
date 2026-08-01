@@ -276,6 +276,183 @@ fn map_respects_budget_at_multiple_sizes() {
     }
 }
 
+/// `deps`'s root `root_unresolved_calls` end-to-end, human output: real
+/// pain point from field feedback was `--dir out` returning empty with
+/// no way to tell "calls nothing" from "everything unresolved" — this
+/// asserts the human-readable line actually appears, not just the
+/// `--json` field (already covered by `deps_matches_golden_json`).
+#[test]
+fn deps_human_output_shows_root_unresolved_calls() {
+    let out = TempDir::new("deps-unresolved-human");
+    index(out.path());
+
+    let output = Command::cargo_bin("carto")
+        .unwrap()
+        .arg("deps")
+        .arg("handle")
+        .arg(fixture_path())
+        .arg("--out")
+        .arg(out.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("unresolved call") && stdout.contains("unknown_external_call"),
+        "got: {stdout}"
+    );
+}
+
+/// `where --subpath` end-to-end (spec §7.1): `"order"` (substring)
+/// matches `log_order` (src/handlers.rs), `parse_order`/`audit_order`/
+/// `Order` (src/orders.rs) unscoped; `--subpath src/orders.rs` must
+/// exclude `log_order` specifically, not just shrink the count.
+#[test]
+fn where_subpath_restricts_matches_to_the_given_file() {
+    let out = TempDir::new("where-subpath");
+    index(out.path());
+
+    let unscoped = Command::cargo_bin("carto")
+        .unwrap()
+        .arg("where")
+        .arg("order")
+        .arg(fixture_path())
+        .arg("--out")
+        .arg(out.path())
+        .arg("--json")
+        .output()
+        .unwrap();
+    let unscoped_value: serde_json::Value = serde_json::from_slice(&unscoped.stdout).unwrap();
+    let unscoped_names: Vec<String> = unscoped_value["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["name"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        unscoped_names.contains(&"log_order".to_string()),
+        "{unscoped_names:?}"
+    );
+
+    let scoped = Command::cargo_bin("carto")
+        .unwrap()
+        .arg("where")
+        .arg("order")
+        .arg(fixture_path())
+        .arg("--out")
+        .arg(out.path())
+        .arg("--subpath")
+        .arg("src/orders.rs")
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(scoped.status.success());
+    let scoped_value: serde_json::Value = serde_json::from_slice(&scoped.stdout).unwrap();
+    let scoped_names: Vec<String> = scoped_value["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["name"].as_str().unwrap().to_string())
+        .collect();
+    assert!(
+        !scoped_names.contains(&"log_order".to_string()),
+        "{scoped_names:?}"
+    );
+    assert!(scoped_names.contains(&"parse_order".to_string()));
+    assert!(scoped_names.contains(&"audit_order".to_string()));
+}
+
+/// `deps --subpath` end-to-end: proves the BFS still traverses through
+/// an out-of-scope hop (`log_order`, src/handlers.rs) to reach a
+/// deeper in-scope one (`validate`, src/orders.rs), not just that
+/// out-of-scope rows are hidden.
+#[test]
+fn deps_subpath_hides_an_out_of_scope_hop_but_keeps_traversing() {
+    let out = TempDir::new("deps-subpath");
+    index(out.path());
+
+    let output = Command::cargo_bin("carto")
+        .unwrap()
+        .arg("deps")
+        .arg("handle")
+        .arg(fixture_path())
+        .arg("--out")
+        .arg(out.path())
+        .arg("--dir")
+        .arg("out")
+        .arg("--depth")
+        .arg("2")
+        .arg("--subpath")
+        .arg("src/orders.rs")
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let hops = value["hops"].as_array().unwrap();
+
+    let hop1_labels: Vec<&str> = hops[0]["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["node"]["label"].as_str().unwrap())
+        .collect();
+    assert!(
+        !hop1_labels.contains(&"log_order"),
+        "log_order (src/handlers.rs) must be hidden: {hop1_labels:?}"
+    );
+    assert!(hop1_labels.contains(&"parse_order"));
+
+    // validate is reached via parse_order at depth 2 — only findable if
+    // the BFS kept expanding past handle's other, non-hidden neighbors
+    // regardless of scoping.
+    let all_labels: Vec<&str> = hops
+        .iter()
+        .flat_map(|h| h["edges"].as_array().unwrap())
+        .map(|e| e["node"]["label"].as_str().unwrap())
+        .collect();
+    assert!(all_labels.contains(&"validate"), "{all_labels:?}");
+}
+
+/// `map --subpath` end-to-end: restricts the file count to just the
+/// named file, proving the CLI flag actually reaches `MapQuery` (unlike
+/// the positional PATH argument, which — per the real-world feedback
+/// that motivated this flag — silently doesn't).
+#[test]
+fn map_subpath_restricts_file_counts() {
+    let out = TempDir::new("map-subpath");
+    index(out.path());
+
+    let unscoped = Command::cargo_bin("carto")
+        .unwrap()
+        .arg("map")
+        .arg(fixture_path())
+        .arg("--out")
+        .arg(out.path())
+        .arg("--json")
+        .output()
+        .unwrap();
+    let unscoped_value: serde_json::Value = serde_json::from_slice(&unscoped.stdout).unwrap();
+    let unscoped_files = unscoped_value["counts"]["files"].as_u64().unwrap();
+
+    let scoped = Command::cargo_bin("carto")
+        .unwrap()
+        .arg("map")
+        .arg(fixture_path())
+        .arg("--out")
+        .arg(out.path())
+        .arg("--subpath")
+        .arg("src/handlers.rs")
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(scoped.status.success());
+    let scoped_value: serde_json::Value = serde_json::from_slice(&scoped.stdout).unwrap();
+    assert_eq!(scoped_value["counts"]["files"].as_u64().unwrap(), 1);
+    assert!(unscoped_files > 1);
+}
+
 #[test]
 fn map_json_matches_golden_json() {
     let out = TempDir::new("map-golden");

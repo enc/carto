@@ -34,6 +34,13 @@ pub struct WhereArgs {
     /// Max matches to return.
     #[arg(long, default_value_t = query::find::DEFAULT_LIMIT)]
     limit: usize,
+
+    /// Restrict matches to symbols under this repo-relative directory
+    /// (e.g. `src/handlers`). Independent of the positional PATH
+    /// argument above, which only locates the index — PATH doesn't
+    /// scope an already-built `--out` index by itself.
+    #[arg(long)]
+    subpath: Option<String>,
 }
 
 pub fn run(args: &WhereArgs) -> Result<query::FindResult> {
@@ -44,6 +51,7 @@ pub fn run(args: &WhereArgs) -> Result<query::FindResult> {
         needle: args.needle.clone(),
         exact: args.exact,
         limit: args.limit,
+        subpath: args.subpath.clone(),
     };
     Ok(query::find(&qg, &find_query))
 }

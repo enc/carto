@@ -25,6 +25,15 @@ pub struct MapArgs {
     /// Max lines in the rendered overview.
     #[arg(long, default_value_t = consts::DEFAULT_MAP_BUDGET)]
     budget: u32,
+
+    /// Restrict the overview to this repo-relative directory (e.g.
+    /// `src/handlers`) — each section's underlying numbers stay
+    /// whole-repo-accurate; only which rows are listed narrows.
+    /// Independent of the positional PATH argument above, which only
+    /// locates the index — PATH doesn't scope an already-built `--out`
+    /// index by itself.
+    #[arg(long)]
+    subpath: Option<String>,
 }
 
 pub fn run(args: &MapArgs) -> Result<query::MapResult> {
@@ -33,6 +42,7 @@ pub fn run(args: &MapArgs) -> Result<query::MapResult> {
     let qg = QueryGraph::from_document(doc);
     let map_query = MapQuery {
         budget: args.budget,
+        subpath: args.subpath.clone(),
     };
     Ok(query::map(&qg, &map_query))
 }

@@ -57,6 +57,15 @@ pub struct DepsArgs {
     /// `contains,imports,calls`). Defaults to every kind.
     #[arg(long)]
     kinds: Option<String>,
+
+    /// Restrict reported rows to nodes under this repo-relative
+    /// directory (e.g. `src/handlers`). The traversal itself still
+    /// crosses out of the subtree and back if that's where the real
+    /// dependency chain goes — only which rows get shown is
+    /// restricted. Independent of the positional PATH argument above,
+    /// which only locates the index.
+    #[arg(long)]
+    subpath: Option<String>,
 }
 
 pub fn run(args: &DepsArgs) -> Result<query::DepsResult> {
@@ -74,6 +83,7 @@ pub fn run(args: &DepsArgs) -> Result<query::DepsResult> {
         dir: args.dir.into(),
         depth: args.depth,
         kinds,
+        subpath: args.subpath.clone(),
     };
     query::deps(&qg, &deps_query)
 }

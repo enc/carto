@@ -21,7 +21,7 @@ pub mod deps;
 pub mod find;
 pub mod map;
 
-use crate::graph::{Edge, EdgeId, GraphDocument, Node, NodeId, SymbolNode};
+use crate::graph::{Edge, EdgeId, GraphDocument, Node, NodeData, NodeId, SymbolNode};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -172,6 +172,36 @@ impl QueryGraph {
             .map(|f| f.path.as_str())
             .unwrap_or("<unknown-file>");
         format!("{file_path}:{}-{}", sym.start_line, sym.end_line)
+    }
+
+    /// Whether `id` is "in scope" for a `--subpath <dir>` filter (spec
+    /// §7.1), shared by `find`/`deps`/`map` rather than three bespoke
+    /// implementations. `subpath: None` (or empty/whitespace-only,
+    /// tolerated as equivalent) means "no filter" — always `true`. A
+    /// `File` node is in scope iff its `path` equals `subpath` or
+    /// starts with `subpath` + `"/"` — segment-boundary-safe, so
+    /// `"src/handlers"` doesn't also match `"src/handlers2/x.ts"`. A
+    /// `Symbol` node is in scope iff its *owning file* is (a dangling
+    /// file reference is conservatively out of scope, not a panic). A
+    /// `Module` node is always in scope: packages have no directory, so
+    /// subpath filtering was never meant to exclude them by path —
+    /// they're either pulled in by an in-scope file's own edges or
+    /// they aren't shown at all, the same way they already work today.
+    pub fn path_in_scope(&self, id: &NodeId, subpath: Option<&str>) -> bool {
+        let prefix = match subpath.map(str::trim) {
+            None | Some("") => return true,
+            Some(p) => p,
+        };
+        let path = match self.node(id).map(|n| &n.data) {
+            Some(NodeData::File(f)) => f.path.as_str(),
+            Some(NodeData::Symbol(s)) => match self.node(&s.file).and_then(|n| n.data.as_file()) {
+                Some(f) => f.path.as_str(),
+                None => return false,
+            },
+            Some(NodeData::Module(_)) => return true,
+            None => return false,
+        };
+        path == prefix || path.starts_with(&format!("{prefix}/"))
     }
 }
 

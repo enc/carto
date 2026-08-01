@@ -27,12 +27,23 @@ const RANKED_ROWS: usize = 10;
 #[derive(Debug, Clone)]
 pub struct MapQuery {
     pub budget: u32,
+    /// Restrict the overview to this repo-relative directory (spec
+    /// §7.1's `--subpath`) — see [`QueryGraph::path_in_scope`] and this
+    /// module's per-section application of it: each section's
+    /// underlying computation (a file's real fan-in/out, whether some
+    /// *other* file outside the subtree already imports a candidate
+    /// entry point) stays whole-graph-accurate; only which rows get
+    /// *listed* is restricted. `None` means no restriction — and every
+    /// section reduces to today's exact unscoped behavior in that case,
+    /// not an approximation of it.
+    pub subpath: Option<String>,
 }
 
 impl MapQuery {
     pub fn new() -> Self {
         MapQuery {
             budget: consts::DEFAULT_MAP_BUDGET,
+            subpath: None,
         }
     }
 }
@@ -64,12 +75,13 @@ pub struct MapResult {
 }
 
 pub fn run(qg: &QueryGraph, query: &MapQuery) -> MapResult {
-    let counts = compute_counts(qg);
+    let subpath = query.subpath.as_deref();
+    let counts = compute_counts(qg, subpath);
 
     let sections: Vec<Vec<String>> = vec![
         counts_lines(&counts),
-        top_modules_lines(qg),
-        entry_points_lines(qg),
+        top_modules_lines(qg, subpath),
+        entry_points_lines(qg, subpath),
         infra_lines(),
     ];
 
@@ -103,29 +115,51 @@ pub fn run(qg: &QueryGraph, query: &MapQuery) -> MapResult {
     }
 }
 
-fn compute_counts(qg: &QueryGraph) -> MapCounts {
+fn compute_counts(qg: &QueryGraph, subpath: Option<&str>) -> MapCounts {
     let mut files = 0;
     let mut symbols = 0;
-    let mut modules = 0;
     for node in qg.nodes() {
+        if !qg.path_in_scope(&node.id, subpath) {
+            continue;
+        }
         match &node.data {
             NodeData::File(_) => files += 1,
             NodeData::Symbol(_) => symbols += 1,
-            NodeData::Module(_) => modules += 1,
+            NodeData::Module(_) => {}
         }
     }
 
+    // Modules aren't excluded by path_in_scope directly (they have no
+    // directory), so they're counted here via the edges that actually
+    // touch them instead — a module is counted iff at least one of its
+    // edges has an in-scope endpoint. Every Module node in the graph
+    // always has >=1 edge by construction (resolve.rs only ever creates
+    // one alongside the edge that references it), so this reduces to
+    // "count every Module node" when `subpath` is `None` — identical to
+    // this function's pre-`--subpath` behavior, not an approximation.
+    let mut touched_modules: BTreeSet<NodeId> = BTreeSet::new();
     let mut edges_by_kind: BTreeMap<String, usize> = BTreeMap::new();
     for edge in qg.edges() {
+        let from_in = qg.path_in_scope(&edge.from, subpath);
+        let to_in = qg.path_in_scope(&edge.to, subpath);
+        if !from_in && !to_in {
+            continue;
+        }
         *edges_by_kind
             .entry(edge.kind.as_str().to_string())
             .or_insert(0) += 1;
+        if matches!(
+            qg.node(&edge.to).map(|n| &n.data),
+            Some(NodeData::Module(_))
+        ) {
+            touched_modules.insert(edge.to.clone());
+        }
     }
 
     MapCounts {
         files,
         symbols,
-        modules,
+        modules: touched_modules.len(),
         edges_by_kind,
     }
 }
@@ -149,7 +183,7 @@ fn counts_lines(counts: &MapCounts) -> Vec<String> {
 /// `File` nodes ranked by `imports` fan-in + fan-out, plus external
 /// `Module` nodes ranked by fan-in ("which third-party packages this
 /// repo leans on"). Spec §7.1: "top modules by fan-in/out".
-fn top_modules_lines(qg: &QueryGraph) -> Vec<String> {
+fn top_modules_lines(qg: &QueryGraph, subpath: Option<&str>) -> Vec<String> {
     let mut file_fan: BTreeMap<NodeId, (usize, usize)> = BTreeMap::new(); // (in, out)
     for node in qg.nodes() {
         if matches!(node.data, NodeData::File(_)) {
@@ -169,14 +203,24 @@ fn top_modules_lines(qg: &QueryGraph) -> Vec<String> {
         if edge.kind != EdgeKind::Imports {
             continue;
         }
+        // File fan-in/out stays whole-graph-accurate regardless of
+        // `--subpath` — a file's real connectivity, not clipped at the
+        // subtree boundary; only which *rows* get listed is restricted,
+        // below.
         if let Some(entry) = file_fan.get_mut(&edge.from) {
             entry.1 += 1;
         }
         if let Some(entry) = file_fan.get_mut(&edge.to) {
             entry.0 += 1;
         }
-        if let Some(entry) = module_fan_in.get_mut(&edge.to) {
-            *entry += 1;
+        // External-package fan-in, deliberately different: only count
+        // an edge whose *source* file is in scope — "what does this
+        // subtree depend on externally" is the useful question here,
+        // not a whole-repo number (ADR-0014).
+        if qg.path_in_scope(&edge.from, subpath) {
+            if let Some(entry) = module_fan_in.get_mut(&edge.to) {
+                *entry += 1;
+            }
         }
     }
 
@@ -184,7 +228,7 @@ fn top_modules_lines(qg: &QueryGraph) -> Vec<String> {
 
     let mut ranked_files: Vec<(String, usize, usize)> = file_fan
         .into_iter()
-        .filter(|(_, (inn, out))| *inn > 0 || *out > 0)
+        .filter(|(id, (inn, out))| (*inn > 0 || *out > 0) && qg.path_in_scope(id, subpath))
         .filter_map(|(id, (inn, out))| {
             let path = qg.node(&id).and_then(|n| n.data.as_file())?.path.clone();
             Some((path, inn, out))
@@ -229,7 +273,10 @@ fn top_modules_lines(qg: &QueryGraph) -> Vec<String> {
 /// that carto doesn't have in v1); this is the same-spirit "honest
 /// heuristic, clearly labeled" pattern spec §7.1 uses for
 /// `unused_permissions`.
-fn entry_points_lines(qg: &QueryGraph) -> Vec<String> {
+fn entry_points_lines(qg: &QueryGraph, subpath: Option<&str>) -> Vec<String> {
+    // Stays whole-graph: a file imported only from *outside* the
+    // subtree must not look like a false entry point just because
+    // that importer isn't listed.
     let mut has_incoming_import: BTreeSet<NodeId> = BTreeSet::new();
     for edge in qg.edges() {
         if edge.kind == EdgeKind::Imports {
@@ -243,7 +290,7 @@ fn entry_points_lines(qg: &QueryGraph) -> Vec<String> {
     let mut candidates: Vec<String> = Vec::new();
     for node in qg.nodes() {
         if let NodeData::File(f) = &node.data {
-            if !has_incoming_import.contains(&node.id) {
+            if !has_incoming_import.contains(&node.id) && qg.path_in_scope(&node.id, subpath) {
                 candidates.push(f.path.clone());
             }
         }
@@ -253,7 +300,7 @@ fn entry_points_lines(qg: &QueryGraph) -> Vec<String> {
     let mut main_fns: Vec<String> = Vec::new();
     for node in qg.nodes() {
         if let NodeData::Symbol(s) = &node.data {
-            if s.name == "main" {
+            if s.name == "main" && qg.path_in_scope(&node.id, subpath) {
                 main_fns.push(qg.location(s));
             }
         }
@@ -336,6 +383,72 @@ mod tests {
         }
     }
 
+    fn module_node(path: &str) -> Node {
+        Node::module(
+            crate::graph::module_id(path, true),
+            Provenance::Syntactic,
+            "test@1",
+            crate::graph::ModuleNode {
+                path: path.to_string(),
+                external: true,
+            },
+        )
+    }
+
+    /// `mg_site/handlers.rs` imports `mg_site/orders.rs` (in-subtree)
+    /// and external package `serde`; `vendor/legacy.rs` (out of
+    /// subtree) imports both `mg_site/orders.rs` and external package
+    /// `lodash` — for `--subpath mg_site` tests: an out-of-scope
+    /// importer keeping an in-scope file's fan-in real, and an
+    /// out-of-scope-only external dependency that must not show up in
+    /// a scoped external-package ranking.
+    fn subtree_doc() -> GraphDocument {
+        let handlers = file("mg_site/handlers.rs");
+        let orders = file("mg_site/orders.rs");
+        let legacy = file("vendor/legacy.rs");
+        let serde = module_node("serde");
+        let lodash = module_node("lodash");
+
+        let handlers_imports_orders = Edge::new(
+            EdgeKind::Imports,
+            handlers.id.clone(),
+            orders.id.clone(),
+            Confidence::Certain,
+            "mod-declaration".to_string(),
+        );
+        let handlers_imports_serde = Edge::new(
+            EdgeKind::Imports,
+            handlers.id.clone(),
+            serde.id.clone(),
+            Confidence::Certain,
+            "external-package".to_string(),
+        );
+        let legacy_imports_orders = Edge::new(
+            EdgeKind::Imports,
+            legacy.id.clone(),
+            orders.id.clone(),
+            Confidence::Certain,
+            "mod-declaration".to_string(),
+        );
+        let legacy_imports_lodash = Edge::new(
+            EdgeKind::Imports,
+            legacy.id.clone(),
+            lodash.id.clone(),
+            Confidence::Certain,
+            "external-package".to_string(),
+        );
+
+        doc(
+            vec![handlers, orders, legacy, serde, lodash],
+            vec![
+                handlers_imports_orders,
+                handlers_imports_serde,
+                legacy_imports_orders,
+                legacy_imports_lodash,
+            ],
+        )
+    }
+
     /// `lib.rs` imports `orders.rs`; `orders.rs` has an unrelated symbol.
     /// `lib.rs` has no incoming imports (entry point); `orders.rs` does.
     fn small_repo_doc() -> GraphDocument {
@@ -368,6 +481,83 @@ mod tests {
         assert_eq!(result.counts.modules, 0);
         assert_eq!(result.counts.edges_by_kind.get("imports"), Some(&1));
         assert_eq!(result.counts.edges_by_kind.get("contains"), Some(&1));
+    }
+
+    #[test]
+    fn subpath_restricts_file_counts_to_the_subtree() {
+        let qg = QueryGraph::from_document(subtree_doc());
+        let result = run(
+            &qg,
+            &MapQuery {
+                budget: consts::DEFAULT_MAP_BUDGET,
+                subpath: Some("mg_site".to_string()),
+            },
+        );
+        // handlers.rs + orders.rs, not vendor/legacy.rs.
+        assert_eq!(result.counts.files, 2);
+    }
+
+    #[test]
+    fn subpath_keeps_a_files_real_fan_in_in_the_ranking_even_from_an_out_of_scope_importer() {
+        let qg = QueryGraph::from_document(subtree_doc());
+        let result = run(
+            &qg,
+            &MapQuery {
+                budget: consts::DEFAULT_MAP_BUDGET,
+                subpath: Some("mg_site".to_string()),
+            },
+        );
+        let joined = result.lines.join("\n");
+        // orders.rs is imported by both handlers.rs (in scope) and
+        // vendor/legacy.rs (out of scope) — its listed fan-in must
+        // still be the real total (2), not clipped to only in-scope
+        // importers.
+        assert!(joined.contains("mg_site/orders.rs  in=2 out=0"), "{joined}");
+        // vendor/legacy.rs itself must not appear as a row.
+        assert!(!joined.contains("vendor/legacy.rs"));
+    }
+
+    #[test]
+    fn subpath_scopes_external_package_fan_in_to_in_scope_importers_only() {
+        let qg = QueryGraph::from_document(subtree_doc());
+        let result = run(
+            &qg,
+            &MapQuery {
+                budget: consts::DEFAULT_MAP_BUDGET,
+                subpath: Some("mg_site".to_string()),
+            },
+        );
+        let joined = result.lines.join("\n");
+        // serde is imported by handlers.rs (in scope) -> shown.
+        assert!(joined.contains("serde"), "{joined}");
+        // lodash is imported only by vendor/legacy.rs (out of scope)
+        // -> not shown, unlike the file fan-in case above, which
+        // deliberately stays whole-graph-accurate (see ADR-0014).
+        assert!(!joined.contains("lodash"), "{joined}");
+    }
+
+    #[test]
+    fn subpath_does_not_falsely_list_a_file_as_an_entry_point_when_only_an_out_of_scope_file_imports_it()
+     {
+        let qg = QueryGraph::from_document(subtree_doc());
+        let result = run(
+            &qg,
+            &MapQuery {
+                budget: consts::DEFAULT_MAP_BUDGET,
+                subpath: Some("mg_site".to_string()),
+            },
+        );
+        let joined = result.lines.join("\n");
+        let entry_section = joined.split("## entry points").nth(1).unwrap();
+        let entry_section = entry_section.split("## infra").next().unwrap();
+        // orders.rs IS imported (by vendor/legacy.rs, even though that
+        // importer is out of scope) -- must not look like a false
+        // entry point just because its only in-scope neighbor doesn't
+        // reveal that.
+        assert!(!entry_section.contains("orders.rs"));
+        // handlers.rs has no incoming imports at all -- a real entry
+        // point, and in scope, so it must still be listed.
+        assert!(entry_section.contains("mg_site/handlers.rs"));
     }
 
     #[test]
@@ -410,7 +600,13 @@ mod tests {
     #[test]
     fn budget_is_never_exceeded() {
         let qg = QueryGraph::from_document(small_repo_doc());
-        let result = run(&qg, &MapQuery { budget: 3 });
+        let result = run(
+            &qg,
+            &MapQuery {
+                budget: 3,
+                subpath: None,
+            },
+        );
         assert!(result.lines.len() <= 3);
         assert!(result.truncation.truncated);
     }
@@ -425,7 +621,13 @@ mod tests {
     #[test]
     fn zero_budget_still_terminates_and_suggests_the_default() {
         let qg = QueryGraph::from_document(small_repo_doc());
-        let result = run(&qg, &MapQuery { budget: 0 });
+        let result = run(
+            &qg,
+            &MapQuery {
+                budget: 0,
+                subpath: None,
+            },
+        );
         assert!(result.lines.is_empty());
         assert!(result.truncation.truncated);
         assert_eq!(

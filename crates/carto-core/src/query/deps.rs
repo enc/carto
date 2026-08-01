@@ -28,6 +28,18 @@ pub struct DepsQuery {
     /// `None` means "no filter" (every edge kind). `Some(set)` keeps
     /// only edges whose kind is in the set.
     pub kinds: Option<BTreeSet<EdgeKind>>,
+    /// Restrict *reported* rows to nodes under this repo-relative
+    /// directory (spec §7.1's `--subpath`) — see
+    /// [`QueryGraph::path_in_scope`]. The BFS traversal itself is
+    /// unaffected: it still expands through out-of-scope nodes, so a
+    /// dependency chain that dips outside the subtree and back is
+    /// never silently broken; only which discovered nodes get shown is
+    /// filtered. Does *not* restrict `target`-by-name resolution unless
+    /// the name is already ambiguous without it — the deps root is very
+    /// commonly outside the subtree being reported on, so scoping it
+    /// unconditionally would break that common case (see
+    /// `resolve_target`). `None` means no restriction.
+    pub subpath: Option<String>,
 }
 
 impl DepsQuery {
@@ -37,6 +49,7 @@ impl DepsQuery {
             dir: Direction::Out,
             depth: 1,
             kinds: None,
+            subpath: None,
         }
     }
 }
@@ -103,7 +116,7 @@ pub fn run(qg: &QueryGraph, query: &DepsQuery) -> Result<DepsResult> {
         ));
     }
 
-    let root_id = resolve_target(qg, &query.target)?;
+    let root_id = resolve_target(qg, &query.target, query.subpath.as_deref())?;
     let root = summarize(qg, &root_id);
     let root_unresolved_calls = match qg.node(&root_id).map(|n| &n.data) {
         Some(NodeData::Symbol(s)) => s.unresolved_calls.clone(),
@@ -138,25 +151,39 @@ pub fn run(qg: &QueryGraph, query: &DepsQuery) -> Result<DepsResult> {
                 if !visited.insert(other.clone()) {
                     continue;
                 }
-                edges_this_hop.push(DepEdge {
-                    kind: edge.kind,
-                    confidence: edge.confidence,
-                    evidence: edge.evidence.clone(),
-                    direction,
-                    node: summarize(qg, &other),
-                });
+                // The traversal itself is never scoped — `other` is
+                // always added to `next_frontier` so later hops can
+                // still reach through an out-of-scope node (a chain
+                // that dips outside `--subpath` and back must not be
+                // silently broken). Only whether this edge gets
+                // *reported* is scoped.
+                if qg.path_in_scope(&other, query.subpath.as_deref()) {
+                    edges_this_hop.push(DepEdge {
+                        kind: edge.kind,
+                        confidence: edge.confidence,
+                        evidence: edge.evidence.clone(),
+                        direction,
+                        node: summarize(qg, &other),
+                    });
+                }
                 next_frontier.push(other);
             }
         }
 
-        if edges_this_hop.is_empty() {
+        // Stop once there's nothing left to explore — not once a hop
+        // has nothing to *report*: with `--subpath` set, a hop can
+        // legitimately discover only out-of-scope nodes while still
+        // having real descendants worth reaching in a later hop.
+        if next_frontier.is_empty() {
             break;
         }
 
-        hops.push(Hop {
-            depth,
-            edges: edges_this_hop,
-        });
+        if !edges_this_hop.is_empty() {
+            hops.push(Hop {
+                depth,
+                edges: edges_this_hop,
+            });
+        }
         frontier = next_frontier;
 
         if depth == query.depth && !frontier.is_empty() {
@@ -165,12 +192,22 @@ pub fn run(qg: &QueryGraph, query: &DepsQuery) -> Result<DepsResult> {
     }
 
     let truncation = match (hit_depth_cap, query.depth < consts::MAX_DEPS_DEPTH) {
-        (true, true) => Truncation::more(format!(
-            "carto deps {} --dir {} --depth {}",
-            query.target,
-            query.dir.as_str(),
-            query.depth + 1
-        )),
+        (true, true) => {
+            // Carries --subpath forward too, if set — spec §7.2's "the
+            // exact follow-up call to get more" should reproduce the
+            // same scoped view, not silently drop the restriction.
+            let subpath_flag = query
+                .subpath
+                .as_deref()
+                .map(|s| format!(" --subpath {s}"))
+                .unwrap_or_default();
+            Truncation::more(format!(
+                "carto deps {} --dir {} --depth {}{subpath_flag}",
+                query.target,
+                query.dir.as_str(),
+                query.depth + 1
+            ))
+        }
         (true, false) => Truncation {
             truncated: true,
             next_call: None,
@@ -188,24 +225,41 @@ pub fn run(qg: &QueryGraph, query: &DepsQuery) -> Result<DepsResult> {
 
 /// Resolves `target` to a [`NodeId`]: used as-is if it's already an
 /// existing node's ID; otherwise looked up as an exact symbol name via
-/// [`super::find`]. Zero matches or more than one match are both
-/// `UserError`s (INV-8's honesty rule, applied to the CLI surface: no
-/// silent pick among ambiguous candidates) — the multi-match case lists
-/// every candidate's ID so the caller can re-run with one.
-fn resolve_target(qg: &QueryGraph, target: &str) -> Result<NodeId> {
+/// [`super::find`]. `subpath` is deliberately **not** applied to this
+/// initial lookup — the deps root is very commonly outside the subtree
+/// being reported on (e.g. `deps handle --subpath src/orders` to see
+/// only `handle`'s dependencies that land in `orders`, where `handle`
+/// itself lives elsewhere entirely), so scoping the root lookup
+/// unconditionally would break that common case. `subpath` only comes
+/// into play as a **tiebreaker**: if the unscoped lookup is ambiguous
+/// (more than one candidate), it's retried scoped, so `--subpath` can
+/// still resolve an otherwise-ambiguous name (e.g. the same symbol name
+/// present in a live tree and in some unrelated vendored/dead-code
+/// directory) — a side effect of narrowing the candidate set, not a
+/// separate mechanism, and never invoked for a name that was already
+/// unambiguous. Zero matches or more than one match (after any
+/// tiebreak attempt) are both `UserError`s (INV-8's honesty rule,
+/// applied to the CLI surface: no silent pick among ambiguous
+/// candidates) — the multi-match case lists every candidate's ID so
+/// the caller can re-run with one.
+fn resolve_target(qg: &QueryGraph, target: &str, subpath: Option<&str>) -> Result<NodeId> {
     if let Some(node) = qg.nodes().find(|n| n.id.as_str() == target) {
         return Ok(node.id.clone());
     }
 
-    let matches = find(
-        qg,
-        &FindQuery {
-            needle: target.to_string(),
-            exact: true,
-            limit: usize::MAX,
-        },
-    )
-    .matches;
+    let find_query = |scope: Option<&str>| FindQuery {
+        needle: target.to_string(),
+        exact: true,
+        limit: usize::MAX,
+        subpath: scope.map(str::to_string),
+    };
+
+    let unscoped = find(qg, &find_query(None)).matches;
+    let matches = if unscoped.len() > 1 && subpath.is_some() {
+        find(qg, &find_query(subpath)).matches
+    } else {
+        unscoped
+    };
 
     match matches.len() {
         0 => Err(Error::new(
@@ -346,6 +400,108 @@ mod tests {
         doc(vec![f, handle, parse_order, validate, noise], vec![e1, e2])
     }
 
+    /// `handle` (in `mg_site/`) -> `parse_order` (in `vendor/`, out of
+    /// scope for `--subpath mg_site`) -> `validate` (back in `mg_site/`)
+    /// — a chain that dips *out* of the subtree and back, for proving
+    /// the BFS traversal itself stays unrestricted by `--subpath` even
+    /// though the middle hop's edge is hidden from the report.
+    fn cross_boundary_chain_doc() -> GraphDocument {
+        let mg_site = file("mg_site/handlers.rs");
+        let vendor = file("vendor/orders.rs");
+        let mg_site_orders = file("mg_site/orders.rs");
+        let handle = symbol("mg_site/handlers.rs", "handle", &mg_site.id, 1);
+        let parse_order = symbol("vendor/orders.rs", "parse_order", &vendor.id, 1);
+        let validate = symbol("mg_site/orders.rs", "validate", &mg_site_orders.id, 1);
+        let e1 = Edge::new(
+            EdgeKind::Calls,
+            handle.id.clone(),
+            parse_order.id.clone(),
+            Confidence::Inferred,
+            "same-package".to_string(),
+        );
+        let e2 = Edge::new(
+            EdgeKind::Calls,
+            parse_order.id.clone(),
+            validate.id.clone(),
+            Confidence::Inferred,
+            "same-package".to_string(),
+        );
+        doc(
+            vec![
+                mg_site,
+                vendor,
+                mg_site_orders,
+                handle,
+                parse_order,
+                validate,
+            ],
+            vec![e1, e2],
+        )
+    }
+
+    #[test]
+    fn subpath_hides_an_out_of_scope_hop_but_the_bfs_still_reaches_past_it() {
+        let qg = QueryGraph::from_document(cross_boundary_chain_doc());
+        let query = DepsQuery {
+            target: "handle".to_string(),
+            dir: Direction::Out,
+            depth: 2,
+            kinds: None,
+            subpath: Some("mg_site".to_string()),
+        };
+        let result = run(&qg, &query).unwrap();
+
+        // Only one hop is reported (depth 2's edge to `validate`) — hop
+        // 1's edge (to the out-of-scope `parse_order`) is hidden, but
+        // the traversal still advanced through it to reach `validate`.
+        assert_eq!(result.hops.len(), 1);
+        assert_eq!(result.hops[0].depth, 2);
+        assert_eq!(result.hops[0].edges[0].node.label, "validate");
+    }
+
+    #[test]
+    fn subpath_none_reports_every_hop_as_before() {
+        let qg = QueryGraph::from_document(cross_boundary_chain_doc());
+        let result = run(
+            &qg,
+            &DepsQuery {
+                target: "handle".to_string(),
+                dir: Direction::Out,
+                depth: 2,
+                kinds: None,
+                subpath: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(result.hops.len(), 2);
+        assert_eq!(result.hops[0].edges[0].node.label, "parse_order");
+        assert_eq!(result.hops[1].edges[0].node.label, "validate");
+    }
+
+    #[test]
+    fn subpath_narrows_ambiguous_target_resolution() {
+        // Same symbol name in two directories — `--subpath` picks the
+        // one under it instead of erroring as ambiguous, directly
+        // serving the "same name in the live tree and in an unrelated
+        // vendored directory" disambiguation case.
+        let live = file("mg_site/orders.rs");
+        let dead = file("typo3_v8_delete_me/orders.rs");
+        let live_sym = symbol("mg_site/orders.rs", "Div", &live.id, 1);
+        let dead_sym = symbol("typo3_v8_delete_me/orders.rs", "Div", &dead.id, 1);
+        let qg =
+            QueryGraph::from_document(doc(vec![live, dead, live_sym.clone(), dead_sym], vec![]));
+
+        let query = DepsQuery {
+            target: "Div".to_string(),
+            dir: Direction::Out,
+            depth: 1,
+            kinds: None,
+            subpath: Some("mg_site".to_string()),
+        };
+        let result = run(&qg, &query).unwrap();
+        assert_eq!(result.root.id, live_sym.id);
+    }
+
     #[test]
     fn out_direction_follows_calls_forward() {
         let qg = QueryGraph::from_document(chain_doc());
@@ -366,6 +522,7 @@ mod tests {
             dir: Direction::In,
             depth: 1,
             kinds: None,
+            subpath: None,
         };
         let result = run(&qg, &query).unwrap();
         assert_eq!(result.hops[0].edges.len(), 1);
@@ -387,6 +544,7 @@ mod tests {
                 dir: Direction::Out,
                 depth: 2,
                 kinds: None,
+                subpath: None,
             },
         )
         .unwrap();
@@ -402,6 +560,7 @@ mod tests {
             dir: Direction::Out,
             depth: consts::MAX_DEPS_DEPTH + 1,
             kinds: None,
+            subpath: None,
         };
         let err = run(&qg, &query).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::UserError);
@@ -433,6 +592,7 @@ mod tests {
             dir: Direction::Out,
             depth: consts::MAX_DEPS_DEPTH,
             kinds: None,
+            subpath: None,
         };
         // Must terminate (this test would hang forever on an unbounded
         // cyclic BFS with no visited set) and report exactly one hop:
@@ -469,6 +629,7 @@ mod tests {
             dir: Direction::Both,
             depth: 1,
             kinds: Some(kinds),
+            subpath: None,
         };
         let result = run(&qg, &query).unwrap();
         assert_eq!(result.hops[0].edges.len(), 1);
@@ -593,6 +754,7 @@ mod tests {
             dir: Direction::In,
             depth: 1,
             kinds: Some(kinds),
+            subpath: None,
         };
         let result = run(&qg, &query).unwrap();
         assert_eq!(result.root_unresolved_calls.len(), 1);
@@ -606,6 +768,7 @@ mod tests {
             dir: Direction::Out,
             depth: 1,
             kinds: None,
+            subpath: None,
         };
         let result = run(&qg, &query).unwrap();
         assert!(result.truncation.truncated);
@@ -623,6 +786,7 @@ mod tests {
             dir: Direction::Out,
             depth: consts::MAX_DEPS_DEPTH,
             kinds: None,
+            subpath: None,
         };
         let result = run(&qg, &query).unwrap();
         assert!(!result.truncation.truncated);

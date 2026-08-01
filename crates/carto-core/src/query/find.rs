@@ -25,6 +25,10 @@ pub struct FindQuery {
     /// agent-friendly default, `--exact` the precise escape hatch.
     pub exact: bool,
     pub limit: usize,
+    /// Restrict matches to symbols under this repo-relative directory
+    /// (spec §7.1's `--subpath`) — see
+    /// [`QueryGraph::path_in_scope`]. `None` means no restriction.
+    pub subpath: Option<String>,
 }
 
 impl FindQuery {
@@ -33,6 +37,7 @@ impl FindQuery {
             needle: needle.into(),
             exact: false,
             limit: DEFAULT_LIMIT,
+            subpath: None,
         }
     }
 }
@@ -75,6 +80,9 @@ pub fn run(qg: &QueryGraph, query: &FindQuery) -> FindResult {
             sym.name.to_lowercase().contains(&needle_lower)
         };
         if !is_match {
+            continue;
+        }
+        if !qg.path_in_scope(&node.id, query.subpath.as_deref()) {
             continue;
         }
         matches.push(SymbolMatch {
@@ -160,6 +168,117 @@ mod tests {
         }
     }
 
+    /// A same-named symbol declared in two different files/directories
+    /// — `mg_site/orders.rs`, the "live" tree, and
+    /// `typo3_v8_delete_me/orders.rs`, a stand-in for vendored/dead
+    /// code — for `--subpath` tests.
+    fn doc_with_same_name_in_two_dirs() -> GraphDocument {
+        let live = Node::file(
+            crate::graph::file_id("mg_site/orders.rs"),
+            Provenance::Syntactic,
+            "test@1",
+            FileNode {
+                path: "mg_site/orders.rs".to_string(),
+                lang: Lang::Rust,
+                size: 0,
+                sha256: None,
+                skipped: None,
+                excluded: None,
+            },
+        );
+        let dead = Node::file(
+            crate::graph::file_id("typo3_v8_delete_me/orders.rs"),
+            Provenance::Syntactic,
+            "test@1",
+            FileNode {
+                path: "typo3_v8_delete_me/orders.rs".to_string(),
+                lang: Lang::Rust,
+                size: 0,
+                sha256: None,
+                skipped: None,
+                excluded: None,
+            },
+        );
+        let live_sym = Node::symbol(
+            crate::graph::sym_id("mg_site/orders.rs", "function", "Div", 1),
+            Provenance::Syntactic,
+            "test@1",
+            SymbolNode {
+                name: "Div".to_string(),
+                sym_kind: SymKind::Function,
+                file: live.id.clone(),
+                start_line: 1,
+                end_line: 2,
+                signature: None,
+                unresolved_calls: vec![],
+            },
+        );
+        let dead_sym = Node::symbol(
+            crate::graph::sym_id("typo3_v8_delete_me/orders.rs", "function", "Div", 1),
+            Provenance::Syntactic,
+            "test@1",
+            SymbolNode {
+                name: "Div".to_string(),
+                sym_kind: SymKind::Function,
+                file: dead.id.clone(),
+                start_line: 1,
+                end_line: 2,
+                signature: None,
+                unresolved_calls: vec![],
+            },
+        );
+        GraphDocument {
+            carto_version: "0.1.0".to_string(),
+            schema_version: crate::consts::SCHEMA_VERSION,
+            nodes: vec![live, dead, live_sym, dead_sym],
+            edges: vec![],
+        }
+    }
+
+    #[test]
+    fn subpath_restricts_matches_to_the_given_directory() {
+        let qg = QueryGraph::from_document(doc_with_same_name_in_two_dirs());
+        let query = FindQuery {
+            needle: "Div".to_string(),
+            exact: true,
+            limit: DEFAULT_LIMIT,
+            subpath: Some("mg_site".to_string()),
+        };
+        let result = run(&qg, &query);
+        assert_eq!(result.matches.len(), 1);
+        assert!(result.matches[0].location.starts_with("mg_site/"));
+    }
+
+    #[test]
+    fn subpath_does_not_match_a_sibling_directory_with_a_similar_prefix() {
+        // "mg_site" must not match "mg_siteXYZ/..." — segment-boundary
+        // safety, not a bare string prefix check.
+        let mut doc = doc_with_same_name_in_two_dirs();
+        for node in &mut doc.nodes {
+            if let crate::graph::NodeData::File(f) = &mut node.data {
+                if f.path == "typo3_v8_delete_me/orders.rs" {
+                    f.path = "mg_siteXYZ/orders.rs".to_string();
+                }
+            }
+        }
+        let qg = QueryGraph::from_document(doc);
+        let query = FindQuery {
+            needle: "Div".to_string(),
+            exact: true,
+            limit: DEFAULT_LIMIT,
+            subpath: Some("mg_site".to_string()),
+        };
+        let result = run(&qg, &query);
+        assert_eq!(result.matches.len(), 1);
+    }
+
+    #[test]
+    fn subpath_none_is_unrestricted() {
+        let qg = QueryGraph::from_document(doc_with_same_name_in_two_dirs());
+        let result = run(&qg, &FindQuery::new("Div"));
+        assert_eq!(result.matches.len(), 2);
+    }
+
     #[test]
     fn substring_match_is_case_insensitive_by_default() {
         let qg = QueryGraph::from_document(doc_with_symbols(&["parse_order", "validate"]));
@@ -179,6 +298,7 @@ mod tests {
             needle: "parse_order".to_string(),
             exact: true,
             limit: DEFAULT_LIMIT,
+            subpath: None,
         };
         assert_eq!(run(&qg, &query).matches.len(), 1);
     }
@@ -198,6 +318,7 @@ mod tests {
             needle: "".to_string(),
             exact: false,
             limit: 2,
+            subpath: None,
         };
         let result = run(&qg, &query);
         assert_eq!(result.matches.len(), 2);
