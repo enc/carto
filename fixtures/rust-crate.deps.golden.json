@@ -87,6 +87,12 @@
     "label": "handle",
     "location": "src/handlers.rs:3-9"
   },
+  "root_unresolved_calls": [
+    {
+      "line": 8,
+      "name": "unknown_external_call"
+    }
+  ],
   "truncation": {
     "next_call": "carto deps handle --dir out --depth 3",
     "truncated": true

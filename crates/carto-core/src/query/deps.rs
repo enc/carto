@@ -16,7 +16,7 @@
 use super::{Direction, FindQuery, QueryGraph, Truncation, find};
 use crate::consts;
 use crate::error::{Error, ErrorKind, Result};
-use crate::graph::{Confidence, EdgeKind, NodeData, NodeId};
+use crate::graph::{Confidence, EdgeKind, NodeData, NodeId, UnresolvedCall};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
@@ -76,6 +76,17 @@ pub struct Hop {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DepsResult {
     pub root: NodeSummary,
+    /// The root symbol's own `unresolved_calls` (empty for a File/Module
+    /// root, or a Symbol root with none) — surfaced here because `--dir
+    /// out` returning zero edges is otherwise indistinguishable from
+    /// "this symbol genuinely calls nothing" vs. "every call it makes
+    /// landed in `unresolved_calls`" (ambiguous candidates, or calls
+    /// into code this repo never indexed — INV-8's honest-omission
+    /// behavior, previously invisible from `deps`'s output). Root-only,
+    /// not per-hop: answers the reported pain point without bloating
+    /// every row of a possibly-large traversal; broaden only if a
+    /// concrete need shows up.
+    pub root_unresolved_calls: Vec<UnresolvedCall>,
     pub hops: Vec<Hop>,
     pub truncation: Truncation,
 }
@@ -94,6 +105,10 @@ pub fn run(qg: &QueryGraph, query: &DepsQuery) -> Result<DepsResult> {
 
     let root_id = resolve_target(qg, &query.target)?;
     let root = summarize(qg, &root_id);
+    let root_unresolved_calls = match qg.node(&root_id).map(|n| &n.data) {
+        Some(NodeData::Symbol(s)) => s.unresolved_calls.clone(),
+        _ => Vec::new(),
+    };
 
     let mut visited: BTreeSet<NodeId> = BTreeSet::new();
     visited.insert(root_id.clone());
@@ -165,6 +180,7 @@ pub fn run(qg: &QueryGraph, query: &DepsQuery) -> Result<DepsResult> {
 
     Ok(DepsResult {
         root,
+        root_unresolved_calls,
         hops,
         truncation,
     })
@@ -269,6 +285,16 @@ mod tests {
     }
 
     fn symbol(relpath: &str, name: &str, file_id: &NodeId, line: u32) -> Node {
+        symbol_with_unresolved(relpath, name, file_id, line, vec![])
+    }
+
+    fn symbol_with_unresolved(
+        relpath: &str,
+        name: &str,
+        file_id: &NodeId,
+        line: u32,
+        unresolved_calls: Vec<UnresolvedCall>,
+    ) -> Node {
         Node::symbol(
             crate::graph::sym_id(relpath, "function", name, line),
             Provenance::Syntactic,
@@ -280,7 +306,7 @@ mod tests {
                 start_line: line,
                 end_line: line + 1,
                 signature: None,
-                unresolved_calls: vec![],
+                unresolved_calls,
             },
         )
     }
@@ -483,6 +509,93 @@ mod tests {
         let result = run(&qg, &DepsQuery::new("handle")).unwrap();
         assert_eq!(result.hops[0].edges[0].confidence, Confidence::Inferred);
         assert_eq!(result.hops[0].edges[0].evidence, vec!["same-file"]);
+    }
+
+    #[test]
+    fn root_unresolved_calls_are_surfaced_when_present() {
+        // A large static-utility-class scenario: the root symbol calls
+        // plenty, but every call lands in unresolved_calls (ambiguous
+        // candidates, or calls into code this repo never indexed) —
+        // `--dir out` returning zero edges must not be indistinguishable
+        // from "genuinely calls nothing."
+        let f = file("src/lib.rs");
+        let div = symbol_with_unresolved(
+            "src/lib.rs",
+            "Div",
+            &f.id,
+            1,
+            vec![
+                UnresolvedCall {
+                    name: "trimExplode".to_string(),
+                    line: 5,
+                },
+                UnresolvedCall {
+                    name: "isValidUrl".to_string(),
+                    line: 9,
+                },
+            ],
+        );
+        let qg = QueryGraph::from_document(doc(vec![f, div], vec![]));
+
+        let result = run(&qg, &DepsQuery::new("Div")).unwrap();
+        assert_eq!(result.hops.len(), 0, "no resolved edges");
+        assert_eq!(
+            result.root_unresolved_calls,
+            vec![
+                UnresolvedCall {
+                    name: "trimExplode".to_string(),
+                    line: 5
+                },
+                UnresolvedCall {
+                    name: "isValidUrl".to_string(),
+                    line: 9
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn root_unresolved_calls_is_empty_when_the_root_has_none() {
+        let qg = QueryGraph::from_document(chain_doc());
+        let result = run(&qg, &DepsQuery::new("handle")).unwrap();
+        assert!(result.root_unresolved_calls.is_empty());
+    }
+
+    #[test]
+    fn root_unresolved_calls_is_empty_for_a_non_symbol_root() {
+        let f = file("src/lib.rs");
+        let qg = QueryGraph::from_document(doc(vec![f.clone()], vec![]));
+        let result = run(&qg, &DepsQuery::new(f.id.as_str())).unwrap();
+        assert!(result.root_unresolved_calls.is_empty());
+    }
+
+    #[test]
+    fn root_unresolved_calls_is_unaffected_by_dir_and_kinds_filtering() {
+        // Root-node metadata, not traversal output — --dir/--kinds only
+        // ever filter `hops`.
+        let f = file("src/lib.rs");
+        let div = symbol_with_unresolved(
+            "src/lib.rs",
+            "Div",
+            &f.id,
+            1,
+            vec![UnresolvedCall {
+                name: "trimExplode".to_string(),
+                line: 5,
+            }],
+        );
+        let qg = QueryGraph::from_document(doc(vec![f, div], vec![]));
+
+        let mut kinds = BTreeSet::new();
+        kinds.insert(EdgeKind::Contains);
+        let query = DepsQuery {
+            target: "Div".to_string(),
+            dir: Direction::In,
+            depth: 1,
+            kinds: Some(kinds),
+        };
+        let result = run(&qg, &query).unwrap();
+        assert_eq!(result.root_unresolved_calls.len(), 1);
     }
 
     #[test]

@@ -100,6 +100,13 @@ fn parse_kinds(s: &str) -> Result<BTreeSet<EdgeKind>> {
     Ok(kinds)
 }
 
+/// Human-rendered cap on how many unresolved-call names are listed —
+/// the structured/`--json` field (`DepsResult::root_unresolved_calls`)
+/// always carries the full, uncapped list; only this rendering caps it,
+/// same "structured field exact, rendered text capped" split `map`'s
+/// `counts` vs. `lines` already uses.
+const UNRESOLVED_CALLS_SHOWN: usize = 20;
+
 pub fn print_human(result: &query::DepsResult) {
     println!(
         "{} ({})  {}",
@@ -107,6 +114,25 @@ pub fn print_human(result: &query::DepsResult) {
         result.root.kind,
         result.root.location.as_deref().unwrap_or("")
     );
+    if !result.root_unresolved_calls.is_empty() {
+        let total = result.root_unresolved_calls.len();
+        let names: Vec<&str> = result
+            .root_unresolved_calls
+            .iter()
+            .take(UNRESOLVED_CALLS_SHOWN)
+            .map(|c| c.name.as_str())
+            .collect();
+        let suffix = if total > UNRESOLVED_CALLS_SHOWN {
+            format!(", +{} more", total - UNRESOLVED_CALLS_SHOWN)
+        } else {
+            String::new()
+        };
+        println!(
+            "  ({total} unresolved call{} not shown as edges: {}{suffix})",
+            if total == 1 { "" } else { "s" },
+            names.join(", "),
+        );
+    }
     for hop in &result.hops {
         for edge in &hop.edges {
             // `direction` is always In or Out for a specific edge (never
