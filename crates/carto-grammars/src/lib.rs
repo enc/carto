@@ -16,6 +16,15 @@ pub fn rust_language() -> tree_sitter::Language {
     tree_sitter_rust::LANGUAGE.into()
 }
 
+/// Python grammar (M1.b.2b). Same `LanguageFn -> Language` conversion as
+/// [`rust_language`] — verified empirically to not need an `unsafe`
+/// block here either, for the same `tree-sitter-language`-mediated
+/// reason ADR-0007 records for Rust.
+#[cfg(feature = "native-grammars")]
+pub fn python_language() -> tree_sitter::Language {
+    tree_sitter_python::LANGUAGE.into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -29,6 +38,14 @@ mod tests {
         let mut parser = tree_sitter::Parser::new();
         parser.set_language(&rust_language()).expect(
             "tree-sitter-rust's language must be compatible with the linked tree-sitter runtime",
+        );
+    }
+
+    #[test]
+    fn python_language_loads_without_panicking() {
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&python_language()).expect(
+            "tree-sitter-python's language must be compatible with the linked tree-sitter runtime",
         );
     }
 }

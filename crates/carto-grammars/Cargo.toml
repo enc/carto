@@ -25,9 +25,10 @@ disallowed_methods = "deny"
 [dependencies]
 tree-sitter = "0.26"
 tree-sitter-rust = { version = "0.24", optional = true }
+tree-sitter-python = { version = "0.25", optional = true }
 
 [features]
 default = ["native-grammars"]
 # M1-M4 (spec §5.4): native grammar crates. `wasm-grammars` (M5, default
 # from M5) is a reserved name, not implemented yet.
-native-grammars = ["dep:tree-sitter-rust"]
+native-grammars = ["dep:tree-sitter-rust", "dep:tree-sitter-python"]
