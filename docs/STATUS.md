@@ -1,6 +1,6 @@
 # carto — status / handoff
 
-**Milestone:** M1.b.2b in progress (Python, PHP done; TS/TSX, JS, Go not started)
+**Milestone:** M1.b.2b in progress (Python, PHP, TS/TSX/JS done; Go not started)
 
 Where the implementation is in the milestone sequence, what's deliberately
 absent, and what's next. Everything else lives elsewhere on purpose:
@@ -27,7 +27,9 @@ so they've been subdivided. Current state:
   real requirements instead of speculatively.
 - **M1.b.2b** — TS/TSX, JS, Python, Go, PHP extractors (PHP added to the
   v1 set post-M1.b.2a, ADR-0012). **Python done** (ADR-0011), **PHP
-  done** (ADR-0012) — current head. TS/TSX, JS, Go not started.
+  done** (ADR-0012), **TS/TSX/JS done** (ADR-0013, which also fixed a
+  cross-language alias-resolution gap ADR-0012 had documented but left
+  unfixed) — current head. Go not started.
 - **M2+** — infra graph, join, MCP, ingest, real redaction. Per spec §10.
 
 ## Deliberately absent — not gaps, not bugs
@@ -109,27 +111,48 @@ Do not "fix" these without checking the linked reasoning first:
   namespace+name) keeps whichever file `resolve` encounters first**,
   not an error — carto only reads source, it doesn't enforce PHP's own
   uniqueness rules. ADR-0012.
+- **CommonJS (`require()`/`module.exports`) is not extracted** — ESM
+  `import`/`export` only. Same "extract nothing rather than partially
+  interpret" precedent as every other exclusion here — ADR-0013.
+- **TS/JS default and namespace imports (`import Foo from './x'`,
+  `import * as ns from './x'`) never feed tier (b)** — the local name
+  is the importer's own choice, not a name the target file declares
+  under that spelling, so there's nothing verifiable to check against.
+  Re-exports (`export { foo } from './x'`) don't either, for a
+  different reason: they never create a binding usable by a call site
+  in the *declaring* file at all. ADR-0013.
+- **Default/namespace-import and re-export `imports` edges get
+  `"mod-declaration"` evidence**, the same label Rust's bare `mod
+  foo;` gets — a naming artifact of `resolve.rs` picking the evidence
+  string by whether `imported_names` is empty, not a discriminant
+  specific to what actually happened. Functionally correct (`certain`,
+  right target file) in every case; just reads oddly for TS/JS. Not
+  fixed — ADR-0013.
+- **No `package.json`/`tsconfig.json`/`node_modules` parsing** — every
+  TS/JS bare package specifier is classified external, the same
+  simplification Python's and PHP's absolute imports already made.
+  Relative-import extension-guessing (`.ts`/`.tsx`/`.js`/`.jsx`/
+  `/index.*`) is a fixed priority order, not real bundler/tsconfig
+  resolution. ADR-0013.
 
-## Next: M1.b.2b continued (TS/TSX, JS, Go)
+## Next: M1.b.2b continued (Go)
 
-Python (ADR-0011) and PHP (ADR-0012) are the second and third data
-points after Rust (ADR-0008) for what varies per language:
-relative-import vs. FQN-based import semantics, what "exported" means,
-whether path-qualified calls are even syntactically distinguishable
-(and, PHP shows, distinguishable ≠ excluded — that's an independent
-call), what "same-package" should mean. TS/TSX, JS, and Go each still
-need their own version of that ADR — expect at least one real judgment
-call per language, not mechanical repetition. TS's `import './x'` is
-genuinely file-relative with extension-guessing (`.ts`/`.tsx`/`.js`/
-`index.ts`) and `package.json`/`node_modules` for external packages —
-meaningfully more resolution machinery than any of Rust's, Python's, or
-PHP's import models needed. `fixtures/ts-app`/`go-svc` (spec §11.1) get
-built alongside the extractors that need them.
+Rust (ADR-0008), Python (ADR-0011), PHP (ADR-0012), and TS/TSX/JS
+(ADR-0013) are four data points for what varies per language:
+relative-import vs. FQN-based vs. literal-path import semantics, what
+"exported" means, whether path-qualified calls are even syntactically
+distinguishable (and, PHP/TS show, distinguishable ≠ excluded — that's
+an independent call each language gets to make on its own), what
+"same-package" should mean. Go still needs its own version of that
+ADR — expect at least one real judgment call, not mechanical
+repetition. `fixtures/go-svc` (spec §11.1) gets built alongside it.
 
 `carto where`/`deps`/`map` need no changes for any of this — confirmed
-end-to-end against `fixtures/py-lib` and `fixtures/php-app` with zero
-language-specific code in `crates/carto-core/src/query/`, and expected
-to hold for every future language the same way.
+end-to-end against `fixtures/py-lib`, `fixtures/php-app`, and
+`fixtures/ts-app` (the first fixture mixing more than one `Lang`
+variant) with zero language-specific code in
+`crates/carto-core/src/query/`, and expected to hold for Go the same
+way.
 
 Also worth knowing before touching `resolve.rs` again: building
 `fixtures/php-app` surfaced a real, language-agnostic bug in call
@@ -138,4 +161,12 @@ classes containing methods — used to get every nested call's edges/
 `unresolved_calls` double-counted onto itself too). Fixed by
 `assign_calls_to_innermost_symbol`, verified behavior-preserving for
 Rust/Python (full pre-existing suite green, both golden files
-untouched) — see ADR-0012's "shared bug" section for the detail.
+untouched) — see ADR-0012's "shared bug" section for the detail. And
+building `fixtures/ts-app` caught two issues that turned out to be
+fixture-design mistakes, not extractor bugs (an aliased import of a
+non-exported symbol — invalid TS/JS — and a function named `log`
+coincidentally colliding with `console.log`) — see ADR-0013's own
+"what building the fixture caught" section. Both were only found by
+eyeballing real `carto index` output, never by unit tests on isolated
+snippets — keep doing that for every new language, per CLAUDE.md's own
+documented gotcha.

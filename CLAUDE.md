@@ -30,6 +30,7 @@ cargo test -p carto-core lang::rust::tests::extracts_top_level_function  # one t
 cargo run -p carto-cli -- index fixtures/rust-crate --out /tmp/carto-out
 cargo run -p carto-cli -- index fixtures/py-lib --out /tmp/carto-out
 cargo run -p carto-cli -- index fixtures/php-app --out /tmp/carto-out
+cargo run -p carto-cli -- index fixtures/ts-app --out /tmp/carto-out
 cargo run -p carto-cli -- index <repo> --json 2>/dev/null | python3 -m json.tool
 cargo run -p carto-cli -- where <name> <repo> --out /tmp/carto-out
 cargo run -p carto-cli -- deps <name|id> <repo> --out /tmp/carto-out --dir out --depth 2
@@ -119,10 +120,13 @@ detail to reshape freely.
 ### Language extraction is two-phase
 
 Per-file extraction and whole-repo resolution are deliberately separate
-(`lang/extractor.rs` → `lang/{rust,python,php}.rs` → `lang/resolve.rs`).
-`lang::extract_and_resolve` dispatches each file to its extractor by
-`Lang` (a small registry, `lang/mod.rs::extractors()`), not a
-hard-coded single language:
+(`lang/extractor.rs` → `lang/{rust,python,php,ecma}.rs` →
+`lang/resolve.rs`). `ecma.rs` houses three `LangExtractor`s
+(TypeScript/TSX/JavaScript) in one module, not one file each — see its
+own module doc comment for why (they're dialects of one grammar
+family; Rust/Python/PHP aren't). `lang::extract_and_resolve` dispatches
+each file to its extractor by `Lang` (a small registry,
+`lang/mod.rs::extractors()`), not a hard-coded single language:
 
 1. **Extract** parses one file into `RawSymbol`/`RawImport`/`RawCallSite`
    using tree-sitter queries kept as reviewable `.scm` files under
@@ -134,27 +138,37 @@ hard-coded single language:
    candidates produce **no edge**, recorded in the caller's
    `unresolved_calls` instead. Missing honestly beats guessing. The
    tier-resolution logic itself is language-agnostic; only import
-   handling (`RawImport::Relative`/`Absolute`/`Qualified`, spanning all
-   three languages today) and each extractor's own `is_pub`-equivalent
+   handling (`RawImport::Relative`/`Absolute`/`Qualified`, spanning
+   every language today) and each extractor's own `is_pub`-equivalent
    gate are per-language. A call is attributed to the *innermost*
    symbol containing it (`assign_calls_to_innermost_symbol`), not every
    symbol whose range contains it — matters for any language whose
    class-like symbol's own range spans its methods' bodies (PHP,
    Python; not Rust, where an `impl` block is never itself a symbol).
+   Tier (b) is alias-aware (`ImportedName { bound_name, declared_name
+   }`, `alias_to_declared`) — a call site's own spelling and the
+   target's actual declared name are tracked separately, not collapsed
+   to one string, so `import { foo as bar }`/`from x import foo as
+   bar`/`use Foo as X;` all resolve correctly (ADR-0013).
 
 Adding a language means: a `.scm` query set, a `LangExtractor` impl
 (registered in `extractors()`), and an ADR mapping §5.3's generic rules
 onto that language's actual import/call semantics.
 [ADR-0008](docs/adr/0008-rust-resolution-policy-mapping.md) (Rust),
 [ADR-0011](docs/adr/0011-python-resolution-policy-mapping.md) (Python),
-and [ADR-0012](docs/adr/0012-php-resolution-policy-mapping.md) (PHP —
-also the ADR that added PHP to spec §5.2's v1 set) are the three worked
-examples so far — templates, not rules that transfer verbatim (Python's
-attribute-call syntax can't even distinguish a module-qualified call
-from an instance call the way Rust's and PHP's grammars both can; PHP
-captures its path-qualified calls anyway, unlike Rust, since they're
-too common to drop; TS's `import './x'` is genuinely file-relative in a
-way none of Rust's, Python's, or PHP's import models are).
+[ADR-0012](docs/adr/0012-php-resolution-policy-mapping.md) (PHP — also
+the ADR that added PHP to spec §5.2's v1 set), and
+[ADR-0013](docs/adr/0013-typescript-javascript-resolution-policy-mapping.md)
+(TypeScript/TSX/JavaScript — also the ADR that fixed the alias-
+resolution gap above) are the worked examples so far — templates, not
+rules that transfer verbatim (Python's attribute-call syntax can't even
+distinguish a module-qualified call from an instance call the way
+Rust's, PHP's, and TS/JS's grammars all can; PHP and TS/JS capture
+their path-qualified/member calls anyway, unlike Rust, since they're
+too common to drop; TS/JS's relative imports are genuinely file-relative
+with extension-guessing in a way none of Rust's, Python's, or PHP's
+import models are, yet still fit the existing `RawImport::Relative`
+shape with no new variant).
 
 ## Conventions
 

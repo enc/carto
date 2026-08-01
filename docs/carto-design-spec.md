@@ -538,10 +538,11 @@ invariant conflict is discovered — surface those).
 ### M1 — Structural core (est. 4–6 wks)
 
 **Scope:** workspace scaffold incl. `deny.toml` FIRST; pathguard + taint types;
-walk; extractors for TS/JS, Python, Rust, Go, PHP (symbols+imports+calls per
-§5.3; PHP added post-M1.b.2a, ADR-0012); graph store, stable IDs, persist
-choke-point (redact stub = no-op pass with the interface in place); commands
-`index`, `where`, `deps`, `map` (code-only); `--json`; CI gates §9.5 (1–4).
+walk; extractors for TS/TSX/JS, Python, Rust, Go, PHP (symbols+imports+calls
+per §5.3; PHP added post-M1.b.2a, ADR-0012; TS/TSX/JS's alias-resolution fix
+and §5.3 mapping, ADR-0013); graph store, stable IDs, persist choke-point
+(redact stub = no-op pass with the interface in place); commands `index`,
+`where`, `deps`, `map` (code-only); `--json`; CI gates §9.5 (1–4).
 **Non-goals:** infra, join, MCP, ingest, YAML/HCL, redaction logic, WASM.
 **Acceptance:** fixtures/ts-app, fixtures/py-lib, fixtures/php-app,
 fixtures/mixed index correctly (golden-file tests on graph.json where
@@ -600,7 +601,7 @@ build for all targets.
 
 ### 11.1 Fixtures (committed, synthetic, small — never real customer code)
 
-`ts-app` (Express-ish, 30 files), `py-lib` (20), `php-app` (3, ADR-0012),
+`ts-app` (7, mixes `.ts`/`.tsx`/`.js`, ADR-0013), `py-lib` (20), `php-app` (3, ADR-0012),
 `rust-crate` (workspace, 15), `go-svc` (15), `mixed` (all of the above +
 noise dirs that must be ignored),
 `tf-app` (VPC+Lambda+DDB+APIGW plan JSON recorded via `terraform show -json`,
