@@ -25,6 +25,17 @@ pub fn python_language() -> tree_sitter::Language {
     tree_sitter_python::LANGUAGE.into()
 }
 
+/// PHP grammar (third language, ADR-0012). `tree-sitter-php` exposes two
+/// grammars (`LANGUAGE_PHP` and `LANGUAGE_PHP_ONLY`, the latter for
+/// files with no surrounding `<?php ... ?>` tags); real `.php` files
+/// open with `<?php`, so `LANGUAGE_PHP` is the correct one here. Same
+/// `LanguageFn -> Language` conversion as [`rust_language`]/
+/// [`python_language`] — no `unsafe` block needed for the same reason.
+#[cfg(feature = "native-grammars")]
+pub fn php_language() -> tree_sitter::Language {
+    tree_sitter_php::LANGUAGE_PHP.into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -46,6 +57,14 @@ mod tests {
         let mut parser = tree_sitter::Parser::new();
         parser.set_language(&python_language()).expect(
             "tree-sitter-python's language must be compatible with the linked tree-sitter runtime",
+        );
+    }
+
+    #[test]
+    fn php_language_loads_without_panicking() {
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&php_language()).expect(
+            "tree-sitter-php's language must be compatible with the linked tree-sitter runtime",
         );
     }
 }
