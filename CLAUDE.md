@@ -33,6 +33,7 @@ cargo run -p carto-cli -- index fixtures/php-app --out /tmp/carto-out
 cargo run -p carto-cli -- index fixtures/ts-app --out /tmp/carto-out
 cargo run -p carto-cli -- index fixtures/go-svc --out /tmp/carto-out
 cargo run -p carto-cli -- index fixtures/csharp-app --out /tmp/carto-out
+cargo run -p carto-cli -- index fixtures/secrets-corpus --out /tmp/carto-out
 cargo run -p carto-cli -- index <repo> --json 2>/dev/null | python3 -m json.tool
 cargo run -p carto-cli -- where <name> <repo> --out /tmp/carto-out
 cargo run -p carto-cli -- deps <name|id> <repo> --out /tmp/carto-out --dir out --depth 2
@@ -61,7 +62,7 @@ any of these means checking the mechanism still bites:
 | INV-2 no code execution | `clippy.toml` `disallowed-methods` bans `std::process::Command` outside `carto-cli/src/selfcheck.rs` |
 | INV-3/INV-4 write confinement | `carto_core::pathguard` — **every** fs write goes through `PathGuard::writer`; hard-coded, non-configurable denylist |
 | INV-5 repo text is untrusted | `TaintedString` has no `Display`/`Deref`/`AsRef<str>`/`Into<String>` and a private field; content only escapes via `render_fenced()`/`render_capped(n)`. Verified by a `trybuild` compile-fail suite (`carto-core/tests/ui/`) that diffs compiler stderr against checked-in snapshots |
-| INV-6 no secrets on disk | `redact::redact()` called from the persist choke-point (currently a no-op stub with the real signature — M2 fills it in) |
+| INV-6 no secrets on disk | `redact::redact()` called from the persist choke-point — pattern + entropy scan over every `TaintedString` field (`crates/carto-core/src/redact/{patterns,entropy}.rs`, ADR-0017) |
 | INV-7 deterministic output | `graph.json` must be byte-identical for the same tree. Double-index-and-compare tests in `carto-cli/tests/` |
 | INV-8 honest edges | `Edge::new` *requires* confidence + evidence as arguments; there is no constructor without them |
 

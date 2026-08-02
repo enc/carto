@@ -1,6 +1,6 @@
 # carto — status / handoff
 
-**Milestone:** M1.b.2b done (Rust, Python, PHP, TS/TSX/JS, Go — spec §5.2's full v1 language set), plus C# added post-v1 on user request (ADR-0016)
+**Milestone:** M1.b.2b done (Rust, Python, PHP, TS/TSX/JS, Go — spec §5.2's full v1 language set), plus C# added post-v1 on user request (ADR-0016). M2's first slice — real redaction (ADR-0017) — is also done.
 
 Where the implementation is in the milestone sequence, what's deliberately
 absent, and what's next. Everything else lives elsewhere on purpose:
@@ -45,7 +45,19 @@ so they've been subdivided. Current state:
   `new Foo()` is a captured call site resolving to the *type* (which
   is exactly why constructors are deliberately not symbols — see
   ADR-0016's constructor-ambiguity section).
-- **M2+** — infra graph, join, MCP, ingest, real redaction. Per spec §10. **Current head.**
+- **M2 — real redaction** (2026-08-02, ADR-0017) — `redact::redact()`'s
+  M1.b.1 no-op stub is filled in: hand-rolled pattern matching (8
+  categories, spec §7.5(a): AWS keys, secret-shaped base64 near
+  "secret", PEM headers, GitHub/GitLab/Slack tokens, JWTs, credential
+  connection strings) plus per-token Shannon entropy (§7.5(b)), scoped
+  to every `TaintedString` field (today: `SymbolNode.signature`) —
+  reached via `Graph`'s new `nodes_mut()`, with no changes to
+  `taint.rs`'s INV-5 machinery. Dogfooding (`carto index .` against
+  carto's own source) caught and fixed a real false positive before
+  shipping: long, descriptive `snake_case` test names crossing the
+  entropy threshold purely from underscore-joined lexical diversity —
+  see ADR-0017's own section on it.
+- **M2+ remaining** — infra graph, join, MCP, ingest. Per spec §10. **Current head.**
 
 Post-M1.b.2b hardening (2026-08-01): real-world PHP field-testing
 against a TYPO3 codebase surfaced two query-layer gaps, both fixed —
@@ -115,6 +127,16 @@ Do not "fix" these without checking the linked reasoning first:
 - **`MCP_TEXT_CAP`'s 8 KiB byte cap isn't enforced anywhere yet** — no
   MCP text renderer exists until M4. Today's output is bounded by each
   command's own `--limit`/`--depth`/`--budget`.
+- **Redaction only scans `TaintedString` fields, not literally every
+  `String` field** (spec §7.5's wording) — `FileNode.path`,
+  `ModuleNode.path`, `SymbolNode.name`, and `UnresolvedCall.name` are
+  all extractor-computed identifiers/paths, never free-form captured
+  source text, so pattern/entropy-scanning them would be pure noise.
+  ADR-0017.
+- **`connection_string` redaction only covers the credential-bearing
+  prefix**, not the trailing path (`postgres://user:pass@host/db` →
+  `postgres://«redacted:...»/db`) — the path carries no credential.
+  ADR-0017.
 - **Query-layer `--json` output never fences tainted text; human output
   fences once per section, not once per row** —
   [ADR-0010](adr/0010-tainted-text-in-query-output.md).
@@ -245,10 +267,10 @@ PHP, same *directory* for Go — the one language so far where package
 scope needed a genuinely new resolution tier, not just a new
 `RawImport` variant).
 
-Next per spec §10 is M2: the infrastructure graph (Terraform/CFN/CDK),
-the code↔infra join, and real redaction (`redact::redact()` is
-currently a no-op stub with the real signature). Read spec §6/§7 before
-planning M2's first slice — it hasn't been sliced yet the way M1.b was.
+Real redaction (ADR-0017) is M2's first slice, done. What's left of M2
+per spec §10: the infrastructure graph (Terraform/CFN/CDK) and the
+code↔infra join. Read spec §6 before planning that next slice — it
+hasn't been sliced yet the way M1.b was.
 
 Also worth knowing before touching `resolve.rs` again: building
 `fixtures/php-app` surfaced a real, language-agnostic bug in call
