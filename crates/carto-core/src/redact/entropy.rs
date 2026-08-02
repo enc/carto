@@ -20,13 +20,24 @@ use super::patterns::Match;
 const MIN_LEN: usize = 20;
 const MIN_ENTROPY_BITS_PER_CHAR: f64 = 4.2;
 
-/// Token alphabet: alnum plus base64/hex "value" punctuation
-/// (`+`, `/`, `=`, `_`, `-`). Deliberately excludes `.` — dotted
-/// identifiers/paths/version strings are common and would otherwise
-/// glue unrelated low-entropy words into one long, spuriously-scored
-/// token.
+/// Token alphabet: alnum plus base64/hex "value" punctuation (`+`, `/`,
+/// `=`, `-`). Deliberately excludes `.` — dotted identifiers/paths/
+/// version strings are common and would otherwise glue unrelated
+/// low-entropy words into one long, spuriously-scored token.
+/// Deliberately excludes `_` too, found by dogfooding this pass against
+/// carto's own source (a long, descriptive `snake_case_test_name` —
+/// this codebase's own convention — merged a dozen lexically-distinct
+/// English words into one 76-char token via its underscores, and their
+/// combined lexical diversity alone pushed it over the entropy
+/// threshold). A real base64/hex secret blob essentially never contains
+/// a literal underscore as a value character (standard base64 doesn't
+/// use one at all; base64url's `_` is already caught separately by
+/// `patterns::find_jwt`'s explicit three-segment shape) — false
+/// positives on ordinary `snake_case` identifiers are far more likely
+/// in practice than a false negative on an unprefixed, underscore-
+/// bearing secret with no other distinguishing shape. See ADR-0017.
 fn is_token_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=' | '_' | '-')
+    c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=' | '-')
 }
 
 /// Finds every token ≥[`MIN_LEN`] chars whose Shannon entropy exceeds
@@ -137,6 +148,25 @@ mod tests {
     fn ordinary_english_sentence_is_not_flagged() {
         assert!(
             categories("fn calculate_total_price_including_tax(order: &Order) -> f64").is_empty()
+        );
+    }
+
+    #[test]
+    fn long_descriptive_snake_case_test_name_is_not_flagged() {
+        // Regression: found by dogfooding this exact pass against
+        // carto's own source (see ADR-0017) -- a long, descriptive
+        // snake_case test function name (this codebase's own testing
+        // convention, CLAUDE.md) used to merge a dozen lexically-
+        // distinct English words into one long token via its
+        // underscores, and their combined lexical diversity alone
+        // pushed it over the 4.2 bits/char threshold. `_` is no longer
+        // in the token alphabet, so this now splits into a dozen short
+        // words, none reaching MIN_LEN.
+        assert!(
+            categories(
+                "fn csharp_namespace_import_with_unknown_root_keys_external_module_by_full_string()"
+            )
+            .is_empty()
         );
     }
 
