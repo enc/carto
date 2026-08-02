@@ -157,6 +157,35 @@ the full-string external module identities, the `Acme.Reports`
 known-root omission, and the three honest `unresolved_calls`
 (`WriteLine`, `NewGuid`, `Trim`).
 
+## Post-merge fix: cross-language index collisions
+
+A `/code-review` pass over this slice found that the three indices this
+ADR introduced (`known_namespace_roots`, `fqn_to_file`,
+`namespace_to_files`) were keyed by bare namespace/FQN strings, not by
+language. This ADR's own claim that "the separator spelling makes
+cross-language keys unequal by construction" is true for multi-segment
+names but false for a **root segment or a single-segment name**, which
+contains no separator at all: a PHP `namespace App;` and a C# `using
+App;` collided exactly, and a PHP `namespace System\Legacy;` (root
+`System`) could silently absorb an unrelated C# `using System.Text;`
+into "known internal root, no exact match" (no edge) instead of the
+correct external-module outcome. Separately, `RawImport::Qualified`'s
+external fallback always truncated to the FQN's root segment — correct
+for PHP's Composer-style dedup, but wrong for C#, where it contradicted
+this ADR's own full-identity policy for `NamespaceImport`.
+
+Fixed by keying all three indices on `(fe.origin, ...)` — the actual
+per-language discriminant already on every `FileExtraction` — and by
+adding `LangExtractor::qualified_external_is_full_fqn()` (default
+`false`, PHP unchanged; `true` for C#) so the `Qualified` external
+fallback follows the same full-FQN policy `NamespaceImport` already
+had. Neither `fixtures/php-app` nor `fixtures/csharp-app` exercises the
+collision path (both are single-language), which is exactly how this
+went unnoticed until reviewed; three new `resolve.rs` unit tests pin
+the cross-language cases directly. See the commit fixing this for the
+full detail; not worth a separate ADR since no new decision was made,
+only a bug in this one's own stated policy.
+
 ## Consequences (query layer)
 
 `crates/carto-core/src/query/` needed zero changes — the same
