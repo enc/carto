@@ -17,7 +17,9 @@
 //! here: `internal` counts as exported (`is_pub` — carto's "same
 //! package" is already "same walked repo", which approximates one
 //! assembly), and `new Foo(...)` object creation is captured as a call
-//! site (with constructors extracted as methods to receive the edges).
+//! site, resolving to the constructed *type*'s symbol (constructors
+//! themselves are deliberately not extracted — see symbols.scm's own
+//! comment for why extracting them would poison exactly those edges).
 
 use super::extractor::{ExtractOut, LangExtractor, RawCallSite, RawImport, RawSymbol};
 use crate::graph::SymKind;
@@ -482,18 +484,25 @@ mod tests {
     }
 
     #[test]
-    fn constructor_is_a_method_with_qualified_name() {
+    fn constructor_is_not_a_symbol_but_its_body_calls_are_captured() {
+        // A constructor shares its type's name — extracting it would
+        // make every `new Order()` ambiguous between type and
+        // constructor and INV-8 would drop the edge (see symbols.scm).
+        // Exactly one symbol named Order (the class); the constructor
+        // body's call site is still captured, attributed to the class
+        // by innermost containment in resolve.
         let out = extract(
             "public class Order\n{\n    public Order(string id)\n    {\n        Validate(id);\n    }\n\n    private static void Validate(string id) { }\n}\n",
         );
-        let ctor = out
-            .symbols
-            .iter()
-            .find(|s| s.name == "Order" && matches!(s.sym_kind, SymKind::Method))
-            .expect("constructor must be extracted as a method");
-        assert_eq!(ctor.qualified_name, "Order.Order");
-        // Its body's call is attributable to it (innermost containment
-        // happens in resolve; here just confirm the call site exists).
+        assert_eq!(out.symbols.iter().filter(|s| s.name == "Order").count(), 1);
+        assert!(matches!(
+            out.symbols
+                .iter()
+                .find(|s| s.name == "Order")
+                .unwrap()
+                .sym_kind,
+            SymKind::Class
+        ));
         assert!(out.call_sites.iter().any(|c| c.callee_name == "Validate"));
     }
 

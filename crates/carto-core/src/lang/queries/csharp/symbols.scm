@@ -35,11 +35,16 @@
 (method_declaration
   name: (identifier) @symbol.name) @symbol.method
 
-; Constructors are extracted as methods (ADR-0016): `new Foo()` call
-; sites are captured, and a constructor body's own calls need an
-; innermost symbol to be attributed to.
-(constructor_declaration
-  name: (identifier) @symbol.name) @symbol.method
+; Constructors are deliberately NOT extracted (ADR-0016): a C#
+; constructor shares its type's own name, so a constructor symbol would
+; make every `new Foo()` (and same-file `Foo`) reference *ambiguous*
+; between the type and its constructor under bare-name resolution —
+; INV-8 would then honestly drop the very construction edges calls.scm
+; captures `new` to produce. `new Foo()` resolves to the *type* symbol
+; instead, and a constructor body's own calls are attributed to the
+; enclosing type (innermost containment) — unlike PHP's `__construct`
+; and Python's `__init__`, which have their own distinct names and so
+; are safely extractable.
 
 ; Only `const` fields become symbols (SymKind::Const) — csharp.rs checks
 ; the modifier and emits one symbol per declarator (`const int A = 1,
