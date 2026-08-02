@@ -74,6 +74,19 @@ impl Graph {
         self.edges.len()
     }
 
+    /// Mutable access to every node, in no particular order. The one
+    /// in-place mutation path in the whole crate — added for
+    /// [`crate::redact::redact`] (spec §6.5: redact runs before
+    /// [`into_sorted_parts`](Self::into_sorted_parts), so it needs to
+    /// rewrite `TaintedString` fields on the `Graph` itself, not on the
+    /// already-extracted `Vec<Node>`). Every other consumer still only
+    /// builds a `Graph` via [`insert_node`](Self::insert_node) and reads
+    /// it via `into_sorted_parts`; order doesn't matter here since
+    /// redaction is a per-node, order-independent rewrite.
+    pub fn nodes_mut(&mut self) -> impl Iterator<Item = &mut Node> {
+        self.nodes.values_mut()
+    }
+
     /// Consumes the graph, returning its nodes and edges in ID-sorted
     /// order (spec §4.4). This is the only way out of a `Graph` — callers
     /// (i.e. [`persist`]) get the sort guarantee without a separate sort
