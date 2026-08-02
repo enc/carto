@@ -1,8 +1,10 @@
 //! Language identification (spec §5.2) and the `LangExtractor` trait +
 //! its implementations. Rust (M1.b.2a), Python (M1.b.2b), PHP
 //! (ADR-0012), TypeScript/TSX/JavaScript (ADR-0013), and Go (ADR-0015)
-//! exist — the full spec §5.2 v1 language set, closing M1.b.2b.
+//! form the full spec §5.2 v1 language set (closed M1.b.2b); C#
+//! (ADR-0016) is the first post-v1 addition.
 
+pub mod csharp;
 pub mod ecma;
 pub mod extractor;
 pub mod go;
@@ -11,6 +13,7 @@ pub mod python;
 pub mod resolve;
 pub mod rust;
 
+pub use csharp::CSharpExtractor;
 pub use ecma::{JavaScriptExtractor, TsxExtractor, TypeScriptExtractor};
 pub use extractor::{ExtractOut, ImportedName, LangExtractor, RawCallSite, RawImport, RawSymbol};
 pub use go::GoExtractor;
@@ -23,10 +26,10 @@ use crate::graph::Node;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-/// The v1 language set (spec §5.2 — amended by ADR-0012 to include PHP),
-/// plus `Other`/`PlainText` for anything `walk` sees that isn't in that
-/// set yet (M1.b.1 has no extractors, so every file is currently either
-/// recognized-by-extension or `Other`).
+/// The v1 language set (spec §5.2 — amended by ADR-0012 to include PHP
+/// and ADR-0016 to include C#), plus `Other`/`PlainText` for anything
+/// `walk` sees that isn't in that set yet (M1.b.1 has no extractors, so
+/// every file is currently either recognized-by-extension or `Other`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Lang {
@@ -37,6 +40,11 @@ pub enum Lang {
     Rust,
     Go,
     Php,
+    /// serde-renamed: snake_case would derive `c_sharp`, but the
+    /// ecosystem-conventional (and graph.json-friendlier) spelling is
+    /// `csharp`.
+    #[serde(rename = "csharp")]
+    CSharp,
     Hcl,
     Yaml,
     Json,
@@ -60,6 +68,7 @@ impl Lang {
             "rs" => Lang::Rust,
             "go" => Lang::Go,
             "php" => Lang::Php,
+            "cs" => Lang::CSharp,
             "tf" | "tfvars" | "hcl" => Lang::Hcl,
             "yaml" | "yml" => Lang::Yaml,
             "json" => Lang::Json,
@@ -84,6 +93,7 @@ fn extractors() -> Vec<Box<dyn LangExtractor>> {
         Box::new(TsxExtractor),
         Box::new(JavaScriptExtractor),
         Box::new(GoExtractor),
+        Box::new(CSharpExtractor),
     ]
 }
 
@@ -145,6 +155,7 @@ mod tests {
         assert_eq!(Lang::from_extension("rs"), Lang::Rust);
         assert_eq!(Lang::from_extension("go"), Lang::Go);
         assert_eq!(Lang::from_extension("php"), Lang::Php);
+        assert_eq!(Lang::from_extension("cs"), Lang::CSharp);
         assert_eq!(Lang::from_extension("tf"), Lang::Hcl);
         assert_eq!(Lang::from_extension("yaml"), Lang::Yaml);
         assert_eq!(Lang::from_extension("json"), Lang::Json);
