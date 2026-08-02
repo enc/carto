@@ -93,6 +93,7 @@ pub fn persist(mut graph: Graph, meta: PersistMeta, guard: &PathGuard) -> Result
 
     let node_count = nodes.len();
     let edge_count = edges.len();
+    let file_count = nodes.iter().filter(|n| n.data.as_file().is_some()).count();
 
     let doc = GraphDocument {
         carto_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -129,7 +130,7 @@ pub fn persist(mut graph: Graph, meta: PersistMeta, guard: &PathGuard) -> Result
         updated_at: now,
         commit_sha: meta.commit_sha,
         dirty: None,
-        file_count: node_count,
+        file_count,
         node_count,
         edge_count,
         redaction,
@@ -240,6 +241,35 @@ mod tests {
 
         let manifest_json = std::fs::read_to_string(g.out_root().join("manifest.json")).unwrap();
         assert!(manifest_json.contains("\"created_at\""));
+    }
+
+    #[test]
+    fn manifest_file_count_counts_only_file_nodes() {
+        let base = TempDir::new("filecount");
+        let g = guard(&base);
+        let mut graph = Graph::new();
+        graph.insert_node(file_node("a.rs"));
+        graph.insert_node(Node::symbol(
+            super::super::sym_id("a.rs", "function", "foo", 1),
+            Provenance::Syntactic,
+            "lang-rust@1",
+            crate::graph::SymbolNode {
+                name: "foo".to_string(),
+                sym_kind: crate::graph::SymKind::Function,
+                file: super::super::file_id("a.rs"),
+                start_line: 1,
+                end_line: 2,
+                signature: None,
+                unresolved_calls: vec![],
+            },
+        ));
+
+        let manifest = persist(graph, empty_meta(), &g).unwrap();
+        assert_eq!(manifest.node_count, 2);
+        assert_eq!(
+            manifest.file_count, 1,
+            "symbols must not inflate file_count"
+        );
     }
 
     #[test]

@@ -24,8 +24,8 @@ pub struct SelfcheckReport {
     pub min_rust_version: &'static str,
     pub target_triple: &'static str,
     /// Hardcoded for now: M1–M4 build native grammars behind the
-    /// `native-grammars` feature (spec §5.4); no grammars exist yet in
-    /// M1.a. `wasm-grammars` becomes default in M5.
+    /// `native-grammars` feature (spec §5.4). `wasm-grammars` becomes
+    /// default in M5.
     pub grammar_mode: &'static str,
     /// Spec §14: "Windows: no Landlock" / non-Linux in general —
     /// `selfcheck` reports "confinement: none (platform)" and does not
@@ -54,7 +54,7 @@ pub fn run() -> SelfcheckReport {
         git_sha: env!("CARTO_GIT_SHA"),
         min_rust_version: env!("CARGO_PKG_RUST_VERSION"),
         target_triple: env!("CARTO_TARGET_TRIPLE"),
-        grammar_mode: "native (no grammars registered yet — M1.a)",
+        grammar_mode: "native (rust, python, php, typescript, tsx, javascript, go)",
         confinement,
         default_out_root,
         pathguard_denylist_digest: pathguard::denylist_digest(),
