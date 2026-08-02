@@ -174,6 +174,13 @@ fn extract_symbols(
 /// `body_start_byte`-style helpers elsewhere make for logic that's
 /// awkward to express as a query pattern.
 fn collect_exported_names(node: Node, src: &[u8], out: &mut BTreeSet<String>) {
+    // A re-export (`export { foo } from './x'`) names symbols declared
+    // in *another* file — its specifiers say nothing about whether a
+    // local declaration that happens to share a name is reachable, so
+    // the whole statement is skipped, not descended into.
+    if node.kind() == "export_statement" && node.child_by_field_name("source").is_some() {
+        return;
+    }
     if node.kind() == "export_specifier" {
         if let Some(name_node) = node.child_by_field_name("name") {
             if name_node.kind() == "identifier" {
@@ -637,6 +644,15 @@ mod tests {
         // must be checked, not the external-facing alias "h".
         let out = ts("function helper() {}\nexport { helper as h };\n");
         assert!(out.symbols[0].is_pub);
+    }
+
+    #[test]
+    fn reexport_specifier_does_not_make_a_same_named_local_declaration_pub() {
+        // `export { helper } from './other'` re-exports the *other*
+        // file's `helper`; the local, never-exported `helper` must stay
+        // module-private.
+        let out = ts("function helper() {}\nexport { helper } from './other';\n");
+        assert!(!out.symbols[0].is_pub);
     }
 
     #[test]

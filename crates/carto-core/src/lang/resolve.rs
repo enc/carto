@@ -45,9 +45,16 @@ pub fn resolve(extractions: Vec<FileExtraction>) -> ResolvedExtraction {
     // ones that don't). `Relative` with non-empty `imported_names` is
     // Python's shape (`from .pkg import a`), not Rust's `mod` shape, so
     // it's excluded here — Rust's `mod foo;` always has empty
-    // `imported_names` (see `RawImport::Relative`'s doc comment).
+    // `imported_names` (see `RawImport::Relative`'s doc comment). But
+    // empty `imported_names` alone isn't Rust-specific: TS/JS
+    // side-effect (`import './x'`), default, namespace, and re-export
+    // imports all produce the same shape (ADR-0013), so this is also
+    // gated on the declaring file being a `.rs` file — otherwise a TS
+    // `import './orders'` would make a bare npm package named `orders`
+    // classify as internal and silently drop its external-module edge.
     let known_modules: BTreeSet<&str> = extractions
         .iter()
+        .filter(|fe| fe.relpath.ends_with(".rs"))
         .flat_map(|fe| &fe.extract.imports)
         .filter_map(|imp| match imp {
             RawImport::Relative {
@@ -121,16 +128,20 @@ pub fn resolve(extractions: Vec<FileExtraction>) -> ResolvedExtraction {
         })
         .collect();
 
-    // Spec §5.3 rule 2 tier (a): same-file, any visibility.
-    let same_file_by_name: Vec<BTreeMap<&str, usize>> = extractions
+    // Spec §5.3 rule 2 tier (a): same-file, any visibility. All indices
+    // per name, not just one — a name declared more than once in the
+    // same file (two classes with a same-named method, a redefined
+    // Python function, TS declaration merging) is *ambiguous*, and must
+    // produce no edge (INV-8), not silently resolve to whichever
+    // declaration happened to be inserted last.
+    let same_file_by_name: Vec<BTreeMap<&str, Vec<usize>>> = extractions
         .iter()
         .map(|fe| {
-            fe.extract
-                .symbols
-                .iter()
-                .enumerate()
-                .map(|(si, s)| (s.name.as_str(), si))
-                .collect()
+            let mut m: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+            for (si, s) in fe.extract.symbols.iter().enumerate() {
+                m.entry(s.name.as_str()).or_default().push(si);
+            }
+            m
         })
         .collect();
 
@@ -299,9 +310,22 @@ pub fn resolve(extractions: Vec<FileExtraction>) -> ResolvedExtraction {
                     module_path,
                     imported_names,
                 } => {
-                    if imported_names.is_empty() {
-                        // Rust's `mod foo;` shape: the import refers to
-                        // the module file itself, not a name within it.
+                    if imported_names.is_empty() || !module_path.is_empty() {
+                        // The module itself is the file-level target;
+                        // one edge, certain per spec rule 1, regardless
+                        // of how many names are drawn from it. Covers
+                        // Rust's `mod foo;` (empty names — evidence
+                        // "mod-declaration", but only for a `.rs` file:
+                        // TS/JS side-effect/default/namespace/re-export
+                        // imports produce the same empty-names shape,
+                        // ADR-0013, and are ordinary relative imports,
+                        // not mod declarations) and Python's `from .pkg
+                        // import a, b` / TS's `import x from './pkg'`.
+                        let evidence = if fe.relpath.ends_with(".rs") {
+                            "mod-declaration"
+                        } else {
+                            "relative-import"
+                        };
                         if let Some(target) = resolve_relative_import(
                             &fe.relpath,
                             *levels_up,
@@ -313,26 +337,7 @@ pub fn resolve(extractions: Vec<FileExtraction>) -> ResolvedExtraction {
                                 fe.file_id.clone(),
                                 target.clone(),
                                 Confidence::Certain,
-                                "mod-declaration".to_string(),
-                            ));
-                        }
-                    } else if !module_path.is_empty() {
-                        // Python's `from .pkg import a, b` — the module
-                        // itself is the file-level target; one edge,
-                        // certain per spec rule 1, regardless of how
-                        // many names are drawn from it.
-                        if let Some(target) = resolve_relative_import(
-                            &fe.relpath,
-                            *levels_up,
-                            module_path,
-                            &relpath_to_file_id,
-                        ) {
-                            edges.push(Edge::new(
-                                EdgeKind::Imports,
-                                fe.file_id.clone(),
-                                target.clone(),
-                                Confidence::Certain,
-                                "relative-import".to_string(),
+                                evidence.to_string(),
                             ));
                         }
                     } else {
@@ -572,7 +577,7 @@ fn assign_calls_to_innermost_symbol<'a>(
 fn resolve_call(
     caller_file_idx: usize,
     call: &RawCallSite,
-    same_file_by_name: &[BTreeMap<&str, usize>],
+    same_file_by_name: &[BTreeMap<&str, Vec<usize>>],
     alias_to_declared: &[BTreeMap<&str, &str>],
     pub_by_name: &BTreeMap<&str, Vec<(usize, usize)>>,
     dir_scoped: &[bool],
@@ -581,8 +586,18 @@ fn resolve_call(
 ) -> Option<(usize, usize, &'static str)> {
     let name = call.callee_name.as_str();
 
-    if let Some(&si) = same_file_by_name[caller_file_idx].get(name) {
-        return Some((caller_file_idx, si, "same-file"));
+    match same_file_by_name[caller_file_idx]
+        .get(name)
+        .map(Vec::as_slice)
+    {
+        Some([si]) => return Some((caller_file_idx, *si, "same-file")),
+        // Two-or-more same-file declarations: the callee is almost
+        // certainly one of them (local scope wins in every supported
+        // language), but which one is ambiguous — no edge, and no
+        // fall-through to a lower tier that would "resolve" it
+        // elsewhere (INV-8: missing honestly beats guessing).
+        Some([_, _, ..]) => return None,
+        _ => {}
     }
 
     // Tier (a′), Go only (ADR-0015): same directory, any visibility —
@@ -927,6 +942,79 @@ mod tests {
         assert_eq!(
             calls_edges(&out.edges)[0].evidence,
             vec!["same-package".to_string()]
+        );
+    }
+
+    #[test]
+    fn duplicate_same_file_names_are_ambiguous_and_produce_no_edge() {
+        // Two classes in one file, each with a `summary` method (a shape
+        // PHP/Python/TS all capture) — a call to `summary` in the same
+        // file must be recorded unresolved, not silently attributed to
+        // whichever declaration was extracted last, and must not fall
+        // through to a lower tier either.
+        let mut f = file("src/models.php");
+        f.origin = "lang-php@1";
+        f.extract.symbols = vec![
+            sym("handle", SymKind::Function, 1, 4, true),
+            sym("summary", SymKind::Method, 6, 8, true),
+            sym("summary", SymKind::Method, 10, 12, true),
+        ];
+        f.extract.call_sites = vec![call("summary", 2)];
+
+        // A same-named pub symbol elsewhere must NOT pick up the call
+        // via tier (c) after the same-file ambiguity.
+        let mut other = file("src/other.php");
+        other.origin = "lang-php@1";
+        other.extract.symbols = vec![sym("summary", SymKind::Function, 1, 2, true)];
+
+        let out = resolve(vec![f, other]);
+        let handle = find_symbol(&out.nodes, "handle");
+        assert_eq!(handle.unresolved_calls.len(), 1);
+        assert_eq!(handle.unresolved_calls[0].name, "summary");
+        assert!(calls_edges(&out.edges).is_empty());
+    }
+
+    #[test]
+    fn ts_relative_import_without_names_does_not_make_a_matching_package_root_internal() {
+        // `import './orders'` (side-effect) in a .ts file produces the
+        // same empty-imported_names Relative shape as Rust's `mod foo;`
+        // — it must not enter `known_modules` and suppress the external
+        // module node for a bare npm package that happens to be named
+        // `orders`.
+        let mut app = file("src/app.ts");
+        app.origin = "lang-ts@1";
+        app.extract.imports = vec![RawImport::Relative {
+            levels_up: 0,
+            module_path: "orders".into(),
+            imported_names: vec![],
+        }];
+        let orders = {
+            let mut f = file("src/orders.ts");
+            f.origin = "lang-ts@1";
+            f
+        };
+        let mut consumer = file("src/consumer.ts");
+        consumer.origin = "lang-ts@1";
+        consumer.extract.imports = vec![RawImport::Absolute {
+            root: "orders".into(),
+            imported_names: vec![],
+        }];
+
+        let out = resolve(vec![app, orders, consumer]);
+        // The side-effect import still resolves file-to-file, with
+        // relative-import (not mod-declaration) evidence...
+        let imports = imports_edges(&out.edges);
+        assert!(
+            imports
+                .iter()
+                .any(|e| e.evidence == vec!["relative-import".to_string()])
+        );
+        // ...and the bare `orders` package still gets its external
+        // module node + edge.
+        assert!(
+            out.nodes.iter().any(
+                |n| matches!(&n.data, NodeData::Module(m) if m.path == "orders" && m.external)
+            )
         );
     }
 
