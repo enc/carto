@@ -1,6 +1,6 @@
 # carto — status / handoff
 
-**Milestone:** M1.b.2b done (Rust, Python, PHP, TS/TSX/JS, Go — spec §5.2's full v1 language set)
+**Milestone:** M1.b.2b done (Rust, Python, PHP, TS/TSX/JS, Go — spec §5.2's full v1 language set), plus C# added post-v1 on user request (ADR-0016)
 
 Where the implementation is in the milestone sequence, what's deliberately
 absent, and what's next. Everything else lives elsewhere on purpose:
@@ -34,6 +34,17 @@ so they've been subdivided. Current state:
   import paths, and a new opt-in directory-scoped resolution tier for
   Go's file-independent package visibility). Spec §5.2's v1 language
   set is now fully implemented.
+- **Post-v1-set: C#** (2026-08-02, ADR-0016) — the eighth language,
+  added on direct user request ahead of the M2+ roadmap, the same
+  on-request scope-amendment path PHP took (ADR-0012). New
+  `RawImport::NamespaceImport` (a C# `using` imports a *namespace* —
+  many files — fitting no prior variant) with Go-style per-file
+  fan-out, and `LangExtractor::namespace_separator()` so PHP's `\` and
+  C#'s `.` FQNs share one index without cross-matching. Two
+  user-confirmed judgment calls: `internal` counts as exported, and
+  `new Foo()` is a captured call site resolving to the *type* (which
+  is exactly why constructors are deliberately not symbols — see
+  ADR-0016's constructor-ambiguity section).
 - **M2+** — infra graph, join, MCP, ingest, real redaction. Per spec §10. **Current head.**
 
 Post-M1.b.2b hardening (2026-08-01): real-world PHP field-testing
@@ -187,28 +198,52 @@ Do not "fix" these without checking the linked reasoning first:
   discarded** — `RawCallSite` carries only the bare callee name
   (`Func`), the same grammar-level ambiguity Python's/TS-JS's
   attribute/member calls already have, not a Go-specific gap. ADR-0015.
+- **C# constructors are never extracted as symbols** — a constructor
+  shares its type's name, so a constructor symbol would make every
+  `new Foo()` ambiguous between type and constructor and INV-8 would
+  drop the very construction edges capturing `new` exists to produce.
+  `new Foo()` resolves to the *type*; constructor-body calls attribute
+  to the enclosing class (innermost containment). Not the same
+  situation as PHP's `__construct`/Python's `__init__`, whose distinct
+  names make them safe to extract. ADR-0016.
+- **C# properties, events, indexers, operators, non-const fields, and
+  local functions are not extracted**; `using static`'s member-binding
+  and `global using`'s repo-wide scope are not modeled; partial
+  classes' cross-file `private` visibility lands in
+  `unresolved_calls`. ADR-0016.
+- **C#'s cross-namespace calls always resolve via tier (c)
+  (`"same-package"`), never tier (b), even through a real `using`** —
+  a namespace `using` binds no symbol name (Go's exact shape, ADR-0015);
+  only the *alias* form (`using P = X.Y.Z;`) feeds tier (b). And every
+  C# `using` of a namespace no walked file declares becomes an external
+  `Module` keyed by the full namespace string — no `.csproj` parsing,
+  same "no manifest parsing" precedent as every other language.
+  ADR-0016.
 
 ## Next: M2 (infra graph, join, MCP, ingest, real redaction)
 
 M1.b.2b is done — spec §5.2's full v1 language set (TypeScript, TSX,
-JavaScript, Python, Rust, Go, PHP) is implemented, `carto index` extracts
-symbols/imports/calls for all seven `Lang` variants, and
-`where`/`deps`/`map` work against every one of them with zero
-language-specific code in `crates/carto-core/src/query/` — reconfirmed
-for Go (ADR-0015), the seventh and final data point for that claim.
+JavaScript, Python, Rust, Go, PHP) is implemented, plus C# post-v1
+(ADR-0016). `carto index` extracts symbols/imports/calls for all eight
+`Lang` variants, and `where`/`deps`/`map` work against every one of
+them with zero language-specific code in
+`crates/carto-core/src/query/` — reconfirmed for C# (ADR-0016), the
+eighth data point for that claim.
 
-Seven languages across six ADRs (Rust/ADR-0008, Python/ADR-0011,
-PHP/ADR-0012, TS-TSX-JS/ADR-0013, Go/ADR-0015) are enough data points to
-say what varies per language with some confidence: relative-import vs.
-FQN-based vs. literal-path vs. directory-path import semantics, what
-"exported" means (a keyword, a convention, or a hard first-letter-case
-rule), whether path-qualified calls are even syntactically
-distinguishable from plain ones (and, PHP/TS/Go all show,
-distinguishable ≠ excluded — an independent call each language gets to
-make), and what "same-package" should mean (same walked repo for
-Rust/Python/TS-JS, same FQN-namespace for PHP, same *directory* for Go
-— the one language so far where package scope needed a genuinely new
-resolution tier, not just a new `RawImport` variant).
+Eight languages across seven ADRs (Rust/ADR-0008, Python/ADR-0011,
+PHP/ADR-0012, TS-TSX-JS/ADR-0013, Go/ADR-0015, C#/ADR-0016) are enough
+data points to say what varies per language with some confidence:
+relative-import vs. FQN-based vs. literal-path vs. directory-path vs.
+namespace-fan-out import semantics, what "exported" means (a keyword,
+a convention, a hard first-letter-case rule — or C#'s
+`internal`-is-repo-visible judgment call), whether path-qualified
+calls are even syntactically distinguishable from plain ones (and,
+PHP/TS/Go/C# all show, distinguishable ≠ excluded — an independent
+call each language gets to make), and what "same-package" should mean
+(same walked repo for Rust/Python/TS-JS/C#, same FQN-namespace for
+PHP, same *directory* for Go — the one language so far where package
+scope needed a genuinely new resolution tier, not just a new
+`RawImport` variant).
 
 Next per spec §10 is M2: the infrastructure graph (Terraform/CFN/CDK),
 the code↔infra join, and real redaction (`redact::redact()` is
@@ -234,3 +269,8 @@ documented gotcha. `fixtures/go-svc` (ADR-0015) broke that streak in a
 good way: the fixture matched real output on the first run, with
 nothing to fix — recorded in ADR-0015 rather than left unmentioned, so
 "nothing was wrong" reads as verified, not skipped.
+`fixtures/csharp-app` (ADR-0016) added a third variation: its one real
+defect (constructor symbols making every `new Foo()` ambiguous) was
+caught at fixture-*design* time — tracing which resolution outcome
+each planned call site must produce, before the first run — and the
+first real run then matched the corrected design exactly.

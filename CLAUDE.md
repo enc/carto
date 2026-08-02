@@ -32,6 +32,7 @@ cargo run -p carto-cli -- index fixtures/py-lib --out /tmp/carto-out
 cargo run -p carto-cli -- index fixtures/php-app --out /tmp/carto-out
 cargo run -p carto-cli -- index fixtures/ts-app --out /tmp/carto-out
 cargo run -p carto-cli -- index fixtures/go-svc --out /tmp/carto-out
+cargo run -p carto-cli -- index fixtures/csharp-app --out /tmp/carto-out
 cargo run -p carto-cli -- index <repo> --json 2>/dev/null | python3 -m json.tool
 cargo run -p carto-cli -- where <name> <repo> --out /tmp/carto-out
 cargo run -p carto-cli -- deps <name|id> <repo> --out /tmp/carto-out --dir out --depth 2
@@ -121,11 +122,11 @@ detail to reshape freely.
 ### Language extraction is two-phase
 
 Per-file extraction and whole-repo resolution are deliberately separate
-(`lang/extractor.rs` → `lang/{rust,python,php,ecma,go}.rs` →
+(`lang/extractor.rs` → `lang/{rust,python,php,ecma,go,csharp}.rs` →
 `lang/resolve.rs`). `ecma.rs` houses three `LangExtractor`s
 (TypeScript/TSX/JavaScript) in one module, not one file each — see its
 own module doc comment for why (they're dialects of one grammar
-family; Rust/Python/PHP/Go aren't). `lang::extract_and_resolve` dispatches
+family; Rust/Python/PHP/Go/C# aren't). `lang::extract_and_resolve` dispatches
 each file to its extractor by `Lang` (a small registry,
 `lang/mod.rs::extractors()`), not a hard-coded single language:
 
@@ -139,14 +140,17 @@ each file to its extractor by `Lang` (a small registry,
    candidates produce **no edge**, recorded in the caller's
    `unresolved_calls` instead. Missing honestly beats guessing. The
    tier-resolution logic itself is language-agnostic; only import
-   handling (`RawImport::Relative`/`Absolute`/`Qualified`/`PackagePath`,
-   spanning every language today) and each extractor's own
-   `is_pub`-equivalent gate are per-language. One tier is opt-in per
-   extractor rather than universal: `LangExtractor::
+   handling (`RawImport::Relative`/`Absolute`/`Qualified`/`PackagePath`/
+   `NamespaceImport`, spanning every language today) and each
+   extractor's own `is_pub`-equivalent gate are per-language. One tier
+   is opt-in per extractor rather than universal: `LangExtractor::
    package_scope_is_directory()` (default `false`) enables a
    directory-scoped tier between same-file and imported, for Go's
    file-independent package visibility — see ADR-0015; every other
-   extractor's tiers are exactly spec §5.3's original three. A call is
+   extractor's tiers are exactly spec §5.3's original three. A second
+   small per-extractor knob, `namespace_separator()` (default `\`,
+   PHP's), lets PHP's `App\Orders` and C#'s `Acme.Orders` share one
+   FQN index without cross-matching (ADR-0016). A call is
    attributed to the *innermost* symbol containing it
    (`assign_calls_to_innermost_symbol`), not every symbol whose range
    contains it — matters for any language whose class-like symbol's
@@ -172,17 +176,25 @@ the ADR that added PHP to spec §5.2's v1 set),
 resolution gap above), and
 [ADR-0015](docs/adr/0015-go-resolution-policy-mapping.md) (Go — the
 ADR that added `RawImport::PackagePath` and the opt-in directory-scoped
-resolution tier above; closes spec §5.2's full v1 language set) are the
-worked examples so far — templates, not rules that transfer verbatim
-(Python's attribute-call syntax can't even distinguish a
-module-qualified call from an instance call the way Rust's, PHP's,
-TS/JS's, and Go's grammars all can; PHP, TS/JS, and Go capture their
-path-qualified/member/selector calls anyway, unlike Rust, since they're
-too common to drop; TS/JS's relative imports are genuinely file-relative
-with extension-guessing in a way none of Rust's, Python's, or PHP's
-import models are, yet still fit the existing `RawImport::Relative`
-shape with no new variant, while Go's directory-shaped, module-qualified
-import paths didn't fit any existing variant and needed a new one).
+resolution tier above; closes spec §5.2's full v1 language set), and
+[ADR-0016](docs/adr/0016-csharp-resolution-policy-mapping.md) (C# —
+the first language added *beyond* the v1 set; the ADR that added
+`RawImport::NamespaceImport` and `namespace_separator()`, and the one
+place a symbol is deliberately *not* extracted to protect edges:
+constructors share their type's name, so extracting them would make
+every `new Foo()` ambiguous and INV-8 would drop the construction
+edge) are the worked examples so far — templates, not rules that
+transfer verbatim (Python's attribute-call syntax can't even
+distinguish a module-qualified call from an instance call the way
+Rust's, PHP's, TS/JS's, Go's, and C#'s grammars all can; PHP, TS/JS,
+Go, and C# capture their path-qualified/member/selector calls anyway,
+unlike Rust, since they're too common to drop; TS/JS's relative
+imports are genuinely file-relative with extension-guessing in a way
+none of Rust's, Python's, or PHP's import models are, yet still fit
+the existing `RawImport::Relative` shape with no new variant, while
+Go's directory-shaped, module-qualified import paths and C#'s
+many-files-at-once namespace `using`s each didn't fit any existing
+variant and needed their own).
 
 ## Conventions
 

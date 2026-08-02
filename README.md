@@ -38,8 +38,9 @@ carto never calls an LLM and never needs an API key.
 
 Implementation in progress, milestone by milestone (spec §10). Currently:
 **M1.b.2b done** — `carto index`/`where`/`deps`/`map` work
-end-to-end against Rust, Python, PHP, Go, and TypeScript/TSX/JavaScript
-repos, spec §5.2's full v1 language set. See
+end-to-end against Rust, Python, PHP, Go, C#, and
+TypeScript/TSX/JavaScript repos: spec §5.2's full v1 language set,
+plus C# added post-v1 (ADR-0016). See
 [`docs/STATUS.md`](docs/STATUS.md) for the detailed handoff.
 
 ## Building
