@@ -136,6 +136,8 @@ pub fn extract_and_resolve(repo_root: &Path, file_nodes: &[Node]) -> ResolvedExt
             origin: extractor.origin(),
             dir_scoped: extractor.package_scope_is_directory(),
             ns_separator: extractor.namespace_separator(),
+            qualified_external_is_full_fqn: extractor.qualified_external_is_full_fqn(),
+            declares_module: extractor.relative_import_declares_module(),
         });
     }
 

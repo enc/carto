@@ -31,6 +31,10 @@ impl LangExtractor for RustExtractor {
         "lang-rust@1"
     }
 
+    fn relative_import_declares_module(&self) -> bool {
+        true
+    }
+
     fn extract(&self, src: &[u8], _relpath: &str) -> ExtractOut {
         let language = carto_grammars::rust_language();
         let mut parser = Parser::new();

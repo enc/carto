@@ -50,6 +50,10 @@ impl LangExtractor for CSharpExtractor {
         "."
     }
 
+    fn qualified_external_is_full_fqn(&self) -> bool {
+        true
+    }
+
     fn extract(&self, src: &[u8], _relpath: &str) -> ExtractOut {
         let language = carto_grammars::csharp_language();
         let mut parser = Parser::new();

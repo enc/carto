@@ -37,6 +37,18 @@ pub struct FileExtraction {
     /// `NamespaceImport` paths are composed into or split against the
     /// FQN/namespace indices.
     pub ns_separator: &'static str,
+    /// [`super::LangExtractor::qualified_external_is_full_fqn`]'s value
+    /// for the producing extractor — `false` for PHP (root-truncated
+    /// dedup), `true` for C# (full-FQN identity). Decides how an
+    /// unresolved `RawImport::Qualified`'s external `Module` node is
+    /// keyed.
+    pub qualified_external_is_full_fqn: bool,
+    /// [`super::LangExtractor::relative_import_declares_module`]'s
+    /// value for the producing extractor — `true` only for Rust.
+    /// Decides `known_modules` membership and the `mod-declaration` vs.
+    /// `relative-import` evidence label for an empty-names
+    /// `RawImport::Relative`.
+    pub declares_module: bool,
 }
 
 pub struct ResolvedExtraction {
@@ -55,12 +67,14 @@ pub fn resolve(extractions: Vec<FileExtraction>) -> ResolvedExtraction {
     // empty `imported_names` alone isn't Rust-specific: TS/JS
     // side-effect (`import './x'`), default, namespace, and re-export
     // imports all produce the same shape (ADR-0013), so this is also
-    // gated on the declaring file being a `.rs` file — otherwise a TS
-    // `import './orders'` would make a bare npm package named `orders`
-    // classify as internal and silently drop its external-module edge.
+    // gated on `fe.declares_module` (`LangExtractor::
+    // relative_import_declares_module`, true only for Rust) — otherwise
+    // a TS `import './orders'` would make a bare npm package named
+    // `orders` classify as internal and silently drop its
+    // external-module edge.
     let known_modules: BTreeSet<&str> = extractions
         .iter()
-        .filter(|fe| fe.relpath.ends_with(".rs"))
+        .filter(|fe| fe.declares_module)
         .flat_map(|fe| &fe.extract.imports)
         .filter_map(|imp| match imp {
             RawImport::Relative {
@@ -92,21 +106,26 @@ pub fn resolve(extractions: Vec<FileExtraction>) -> ResolvedExtraction {
     // erroring — carto only reads source, it doesn't enforce PHP's own
     // rules.
     // Splitting/composition uses each file's own `ns_separator` (`\` for
-    // PHP, `.` for C# — ADR-0016) rather than a hard-coded `\`: the two
-    // languages' FQNs coexist in one index, and an import only ever
-    // needs to match namespaces declared in its own language, since the
-    // separator spelling makes cross-language keys unequal by
-    // construction.
-    let known_namespace_roots: BTreeSet<&str> = extractions
+    // PHP, `.` for C# — ADR-0016) rather than a hard-coded `\`, but the
+    // separator spelling alone does NOT make cross-language keys unequal
+    // by construction: a *root segment* or a single-segment name
+    // contains no separator at all (`namespace System;` in C# and
+    // `namespace System\Legacy;` in PHP both split to root `System`;
+    // `namespace App;` is the same string in both languages' `.`/`\`
+    // schemes). So every index below is additionally keyed by
+    // `fe.origin` — the actual per-language discriminant already on
+    // every `FileExtraction` — not just the namespace string.
+    let known_namespace_roots: BTreeSet<(&str, &str)> = extractions
         .iter()
         .filter_map(|fe| {
             let ns = fe.extract.declared_namespace.as_deref()?;
-            ns.split(fe.ns_separator).next()
+            let root = ns.split(fe.ns_separator).next()?;
+            Some((fe.origin, root))
         })
-        .filter(|s| !s.is_empty())
+        .filter(|(_, root)| !root.is_empty())
         .collect();
 
-    let mut fqn_to_file: BTreeMap<String, &NodeId> = BTreeMap::new();
+    let mut fqn_to_file: BTreeMap<(&'static str, String), &NodeId> = BTreeMap::new();
     for fe in &extractions {
         let ns = fe.extract.declared_namespace.as_deref().unwrap_or("");
         for sym in &fe.extract.symbols {
@@ -118,19 +137,24 @@ pub fn resolve(extractions: Vec<FileExtraction>) -> ResolvedExtraction {
             } else {
                 format!("{ns}{}{}", fe.ns_separator, sym.name)
             };
-            fqn_to_file.entry(fqn).or_insert(&fe.file_id);
+            fqn_to_file.entry((fe.origin, fqn)).or_insert(&fe.file_id);
         }
     }
 
     // C#'s `using Acme.Orders;` (ADR-0016, `RawImport::NamespaceImport`)
     // resolves against declared namespaces *as wholes*, fanning out one
     // edge per declaring file — a namespace spans files the way a Go
-    // package spans a directory. Exact-string keys; PHP files enter this
-    // index too (harmlessly — PHP never emits `NamespaceImport`).
-    let mut namespace_to_files: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    // package spans a directory. PHP files enter this index too
+    // (harmlessly — PHP never emits `NamespaceImport`), but are kept
+    // apart by the `fe.origin` key component for the same reason as
+    // `known_namespace_roots`/`fqn_to_file` above.
+    let mut namespace_to_files: BTreeMap<(&str, &str), Vec<usize>> = BTreeMap::new();
     for (fi, fe) in extractions.iter().enumerate() {
         if let Some(ns) = fe.extract.declared_namespace.as_deref() {
-            namespace_to_files.entry(ns).or_default().push(fi);
+            namespace_to_files
+                .entry((fe.origin, ns))
+                .or_default()
+                .push(fi);
         }
     }
 
@@ -344,13 +368,15 @@ pub fn resolve(extractions: Vec<FileExtraction>) -> ResolvedExtraction {
                         // one edge, certain per spec rule 1, regardless
                         // of how many names are drawn from it. Covers
                         // Rust's `mod foo;` (empty names — evidence
-                        // "mod-declaration", but only for a `.rs` file:
-                        // TS/JS side-effect/default/namespace/re-export
-                        // imports produce the same empty-names shape,
-                        // ADR-0013, and are ordinary relative imports,
-                        // not mod declarations) and Python's `from .pkg
-                        // import a, b` / TS's `import x from './pkg'`.
-                        let evidence = if fe.relpath.ends_with(".rs") {
+                        // "mod-declaration", gated on `fe.declares_module`
+                        // (`LangExtractor::relative_import_declares_module`,
+                        // true only for Rust): TS/JS side-effect/default/
+                        // namespace/re-export imports produce the same
+                        // empty-names shape, ADR-0013, and are ordinary
+                        // relative imports, not mod declarations) and
+                        // Python's `from .pkg import a, b` / TS's `import
+                        // x from './pkg'`.
+                        let evidence = if fe.declares_module {
                             "mod-declaration"
                         } else {
                             "relative-import"
@@ -443,7 +469,7 @@ pub fn resolve(extractions: Vec<FileExtraction>) -> ResolvedExtraction {
                     // the repo-wide FQN index built above, not a
                     // directory walk. Three outcomes, in order:
                     let fqn = fqn.trim_start_matches(fe.ns_separator);
-                    if let Some(&target) = fqn_to_file.get(fqn) {
+                    if let Some(&target) = fqn_to_file.get(&(fe.origin, fqn.to_string())) {
                         // 1. Exact FQN match: certain edge to the
                         //    declaring file.
                         edges.push(Edge::new(
@@ -456,26 +482,38 @@ pub fn resolve(extractions: Vec<FileExtraction>) -> ResolvedExtraction {
                     } else if fqn
                         .split(fe.ns_separator)
                         .next()
-                        .is_some_and(|root| known_namespace_roots.contains(root))
+                        .is_some_and(|root| known_namespace_roots.contains(&(fe.origin, root)))
                     {
                         // 2. Internal namespace root, but no file
                         //    declares this exact FQN: honest omission
                         //    (INV-8) rather than a guess — no edge, no
                         //    node.
                     } else {
-                        // 3. Unknown root: an external package, same
-                        //    dedup-by-root treatment as `Absolute`.
-                        let root = fqn.split(fe.ns_separator).next().unwrap_or(fqn);
+                        // 3. Unknown root: an external package. PHP
+                        //    dedups by root (Composer-style: `Psr\Log\X`
+                        //    and `Psr\Http\Y` share one `Psr` node); C#
+                        //    keys by the *whole* FQN instead
+                        //    (`qualified_external_is_full_fqn`,
+                        //    ADR-0016) — `System.Text.Json.JsonSerializer`
+                        //    must not collapse onto the same node as a
+                        //    plain `using System;`, matching
+                        //    `NamespaceImport`'s own full-string policy
+                        //    below.
+                        let key = if fe.qualified_external_is_full_fqn {
+                            fqn
+                        } else {
+                            fqn.split(fe.ns_separator).next().unwrap_or(fqn)
+                        };
                         let module_id = external_modules
-                            .entry(root)
+                            .entry(key)
                             .or_insert_with(|| {
-                                let id = graph::module_id(root, true);
+                                let id = graph::module_id(key, true);
                                 nodes.push(Node::module(
                                     id.clone(),
                                     Provenance::Syntactic,
                                     fe.origin,
                                     ModuleNode {
-                                        path: root.to_string(),
+                                        path: key.to_string(),
                                         external: true,
                                     },
                                 ));
@@ -497,7 +535,7 @@ pub fn resolve(extractions: Vec<FileExtraction>) -> ResolvedExtraction {
                     // Three outcomes, mirroring `Qualified`'s, except a
                     // hit fans out per declaring file (a namespace spans
                     // files the way a Go package spans a directory):
-                    if let Some(target_fis) = namespace_to_files.get(path.as_str()) {
+                    if let Some(target_fis) = namespace_to_files.get(&(fe.origin, path.as_str())) {
                         // 1. Some walked file declares exactly this
                         //    namespace: one certain edge per such file.
                         for &target_fi in target_fis {
@@ -515,7 +553,7 @@ pub fn resolve(extractions: Vec<FileExtraction>) -> ResolvedExtraction {
                     } else if path
                         .split(fe.ns_separator)
                         .next()
-                        .is_some_and(|root| known_namespace_roots.contains(root))
+                        .is_some_and(|root| known_namespace_roots.contains(&(fe.origin, root)))
                     {
                         // 2. Internal namespace root, but no file
                         //    declares this exact namespace (e.g. `using
@@ -848,6 +886,15 @@ mod tests {
             origin: "lang-rust@1",
             dir_scoped: false,
             ns_separator: "\\",
+            qualified_external_is_full_fqn: false,
+            // Matches `RustExtractor::relative_import_declares_module()`
+            // -> `true` — every other field here already mirrors what a
+            // real Rust `FileExtraction` looks like (trait defaults with
+            // origin overridden to Rust), so this does too. Non-Rust
+            // fixtures built from `file()` that need Rust's `mod`
+            // semantics turned off set `declares_module = false`
+            // explicitly (see `ts_relative_import_...` below).
+            declares_module: true,
         }
     }
 
@@ -857,6 +904,8 @@ mod tests {
         let mut fe = file(relpath);
         fe.origin = "lang-csharp@1";
         fe.ns_separator = ".";
+        fe.qualified_external_is_full_fqn = true;
+        fe.declares_module = false;
         fe
     }
 
@@ -1085,6 +1134,7 @@ mod tests {
         // `orders`.
         let mut app = file("src/app.ts");
         app.origin = "lang-ts@1";
+        app.declares_module = false;
         app.extract.imports = vec![RawImport::Relative {
             levels_up: 0,
             module_path: "orders".into(),
@@ -1093,10 +1143,12 @@ mod tests {
         let orders = {
             let mut f = file("src/orders.ts");
             f.origin = "lang-ts@1";
+            f.declares_module = false;
             f
         };
         let mut consumer = file("src/consumer.ts");
         consumer.origin = "lang-ts@1";
+        consumer.declares_module = false;
         consumer.extract.imports = vec![RawImport::Absolute {
             root: "orders".into(),
             imported_names: vec![],
@@ -1206,6 +1258,7 @@ mod tests {
         // `orders` resolves as a same-directory sibling of handlers.py.
         let mut python_file = file("pkg/handlers.py");
         python_file.origin = "lang-python@1";
+        python_file.declares_module = false;
         python_file.extract.imports = vec![RawImport::Relative {
             levels_up: 0,
             module_path: "orders".into(),
@@ -1538,6 +1591,92 @@ mod tests {
     }
 
     #[test]
+    fn namespace_import_does_not_cross_match_a_single_segment_php_namespace() {
+        // Regression: a single-segment name (`App`) has no separator at
+        // all, so the old bare-string `namespace_to_files` index made a
+        // C# `using App;` match a PHP file's `namespace App;` — same
+        // string, different language. Origin-keyed, this must instead
+        // fall all the way through to outcome 3 (external, unknown
+        // root — no C# file declares `App` at all).
+        let mut php = file("src/App.php");
+        php.origin = "lang-php@1";
+        php.extract.declared_namespace = Some("App".into());
+        php.extract.symbols = vec![sym("Bootstrap", SymKind::Class, 1, 5, true)];
+
+        let mut program = cs_file("Program.cs");
+        program.extract.imports = vec![RawImport::NamespaceImport { path: "App".into() }];
+
+        let out = resolve(vec![program, php]);
+        let imports = imports_edges(&out.edges);
+        assert_eq!(imports.len(), 1, "must not silently match the PHP file");
+        assert_eq!(imports[0].evidence, vec!["external-package".to_string()]);
+        assert!(
+            out.nodes
+                .iter()
+                .any(|n| matches!(&n.data, NodeData::Module(m) if m.path == "App" && m.external))
+        );
+    }
+
+    #[test]
+    fn known_namespace_roots_does_not_cross_match_a_php_root_against_csharp() {
+        // Regression: `known_namespace_roots` used to be a bare
+        // `BTreeSet<&str>` of root segments — a PHP file declaring
+        // `namespace System\Legacy;` (root `System`) made a C# `using
+        // System.Text;` (root `System` too — root segments have no
+        // separator to tell the languages apart) look like a *known
+        // internal root with no exact match* (outcome 2: silent no-edge,
+        // no node), when it should fall through to outcome 3 (external
+        // — no C# file anywhere declares any `System`-rooted namespace).
+        let mut php = file("src/Legacy.php");
+        php.origin = "lang-php@1";
+        php.extract.declared_namespace = Some("System\\Legacy".into());
+        php.extract.symbols = vec![sym("Thing", SymKind::Class, 1, 5, true)];
+
+        let mut program = cs_file("Program.cs");
+        program.extract.imports = vec![RawImport::NamespaceImport {
+            path: "System.Text".into(),
+        }];
+
+        let out = resolve(vec![program, php]);
+        let imports = imports_edges(&out.edges);
+        assert_eq!(
+            imports.len(),
+            1,
+            "PHP's `System` root must not suppress C#'s external edge"
+        );
+        assert_eq!(imports[0].evidence, vec!["external-package".to_string()]);
+        assert!(out.nodes.iter().any(
+            |n| matches!(&n.data, NodeData::Module(m) if m.path == "System.Text" && m.external)
+        ));
+    }
+
+    #[test]
+    fn csharp_qualified_external_fallback_keys_by_full_fqn_not_truncated_root() {
+        // `using J = System.Text.Json.JsonSerializer;` with no internal
+        // match — C#'s `qualified_external_is_full_fqn` (ADR-0016) must
+        // key the external Module node by the whole FQN, matching
+        // `RawImport::NamespaceImport`'s own full-identity policy, not
+        // PHP's root-truncation (`System`, which would incorrectly
+        // collapse distinct packages together).
+        let mut program = cs_file("Program.cs");
+        program.extract.imports = vec![RawImport::Qualified {
+            fqn: "System.Text.Json.JsonSerializer".into(),
+            bound_name: "J".into(),
+        }];
+
+        let out = resolve(vec![program]);
+        let module_paths: Vec<&str> = out
+            .nodes
+            .iter()
+            .filter_map(|n| match &n.data {
+                NodeData::Module(m) if m.external => Some(m.path.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(module_paths, vec!["System.Text.Json.JsonSerializer"]);
+    }
+
+    #[test]
     fn external_use_produces_one_deduped_module_node_with_edges_from_each_file() {
         let mut a = file("src/a.rs");
         a.extract.imports = vec![RawImport::Absolute {
@@ -1629,6 +1768,10 @@ mod tests {
         let mut f = file(relpath);
         f.origin = "lang-go@1";
         f.dir_scoped = true;
+        // GoExtractor doesn't override `relative_import_declares_module`
+        // (stays `false` — Go never emits `RawImport::Relative` at all),
+        // unlike `file()`'s Rust default.
+        f.declares_module = false;
         f
     }
 

@@ -238,4 +238,30 @@ pub trait LangExtractor {
     fn namespace_separator(&self) -> &'static str {
         "\\"
     }
+
+    /// Whether an unresolved `RawImport::Qualified` FQN's external
+    /// `Module` node is keyed by the *whole* FQN string rather than its
+    /// first `namespace_separator()`-delimited segment. Defaults to
+    /// `false` (PHP's Composer-style root grouping — `Psr\Log\X` and
+    /// `Psr\Http\Y` share one `Psr` node, ADR-0012). `CSharpExtractor`
+    /// overrides to `true`: `using J = System.Text.Json.JsonSerializer;`
+    /// must key the same full-string identity `RawImport::NamespaceImport`
+    /// already uses for `using System.Text.Json;` (ADR-0016) — truncating
+    /// to `System` would collapse distinct packages together.
+    fn qualified_external_is_full_fqn(&self) -> bool {
+        false
+    }
+
+    /// Whether this language's `RawImport::Relative` with empty
+    /// `imported_names` is a *module declaration* — Rust's `mod foo;`,
+    /// which makes `foo` a locally known module name other files' `use`
+    /// paths can reference (`resolve`'s `known_modules`) — rather than
+    /// an ordinary relative import that merely imports nothing by name
+    /// (TS/JS's side-effect/default/namespace imports, ADR-0013, which
+    /// produce the same empty-names shape but declare no reusable
+    /// module name). Defaults to `false`; only `RustExtractor`
+    /// overrides it.
+    fn relative_import_declares_module(&self) -> bool {
+        false
+    }
 }
