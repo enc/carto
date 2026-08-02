@@ -31,6 +31,12 @@ pub struct FileExtraction {
     /// the producing extractor — `true` only for Go (ADR-0015). Enables
     /// tier (a′) for this file's calls.
     pub dir_scoped: bool,
+    /// [`super::LangExtractor::namespace_separator`]'s value for the
+    /// producing extractor — `\` for PHP, `.` for C# (ADR-0016). Used
+    /// wherever this file's `declared_namespace` or `Qualified`/
+    /// `NamespaceImport` paths are composed into or split against the
+    /// FQN/namespace indices.
+    pub ns_separator: &'static str,
 }
 
 pub struct ResolvedExtraction {
@@ -85,10 +91,18 @@ pub fn resolve(extractions: Vec<FileExtraction>) -> ResolvedExtraction {
     // FQN) keeps whichever file is encountered first rather than
     // erroring — carto only reads source, it doesn't enforce PHP's own
     // rules.
+    // Splitting/composition uses each file's own `ns_separator` (`\` for
+    // PHP, `.` for C# — ADR-0016) rather than a hard-coded `\`: the two
+    // languages' FQNs coexist in one index, and an import only ever
+    // needs to match namespaces declared in its own language, since the
+    // separator spelling makes cross-language keys unequal by
+    // construction.
     let known_namespace_roots: BTreeSet<&str> = extractions
         .iter()
-        .filter_map(|fe| fe.extract.declared_namespace.as_deref())
-        .filter_map(|ns| ns.split('\\').next())
+        .filter_map(|fe| {
+            let ns = fe.extract.declared_namespace.as_deref()?;
+            ns.split(fe.ns_separator).next()
+        })
         .filter(|s| !s.is_empty())
         .collect();
 
@@ -102,9 +116,21 @@ pub fn resolve(extractions: Vec<FileExtraction>) -> ResolvedExtraction {
             let fqn = if ns.is_empty() {
                 sym.name.clone()
             } else {
-                format!("{ns}\\{}", sym.name)
+                format!("{ns}{}{}", fe.ns_separator, sym.name)
             };
             fqn_to_file.entry(fqn).or_insert(&fe.file_id);
+        }
+    }
+
+    // C#'s `using Acme.Orders;` (ADR-0016, `RawImport::NamespaceImport`)
+    // resolves against declared namespaces *as wholes*, fanning out one
+    // edge per declaring file — a namespace spans files the way a Go
+    // package spans a directory. Exact-string keys; PHP files enter this
+    // index too (harmlessly — PHP never emits `NamespaceImport`).
+    let mut namespace_to_files: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    for (fi, fe) in extractions.iter().enumerate() {
+        if let Some(ns) = fe.extract.declared_namespace.as_deref() {
+            namespace_to_files.entry(ns).or_default().push(fi);
         }
     }
 
@@ -189,14 +215,17 @@ pub fn resolve(extractions: Vec<FileExtraction>) -> ResolvedExtraction {
                         }
                     }
                     RawImport::Qualified { fqn, bound_name } => {
-                        let declared = fqn.rsplit('\\').next().unwrap_or(fqn.as_str());
+                        let declared = fqn.rsplit(fe.ns_separator).next().unwrap_or(fqn.as_str());
                         m.insert(bound_name.as_str(), declared);
                     }
                     // Go's package-import binds a *package* name, never a
                     // symbol name — nothing to pair here. See
                     // `RawImport::PackagePath`'s own doc comment
-                    // (ADR-0015): Go can never feed tier (b).
-                    RawImport::PackagePath { .. } => {}
+                    // (ADR-0015): Go can never feed tier (b). C#'s
+                    // namespace `using` is the same shape (ADR-0016): it
+                    // makes a whole namespace's types visible without
+                    // binding any one name.
+                    RawImport::PackagePath { .. } | RawImport::NamespaceImport { .. } => {}
                 }
             }
             m
@@ -409,10 +438,11 @@ pub fn resolve(extractions: Vec<FileExtraction>) -> ResolvedExtraction {
                     ));
                 }
                 RawImport::Qualified { fqn, .. } => {
-                    // PHP's `use App\Orders\Order;` (ADR-0012) — resolved
-                    // against the repo-wide FQN index built above, not a
+                    // PHP's `use App\Orders\Order;` (ADR-0012) and C#'s
+                    // `using F = X.Y.Z;` (ADR-0016) — resolved against
+                    // the repo-wide FQN index built above, not a
                     // directory walk. Three outcomes, in order:
-                    let fqn = fqn.trim_start_matches('\\');
+                    let fqn = fqn.trim_start_matches(fe.ns_separator);
                     if let Some(&target) = fqn_to_file.get(fqn) {
                         // 1. Exact FQN match: certain edge to the
                         //    declaring file.
@@ -424,7 +454,7 @@ pub fn resolve(extractions: Vec<FileExtraction>) -> ResolvedExtraction {
                             "namespace-import".to_string(),
                         ));
                     } else if fqn
-                        .split('\\')
+                        .split(fe.ns_separator)
                         .next()
                         .is_some_and(|root| known_namespace_roots.contains(root))
                     {
@@ -435,7 +465,7 @@ pub fn resolve(extractions: Vec<FileExtraction>) -> ResolvedExtraction {
                     } else {
                         // 3. Unknown root: an external package, same
                         //    dedup-by-root treatment as `Absolute`.
-                        let root = fqn.split('\\').next().unwrap_or(fqn);
+                        let root = fqn.split(fe.ns_separator).next().unwrap_or(fqn);
                         let module_id = external_modules
                             .entry(root)
                             .or_insert_with(|| {
@@ -446,6 +476,68 @@ pub fn resolve(extractions: Vec<FileExtraction>) -> ResolvedExtraction {
                                     fe.origin,
                                     ModuleNode {
                                         path: root.to_string(),
+                                        external: true,
+                                    },
+                                ));
+                                id
+                            })
+                            .clone();
+                        edges.push(Edge::new(
+                            EdgeKind::Imports,
+                            fe.file_id.clone(),
+                            module_id,
+                            Confidence::Certain,
+                            "external-package".to_string(),
+                        ));
+                    }
+                }
+                RawImport::NamespaceImport { path } => {
+                    // C#'s `using Acme.Orders;` (ADR-0016) — matched
+                    // exactly against every file's declared namespace.
+                    // Three outcomes, mirroring `Qualified`'s, except a
+                    // hit fans out per declaring file (a namespace spans
+                    // files the way a Go package spans a directory):
+                    if let Some(target_fis) = namespace_to_files.get(path.as_str()) {
+                        // 1. Some walked file declares exactly this
+                        //    namespace: one certain edge per such file.
+                        for &target_fi in target_fis {
+                            if target_fi == fi {
+                                continue; // no self-edge
+                            }
+                            edges.push(Edge::new(
+                                EdgeKind::Imports,
+                                fe.file_id.clone(),
+                                extractions[target_fi].file_id.clone(),
+                                Confidence::Certain,
+                                "namespace-import".to_string(),
+                            ));
+                        }
+                    } else if path
+                        .split(fe.ns_separator)
+                        .next()
+                        .is_some_and(|root| known_namespace_roots.contains(root))
+                    {
+                        // 2. Internal namespace root, but no file
+                        //    declares this exact namespace (e.g. `using
+                        //    Acme;` in a repo that only declares
+                        //    `Acme.Orders`): honest omission (INV-8) —
+                        //    no edge, no node.
+                    } else {
+                        // 3. Unknown root: an external namespace, keyed
+                        //    by the *full* string — `System.Text.Json`
+                        //    is not the same package as `System`, so no
+                        //    truncation to a root (same full-identity
+                        //    reasoning as Go's import paths, ADR-0015).
+                        let module_id = external_modules
+                            .entry(path.as_str())
+                            .or_insert_with(|| {
+                                let id = graph::module_id(path, true);
+                                nodes.push(Node::module(
+                                    id.clone(),
+                                    Provenance::Syntactic,
+                                    fe.origin,
+                                    ModuleNode {
+                                        path: path.clone(),
                                         external: true,
                                     },
                                 ));
@@ -755,7 +847,17 @@ mod tests {
             extract: ExtractOut::default(),
             origin: "lang-rust@1",
             dir_scoped: false,
+            ns_separator: "\\",
         }
+    }
+
+    /// A C#-shaped `FileExtraction` — `.`-separated namespaces
+    /// (ADR-0016), matching what `CSharpExtractor` produces.
+    fn cs_file(relpath: &str) -> FileExtraction {
+        let mut fe = file(relpath);
+        fe.origin = "lang-csharp@1";
+        fe.ns_separator = ".";
+        fe
     }
 
     fn sym(name: &str, kind: SymKind, start: u32, end: u32, is_pub: bool) -> RawSymbol {
@@ -1267,6 +1369,172 @@ mod tests {
             calls_edges(&out.edges)[0].evidence,
             vec!["imported".to_string()]
         );
+    }
+
+    #[test]
+    fn csharp_namespace_import_fans_out_to_every_file_declaring_the_namespace() {
+        // `using Acme.Orders;` (RawImport::NamespaceImport, ADR-0016)
+        // matched exactly against declared namespaces — a namespace
+        // spans files the way a Go package spans a directory, so a hit
+        // fans out one certain edge per declaring file.
+        let mut order = cs_file("Orders/Order.cs");
+        order.extract.declared_namespace = Some("Acme.Orders".into());
+        order.extract.symbols = vec![sym("Order", SymKind::Class, 1, 5, true)];
+
+        let mut parser = cs_file("Orders/OrderParser.cs");
+        parser.extract.declared_namespace = Some("Acme.Orders".into());
+        parser.extract.symbols = vec![sym("OrderParser", SymKind::Class, 1, 5, true)];
+
+        let mut program = cs_file("Program.cs");
+        program.extract.declared_namespace = Some("Acme.App".into());
+        program.extract.imports = vec![RawImport::NamespaceImport {
+            path: "Acme.Orders".into(),
+        }];
+
+        let out = resolve(vec![program, order, parser]);
+        let imports = imports_edges(&out.edges);
+        assert_eq!(imports.len(), 2);
+        for e in &imports {
+            assert_eq!(e.confidence, Confidence::Certain);
+            assert_eq!(e.evidence, vec!["namespace-import".to_string()]);
+        }
+    }
+
+    #[test]
+    fn csharp_namespace_import_with_known_root_but_no_exact_match_produces_no_edge() {
+        // `Acme` is a known root (a file declares `Acme.Orders`) but no
+        // file declares exactly `Acme.Billing` — internal but
+        // unresolvable, honest omission (INV-8), same as PHP outcome 2.
+        let mut order = cs_file("Orders/Order.cs");
+        order.extract.declared_namespace = Some("Acme.Orders".into());
+        order.extract.symbols = vec![sym("Order", SymKind::Class, 1, 5, true)];
+
+        let mut program = cs_file("Program.cs");
+        program.extract.imports = vec![RawImport::NamespaceImport {
+            path: "Acme.Billing".into(),
+        }];
+
+        let out = resolve(vec![program, order]);
+        assert!(imports_edges(&out.edges).is_empty());
+        assert!(
+            out.nodes
+                .iter()
+                .all(|n| !matches!(n.data, NodeData::Module(_)))
+        );
+    }
+
+    #[test]
+    fn csharp_namespace_import_with_unknown_root_keys_external_module_by_full_string() {
+        // `using System.Text.Json;` — external, keyed by the full
+        // namespace string, not truncated to `System` (Go-style full
+        // identity, ADR-0015/0016): `System.Text.Json` is not the same
+        // package as `System`.
+        let mut program = cs_file("Program.cs");
+        program.extract.imports = vec![
+            RawImport::NamespaceImport {
+                path: "System.Text.Json".into(),
+            },
+            RawImport::NamespaceImport {
+                path: "System".into(),
+            },
+        ];
+
+        let out = resolve(vec![program]);
+        let module_paths: Vec<&str> = out
+            .nodes
+            .iter()
+            .filter_map(|n| match &n.data {
+                NodeData::Module(m) if m.external => Some(m.path.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(module_paths, vec!["System.Text.Json", "System"]);
+        assert_eq!(imports_edges(&out.edges).len(), 2);
+    }
+
+    #[test]
+    fn csharp_namespace_import_never_feeds_tier_b_but_tier_c_resolves_the_call() {
+        // A namespace `using` binds no symbol name (like Go's package
+        // import, ADR-0015), so the cross-namespace call resolves at
+        // tier (c) with "same-package" evidence — which is also why
+        // `internal` counts as is_pub (ADR-0016): tier (c) only matches
+        // exported symbols.
+        let mut order = cs_file("Orders/Order.cs");
+        order.extract.declared_namespace = Some("Acme.Orders".into());
+        order.extract.symbols = vec![sym("ParseOrder", SymKind::Method, 1, 5, true)];
+
+        let mut program = cs_file("Program.cs");
+        program.extract.declared_namespace = Some("Acme.App".into());
+        program.extract.imports = vec![RawImport::NamespaceImport {
+            path: "Acme.Orders".into(),
+        }];
+        program.extract.symbols = vec![sym("Main", SymKind::Method, 1, 5, true)];
+        program.extract.call_sites = vec![call("ParseOrder", 3)];
+
+        let out = resolve(vec![program, order]);
+        assert!(find_symbol(&out.nodes, "Main").unresolved_calls.is_empty());
+        assert_eq!(
+            calls_edges(&out.edges)[0].evidence,
+            vec!["same-package".to_string()]
+        );
+    }
+
+    #[test]
+    fn csharp_alias_using_resolves_import_and_call_with_dot_separator() {
+        // `using Parser = Acme.Orders.OrderParser;` maps to
+        // RawImport::Qualified with a `.`-separated FQN — the FQN index
+        // must compose with the declaring file's own separator
+        // (ns_separator, ADR-0016), and tier (b) must find the declared
+        // name behind the alias (ADR-0013's machinery, unchanged).
+        let mut parser = cs_file("Orders/OrderParser.cs");
+        parser.extract.declared_namespace = Some("Acme.Orders".into());
+        parser.extract.symbols = vec![sym("OrderParser", SymKind::Class, 1, 5, true)];
+
+        let mut program = cs_file("Program.cs");
+        program.extract.declared_namespace = Some("Acme.App".into());
+        program.extract.imports = vec![RawImport::Qualified {
+            fqn: "Acme.Orders.OrderParser".into(),
+            bound_name: "Parser".into(),
+        }];
+        program.extract.symbols = vec![sym("Main", SymKind::Method, 1, 5, true)];
+        program.extract.call_sites = vec![call("Parser", 3)];
+
+        let out = resolve(vec![program, parser]);
+        let imports = imports_edges(&out.edges);
+        assert_eq!(imports.len(), 1);
+        assert_eq!(imports[0].evidence, vec!["namespace-import".to_string()]);
+        assert!(find_symbol(&out.nodes, "Main").unresolved_calls.is_empty());
+        assert_eq!(
+            calls_edges(&out.edges)[0].evidence,
+            vec!["imported".to_string()]
+        );
+    }
+
+    #[test]
+    fn php_and_csharp_namespaces_coexist_without_cross_matching() {
+        // The separator spelling keeps the two languages' keys unequal
+        // by construction: PHP's `App\Orders` and C#'s `App.Orders` are
+        // different index entries, so a C# `using App.Orders;` never
+        // matches the PHP file (and vice versa).
+        let mut php = file("src/Orders.php");
+        php.origin = "lang-php@1";
+        php.extract.declared_namespace = Some("App\\Orders".into());
+        php.extract.symbols = vec![sym("Order", SymKind::Class, 1, 5, true)];
+
+        let mut cs = cs_file("Orders/Order.cs");
+        cs.extract.declared_namespace = Some("App.Orders".into());
+        cs.extract.symbols = vec![sym("CsOrder", SymKind::Class, 1, 5, true)];
+
+        let mut program = cs_file("Program.cs");
+        program.extract.imports = vec![RawImport::NamespaceImport {
+            path: "App.Orders".into(),
+        }];
+
+        let out = resolve(vec![program, php, cs]);
+        let imports = imports_edges(&out.edges);
+        // Exactly one edge — to the C# file, not the PHP one.
+        assert_eq!(imports.len(), 1);
+        assert_eq!(imports[0].to, graph::file_id("Orders/Order.cs"));
     }
 
     #[test]

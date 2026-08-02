@@ -152,6 +152,29 @@ pub enum RawImport {
     /// still a real dependency edge, and a dot import's local-binding
     /// behavior isn't consumed by anything here anyway.
     PackagePath { path: String },
+    /// A C# `using Acme.Orders;` directive (ADR-0016) — an import of a
+    /// *namespace*, i.e. potentially many files at once. None of the
+    /// variants above fit: it names no single FQN (`Qualified` — a C#
+    /// `using` brings a whole namespace's types into scope, not one
+    /// declaration), no directory (`PackagePath` — C# namespaces have no
+    /// required relationship to the directory tree), involves no path
+    /// arithmetic from the declaring file (`Relative`), and its root
+    /// segment alone is meaningless (`Absolute` — `System` vs.
+    /// `System.Text.Json` are different packages). `resolve` matches
+    /// `path` *exactly* against every file's own `declared_namespace`
+    /// and, on a hit, fans out one `imports` edge per declaring file —
+    /// Go's per-package-file fan-out shape, keyed by namespace instead
+    /// of directory. No hit but a known namespace root ⇒ no edge
+    /// (INV-8); unknown root ⇒ an external `Module` node keyed by the
+    /// full namespace string (Go-style full identity — truncating
+    /// `System.Text.Json` to `System` would collapse distinct packages).
+    ///
+    /// Like `PackagePath`, this carries no `imported_names`/`bound_name`
+    /// and never feeds call-resolution tier (b): a namespace `using`
+    /// binds no symbol name a call site could be matched against (it
+    /// makes *all* of the namespace's types visible — the aliased form
+    /// `using F = X.Y.Z;` is different, and maps to `Qualified`).
+    NamespaceImport { path: String },
 }
 
 /// A call expression's callee, before resolution. `line` locates it for
@@ -200,5 +223,19 @@ pub trait LangExtractor {
     /// scope visibility at the file, not the directory.
     fn package_scope_is_directory(&self) -> bool {
         false
+    }
+
+    /// The separator this language's `declared_namespace` and
+    /// `RawImport::Qualified` FQNs are spelled with — `resolve` composes
+    /// its repo-wide FQN index (`fqn_to_file`) and splits namespace
+    /// roots using the declaring file's own separator, so PHP's
+    /// `App\Orders` and C#'s `Acme.Orders` (ADR-0016) coexist in one
+    /// index without ever falsely matching each other. Defaults to
+    /// PHP's `\` — the only namespace-based language before C# —
+    /// so existing extractors are unaffected; only `CSharpExtractor`
+    /// overrides it (to `.`). Irrelevant for languages that never set
+    /// `declared_namespace` or emit `Qualified`/`NamespaceImport`.
+    fn namespace_separator(&self) -> &'static str {
+        "\\"
     }
 }
