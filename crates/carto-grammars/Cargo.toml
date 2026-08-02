@@ -30,6 +30,7 @@ tree-sitter-php = { version = "0.24", optional = true }
 tree-sitter-typescript = { version = "0.23", optional = true }
 tree-sitter-javascript = { version = "0.25", optional = true }
 tree-sitter-go = { version = "0.25", optional = true }
+tree-sitter-c-sharp = { version = "0.23", optional = true }
 
 [features]
 default = ["native-grammars"]
@@ -42,4 +43,5 @@ native-grammars = [
     "dep:tree-sitter-typescript",
     "dep:tree-sitter-javascript",
     "dep:tree-sitter-go",
+    "dep:tree-sitter-c-sharp",
 ]

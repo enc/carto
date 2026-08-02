@@ -70,6 +70,15 @@ pub fn go_language() -> tree_sitter::Language {
     tree_sitter_go::LANGUAGE.into()
 }
 
+/// C# grammar (eighth language, the first added after spec §5.2's v1
+/// set closed — see `docs/adr/0016-csharp-resolution-policy-mapping.md`
+/// for the scope amendment). Same `LanguageFn -> Language` conversion
+/// as the others, no `unsafe` needed for the same reason.
+#[cfg(feature = "native-grammars")]
+pub fn csharp_language() -> tree_sitter::Language {
+    tree_sitter_c_sharp::LANGUAGE.into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,6 +132,14 @@ mod tests {
         let mut parser = tree_sitter::Parser::new();
         parser.set_language(&javascript_language()).expect(
             "tree-sitter-javascript's language must be compatible with the linked tree-sitter runtime",
+        );
+    }
+
+    #[test]
+    fn csharp_language_loads_without_panicking() {
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&csharp_language()).expect(
+            "tree-sitter-c-sharp's language must be compatible with the linked tree-sitter runtime",
         );
     }
 
