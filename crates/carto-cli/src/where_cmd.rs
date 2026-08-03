@@ -5,11 +5,10 @@
 //! logic lives in `carto_core::query::find`; this file is the thin CLI
 //! wrapper: args, load, print.
 
-use crate::target;
 use carto_core::error::Result;
 use carto_core::query::{self, FindQuery, QueryGraph};
 use carto_core::taint::TaintedString;
-use carto_core::{consts, graph};
+use carto_core::{consts, graph, target};
 use clap::Args;
 use std::path::PathBuf;
 

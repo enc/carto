@@ -3,11 +3,11 @@
 //! module doc explains why); this file is the CLI wrapper: args, load,
 //! print.
 
-use crate::target;
 use carto_core::consts;
 use carto_core::error::Result;
 use carto_core::graph;
 use carto_core::query::{self, MapQuery, QueryGraph};
+use carto_core::target;
 use clap::Args;
 use std::path::PathBuf;
 

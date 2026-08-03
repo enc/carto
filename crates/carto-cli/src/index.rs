@@ -4,10 +4,9 @@
 //! for every walked file whose language has a registered extractor
 //! (Rust only as of M1.b.2a). No infra flags yet (M2).
 
-use crate::target;
 use carto_core::error::Result;
 use carto_core::graph::Graph;
-use carto_core::{gitinfo, graph, lang, pathguard, walk};
+use carto_core::{gitinfo, graph, lang, pathguard, target, walk};
 use clap::Args;
 use serde::Serialize;
 use std::path::PathBuf;

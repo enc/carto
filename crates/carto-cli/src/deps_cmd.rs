@@ -4,11 +4,10 @@
 //! isn't itself a Rust keyword — keeping both command files named
 //! `<name>_cmd` avoids a `where`-only special case.
 
-use crate::target;
 use carto_core::error::{Error, ErrorKind, Result};
 use carto_core::graph::EdgeKind;
 use carto_core::query::{self, DepsQuery, Direction, QueryGraph};
-use carto_core::{consts, graph};
+use carto_core::{consts, graph, target};
 use clap::Args;
 use std::collections::BTreeSet;
 use std::path::PathBuf;

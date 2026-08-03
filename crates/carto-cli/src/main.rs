@@ -6,7 +6,6 @@ mod deps_cmd;
 mod index;
 mod map_cmd;
 mod selfcheck;
-mod target;
 mod where_cmd;
 
 use clap::{Parser, Subcommand};

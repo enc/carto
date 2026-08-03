@@ -12,6 +12,7 @@ pub mod pathguard;
 pub mod query;
 pub mod redact;
 pub mod taint;
+pub mod target;
 pub mod walk;
 
 pub use error::{Error, ErrorKind, Result};
