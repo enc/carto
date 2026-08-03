@@ -1,8 +1,18 @@
 #!/usr/bin/env python3
 """Scores the S-1 benchmark (bench/tasks.md, spec §11.4) from a
 bench/results/<timestamp>/ directory produced by bench/run.sh: 8 tasks x
-2 arms (grep, carto), one real `claude -p --output-format json` session
-each.
+3 strategy arms (grep, cli, carto), one real
+`claude -p --output-format json` session each.
+
+The `cli` arm (added after ADR-0019's first measurement) answers a
+question spec §1.5 doesn't ask but the same evidence motivates: is MCP
+the right integration surface at all, or does carto-via-Bash-CLI get the
+same answers without the MCP transport/config friction that caused every
+real harness failure in the first measurement? `cli` vs. `carto` is
+reported alongside the spec-defined `grep` vs. `carto` comparison, but
+kept clearly separate — S-1's own threshold is specifically about
+carto-via-MCP vs. grep-only, and the cli comparison is informal,
+exploratory numbers for that separate question.
 
 Reports, per spec §1.5's S-1 wording ("≥30% fewer input tokens and ≥20%
 higher accuracy than agent-with-grep-only"):
@@ -17,9 +27,10 @@ higher accuracy than agent-with-grep-only"):
     data supports.
   - accuracy is NOT auto-graded here: bench/tasks.md's ground truth
     requires human judgment against each task's real answer, and
-    bench/GRADES.md (checked in alongside a results run) supplies it.
-    This script fails loudly rather than silently report token deltas
-    without accuracy context if that file is missing.
+    bench/results/<timestamp>/GRADES.json (checked in alongside a
+    results run) supplies it. This script fails loudly rather than
+    silently report token deltas without accuracy context if that file
+    is missing.
 
 Usage: python3 bench/score.py bench/results/<timestamp>/ [--grades bench/results/<timestamp>/GRADES.json]
 """
@@ -32,7 +43,7 @@ import sys
 from pathlib import Path
 
 TASKS = ["L1", "L2", "L3", "L4", "T5", "T6", "T7", "T8"]
-ARMS = ["grep", "carto"]
+ARMS = ["grep", "cli", "carto"]
 
 
 def load_session(path: Path) -> dict | None:
@@ -161,12 +172,24 @@ def main() -> int:
 
     grep_in = totals["grep"]["combined_in"]
     carto_in = totals["carto"]["combined_in"]
+    cli_in = totals["cli"]["combined_in"]
     if grep_in:
         pct = (1 - carto_in / grep_in) * 100
-        print(f"\nS-1 input-token check: carto uses {pct:+.1f}% vs. grep-only "
+        print(f"\nS-1 input-token check: carto (MCP) uses {pct:+.1f}% vs. grep-only "
               f"(threshold: ≥30% fewer, i.e. pct ≥ 30).")
         print("This is ONE trial per task-arm cell — treat as directional, "
               "not a confidence interval, per bench/tasks.md's own caveat.")
+
+    if grep_in and cli_in:
+        cli_pct = (1 - cli_in / grep_in) * 100
+        print(f"\n[exploratory, not an S-1 metric] cli-vs-grep input tokens: "
+              f"carto-via-CLI uses {cli_pct:+.1f}% vs. grep-only.")
+    if carto_in and cli_in:
+        cli_vs_mcp_pct = (1 - cli_in / carto_in) * 100
+        print(f"[exploratory, not an S-1 metric] cli-vs-MCP input tokens: "
+              f"carto-via-CLI uses {cli_vs_mcp_pct:+.1f}% vs. carto-via-MCP — "
+              f"answers whether MCP's transport overhead (not carto's answers, "
+              f"which are identical either way) costs anything in practice.")
 
     grade_weight = {"correct": 1.0, "partial": 0.5, "wrong": 0.0}
     for arm in ARMS:
@@ -177,12 +200,19 @@ def main() -> int:
             print(f"S-1 accuracy ({arm}): {score:.1f}% ({len(graded)}/{len(TASKS)} tasks graded)")
     grep_graded = [grades.get(t, {}).get("grep") for t in TASKS]
     carto_graded = [grades.get(t, {}).get("carto") for t in TASKS]
+    cli_graded = [grades.get(t, {}).get("cli") for t in TASKS]
     if all(g in grade_weight for g in grep_graded) and all(g in grade_weight for g in carto_graded):
         grep_score = sum(grade_weight[g] for g in grep_graded) / len(TASKS) * 100
         carto_score = sum(grade_weight[g] for g in carto_graded) / len(TASKS) * 100
         acc_pct = carto_score - grep_score
-        print(f"S-1 accuracy check: carto is {acc_pct:+.1f} points vs. grep-only "
+        print(f"S-1 accuracy check: carto (MCP) is {acc_pct:+.1f} points vs. grep-only "
               f"(threshold: ≥20% higher, i.e. pct ≥ 20).")
+        if all(g in grade_weight for g in cli_graded):
+            cli_score = sum(grade_weight[g] for g in cli_graded) / len(TASKS) * 100
+            print(f"[exploratory, not an S-1 metric] cli-vs-grep accuracy: "
+                  f"carto-via-CLI is {cli_score - grep_score:+.1f} points vs. grep-only.")
+            print(f"[exploratory, not an S-1 metric] cli-vs-MCP accuracy: "
+                  f"carto-via-CLI is {cli_score - carto_score:+.1f} points vs. carto-via-MCP.")
 
     n_graded = sum(1 for t in TASKS for a in ARMS if grades.get(t, {}).get(a))
     if n_graded == 0:

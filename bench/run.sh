@@ -1,18 +1,32 @@
 #!/usr/bin/env bash
 # Real-run arm for the S-1 benchmark (bench/tasks.md, spec §11.4): 8
-# tasks x 2 arms (grep-only vs. carto-MCP), one trial each, via real
-# `claude -p` sessions. Saves each session's full JSON output (including
-# the exact `usage` block: input/output/cache tokens, cost, duration) to
-# bench/results/<timestamp>/<task>.<arm>.json.
+# tasks x 3 strategy arms (grep-only, carto-via-CLI, carto-via-MCP), one
+# trial each, via real `claude -p` sessions. Saves each session's full
+# JSON output (including the exact `usage` block: input/output/cache
+# tokens, cost, duration) to bench/results/<timestamp>/<task>.<arm>.json.
+#
+# The `cli` arm was added after the first S-1 measurement (ADR-0019)
+# left an open question: is MCP actually the better integration surface
+# for carto, or would the CLI invoked via Bash — no server handshake, no
+# separate MCP config file, no connection state — be just as good or
+# better? Every real failure the original two-arm batch hit (the
+# neutral-cwd bug, --bare needing an unavailable API key, --safe-mode
+# disabling MCP outright, one isolated MCP-connection flake) was friction
+# *of the MCP transport/config layer*, never of carto's answers
+# themselves — none of that is inherent to a CLI reached through a tool
+# the agent already has unconditionally. `cli` and `carto` call the
+# exact same underlying functions (query::{find,deps,map},
+# indexer::build_and_persist) and answer identically when reached; this
+# arm exists to measure whether the path to reach them differs in cost.
 #
 # Auth note: `--bare` (the cleanest isolation — no CLAUDE.md/hook/plugin
 # auto-discovery) requires ANTHROPIC_API_KEY, which isn't set in the
 # environment this was built in. Runs instead under normal session auth,
-# with `--strict-mcp-config` on BOTH arms (the grep arm gets an empty MCP
-# config) so MCP-server exposure is at least cleanly controlled even
-# though CLAUDE.md/hook isolation isn't as complete as --bare would give.
-# Flagged here, and again in every results writeup, as a real methodology
-# caveat — not silently treated as equivalent to --bare.
+# with `--strict-mcp-config` on ALL THREE arms (grep and cli both get an
+# empty MCP config) so MCP-server exposure is at least cleanly controlled
+# even though CLAUDE.md/hook isolation isn't as complete as --bare would
+# give. Flagged here, and again in every results writeup, as a real
+# methodology caveat — not silently treated as equivalent to --bare.
 #
 # Working-directory note (fixed after a real, disclosed failure): the
 # first version of this script ran every session from a neutral tempdir
@@ -50,21 +64,29 @@ if [ ! -d "$ZED_REPO" ]; then
   exit 1
 fi
 
-# Real MCP config for the carto arm.
+# Real MCP config for the carto (MCP) arm.
 cat > "$RUN_DIR/mcp-config.json" <<EOF
 {"mcpServers": {"carto": {"command": "$CARTO_BIN", "args": ["serve"]}}}
 EOF
-# Empty MCP config for the grep arm — with --strict-mcp-config, this
-# guarantees zero MCP tools are exposed, rather than relying on "nothing
-# else happens to be configured."
+# Empty MCP config for the grep and cli arms — with --strict-mcp-config,
+# this guarantees zero MCP tools are exposed, rather than relying on
+# "nothing else happens to be configured."
 echo '{"mcpServers": {}}' > "$RUN_DIR/empty-mcp-config.json"
 
 READ_TOOLS="Read Glob Grep Bash(rg:*) Bash(grep:*) Bash(find:*) Bash(sed:*) Bash(wc:*) Bash(ls:*) Bash(cat:*)"
-CARTO_TOOLS="mcp__carto__index mcp__carto__where mcp__carto__deps mcp__carto__map mcp__carto__selfcheck"
+CARTO_MCP_TOOLS="mcp__carto__index mcp__carto__where mcp__carto__deps mcp__carto__map mcp__carto__selfcheck"
+# The cli arm's only additional tool is Bash access to the carto binary
+# itself, at its exact absolute path — Claude Code's Bash allowedTools
+# patterns match on the command's leading word, so this has to be the
+# literal resolved path, not a bare `carto` (which wouldn't be on PATH
+# inside the spawned session anyway).
+CARTO_CLI_TOOLS="Bash($CARTO_BIN:*)"
 # --append-system-prompt-file doesn't actually exist as a standalone flag
 # (checked against `claude --help`; only the inline-text
-# --append-system-prompt does) — pass the skill file's content directly.
+# --append-system-prompt does) — pass file content directly for both the
+# MCP arm's skill file and the cli arm's CLI-usage guidance.
 SKILL_TEXT="$(cat "$CARTO_REPO/skill/carto.skill.md")"
+CLI_TEXT="$(sed "s|{{CARTO_BIN}}|$CARTO_BIN|g" "$CARTO_REPO/bench/cli-arm-prompt.md")"
 
 declare -A PROMPT
 declare -A CORPUS
@@ -98,26 +120,40 @@ $prompt"
   # carto-repo task in the first version of this harness.
   (
     cd "$corpus"
-    if [ "$arm" = "carto" ]; then
-      claude -p \
-        --mcp-config "$RUN_DIR/mcp-config.json" \
-        --strict-mcp-config \
-        --output-format json \
-        --model "$MODEL" \
-        --allowedTools "$READ_TOOLS $CARTO_TOOLS" \
-        --permission-mode bypassPermissions \
-        --append-system-prompt "$SKILL_TEXT" \
-        "$full_prompt"
-    else
-      claude -p \
-        --mcp-config "$RUN_DIR/empty-mcp-config.json" \
-        --strict-mcp-config \
-        --output-format json \
-        --model "$MODEL" \
-        --allowedTools "$READ_TOOLS" \
-        --permission-mode bypassPermissions \
-        "$full_prompt"
-    fi
+    case "$arm" in
+      carto)
+        claude -p \
+          --mcp-config "$RUN_DIR/mcp-config.json" \
+          --strict-mcp-config \
+          --output-format json \
+          --model "$MODEL" \
+          --allowedTools "$READ_TOOLS $CARTO_MCP_TOOLS" \
+          --permission-mode bypassPermissions \
+          --append-system-prompt "$SKILL_TEXT" \
+          "$full_prompt"
+        ;;
+      cli)
+        claude -p \
+          --mcp-config "$RUN_DIR/empty-mcp-config.json" \
+          --strict-mcp-config \
+          --output-format json \
+          --model "$MODEL" \
+          --allowedTools "$READ_TOOLS $CARTO_CLI_TOOLS" \
+          --permission-mode bypassPermissions \
+          --append-system-prompt "$CLI_TEXT" \
+          "$full_prompt"
+        ;;
+      *)
+        claude -p \
+          --mcp-config "$RUN_DIR/empty-mcp-config.json" \
+          --strict-mcp-config \
+          --output-format json \
+          --model "$MODEL" \
+          --allowedTools "$READ_TOOLS" \
+          --permission-mode bypassPermissions \
+          "$full_prompt"
+        ;;
+    esac
   ) > "$out" 2> "$RESULTS_DIR/$task.$arm.stderr"
 
   local cost tokens_in
@@ -127,6 +163,7 @@ $prompt"
 
 for task in L1 L2 L3 L4 T5 T6 T7 T8; do
   run_session "$task" grep "${CORPUS[$task]}" "${PROMPT[$task]}"
+  run_session "$task" cli "${CORPUS[$task]}" "${PROMPT[$task]}"
   run_session "$task" carto "${CORPUS[$task]}" "${PROMPT[$task]}"
 done
 

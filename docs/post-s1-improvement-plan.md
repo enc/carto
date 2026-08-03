@@ -24,6 +24,50 @@ transcript, or a real repro in `bench/`.
 
 ---
 
+## 0. Is MCP even the right integration surface? (implemented, not yet re-measured)
+
+A question that came up discussing this plan, and worth settling before
+investing further in either surface: `crates/carto-mcp` and
+`crates/carto-cli` call the *exact same* underlying functions
+(`query::{find,deps,map}`, `indexer::build_and_persist`) — spec §7.1's
+"commands = MCP tools, same core functions" holds structurally, per
+ADR-0018. So the choice between them is purely about the *path* an agent
+takes to reach an identical answer, not about answer quality. Looking
+back at where this session actually lost time and money, that path
+mattered more than expected: **every real failure in the S-1
+measurement was friction of the MCP transport/config layer specifically**
+— the neutral-cwd bug, `--bare` needing an unavailable
+`ANTHROPIC_API_KEY`, `--safe-mode` silently disabling MCP servers
+outright, and one isolated MCP-connection flake that produced a
+plausible-looking answer without ever touching carto's tools. None of
+that is inherent to a CLI reached through Bash, which has no handshake,
+no separate config file, and no connection state to manage.
+
+That reasoning was itself only a prediction — the original S-1 batch
+never actually tested carto-via-Bash-CLI as its own arm, only
+grep-only vs. carto-via-MCP. **A third `cli` arm has now been added to
+`bench/run.sh`** (and `bench/score.py`, `bench/cli-arm-prompt.md`): same
+8 tasks, same read tools, but Bash access to the `carto` binary directly
+instead of an MCP connection, guided by a CLI-flavored version of
+`skill/carto.skill.md`'s honesty contract. `bench/score.py` reports the
+spec-defined grep-vs-carto(MCP) comparison unchanged, plus two new,
+explicitly-labeled *exploratory, not-S-1* comparisons: cli-vs-grep and
+cli-vs-MCP — the latter isolates whatever the MCP transport itself costs
+or saves, independent of carto's answers, which are identical either
+way. A quick single-task smoke test (`L2`, $0.23) confirmed the new arm
+works end-to-end: the agent used the CLI binary correctly, no permission
+denials, correct answer.
+
+**This has not yet been run as a full batch.** Per the user's direction,
+it's being implemented now and will run as part of the next full
+`bench/run.sh` pass — alongside the highest-confidence items from §1–§3
+below — rather than as an isolated measurement, so the eventual
+`skill/carto.skill.md` and README recommendation (which surface to lead
+with) is based on real numbers from the same measurement round, not
+argued from this section's reasoning alone.
+
+---
+
 ## 1. What features help
 
 ### 1.1 Make "zero edges" distinguishable from "we didn't look" (highest priority)
@@ -269,6 +313,10 @@ showed, not from the original hypothesis:
 
 ## Suggested slice order (not yet approved — for discussion)
 
+0. §0 (`cli` benchmark arm) — **implemented** (`bench/run.sh`, `bench/
+   score.py`, `bench/cli-arm-prompt.md`), smoke-tested, not yet run as a
+   full batch. Runs alongside the next full measurement (step 5), not as
+   a separate pass.
 1. §1.1 (honest absence signal on `deps`) + §3.1 (skill file known-gaps
    section) together — cheapest, highest-evidence, no new dependencies,
    directly targets T6's failure mode.
@@ -279,6 +327,9 @@ showed, not from the original hypothesis:
 4. §1.3 (group-import extraction) — the largest single item here; scope
    to Rust `use_list` first (the demonstrated case), decide on other
    languages after checking whether they share the failure mode.
-5. Re-run `bench/run.sh` against the same 8 tasks. Compare against this
-   session's `bench/results/20260803T112447/` baseline before deciding
-   on M3.
+5. Re-run `bench/run.sh` against the same 8 tasks, now with all three
+   arms (grep, cli, carto-MCP). Compare against this session's
+   `bench/results/20260803T112447/` baseline (grep/carto only) before
+   deciding on M3 — and let the cli-vs-MCP numbers from this run decide
+   which surface `skill/carto.skill.md`/README lead with, rather than
+   this document's own reasoning in §0.
