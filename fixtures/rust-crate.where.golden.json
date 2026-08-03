@@ -9,6 +9,7 @@
       "sym_kind": "method"
     }
   ],
+  "module_matches": [],
   "truncation": {
     "next_call": null,
     "truncated": false

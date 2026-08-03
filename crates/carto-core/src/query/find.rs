@@ -3,10 +3,16 @@
 //! because `where` is a Rust keyword — the CLI subcommand stays `where`;
 //! only the core function and this module are renamed.
 //!
-//! Matches [`crate::graph::SymbolNode::name`] only — `File`/`Module`
-//! nodes are not searched. Spec §7.1 names "symbol name" specifically;
-//! broadening this to files/modules is a real decision left to a future
-//! milestone, not an oversight (recorded in `docs/STATUS.md`).
+//! Also matches [`crate::graph::ModuleNode::path`] (ADR-0021) — a
+//! `Module` node's ID is a blake3 hash with no other reachable lookup
+//! path (`deps` requires a node ID or an exact symbol name), so without
+//! this a package/module was unreachable from the tool surface entirely
+//! (spec §7.1 names "symbol name" for `where`, but a purely additive
+//! second list alongside it doesn't take that away — see
+//! `docs/STATUS.md`'s note on this). `File` nodes are deliberately not
+//! searched here — `deps`'s target resolution (not `find`) is where a
+//! `File.path` becomes reachable, since a file is a traversal starting
+//! point, not a `where`-style name lookup spec §7.1 describes.
 
 use super::{QueryGraph, Truncation};
 use crate::graph::{NodeData, NodeId, SymKind};
@@ -60,9 +66,31 @@ pub struct SymbolMatch {
     pub provenance: Provenance,
 }
 
+/// One matched module (ADR-0021) — a separate row shape from
+/// `SymbolMatch` rather than folding into it, since a module has no
+/// `sym_kind`/`location`/`signature` to answer with.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModuleMatch {
+    pub id: NodeId,
+    pub path: String,
+    /// Whether this module is external (a package carto never parsed)
+    /// or an internal package reference — [`crate::graph::ModuleNode::
+    /// external`], surfaced since it changes what a caller can do next
+    /// with the ID (an internal module has real edges to traverse via
+    /// `deps`; an external one is a leaf).
+    pub external: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FindResult {
     pub matches: Vec<SymbolMatch>,
+    /// Modules whose `path` matched the same needle/exact/subpath rule
+    /// as `matches` (ADR-0021). `limit`/truncation apply to `matches`
+    /// and `module_matches` combined — symbols first, modules filling
+    /// whatever's left — rather than each list independently capped at
+    /// `limit`, so the response's total size stays bounded the same way
+    /// it always has.
+    pub module_matches: Vec<ModuleMatch>,
     pub truncation: Truncation,
 }
 
@@ -70,29 +98,48 @@ pub fn run(qg: &QueryGraph, query: &FindQuery) -> FindResult {
     let needle_lower = query.needle.to_lowercase();
 
     let mut matches: Vec<SymbolMatch> = Vec::new();
+    let mut module_matches: Vec<ModuleMatch> = Vec::new();
     for node in qg.nodes() {
-        let NodeData::Symbol(sym) = &node.data else {
-            continue;
-        };
-        let is_match = if query.exact {
-            sym.name == query.needle
-        } else {
-            sym.name.to_lowercase().contains(&needle_lower)
-        };
-        if !is_match {
-            continue;
+        match &node.data {
+            NodeData::Symbol(sym) => {
+                let is_match = if query.exact {
+                    sym.name == query.needle
+                } else {
+                    sym.name.to_lowercase().contains(&needle_lower)
+                };
+                if !is_match || !qg.path_in_scope(&node.id, query.subpath.as_deref()) {
+                    continue;
+                }
+                matches.push(SymbolMatch {
+                    id: node.id.clone(),
+                    name: sym.name.clone(),
+                    sym_kind: sym.sym_kind,
+                    location: qg.location(sym),
+                    signature: sym.signature.clone(),
+                    provenance: node.provenance,
+                });
+            }
+            NodeData::Module(m) => {
+                let is_match = if query.exact {
+                    m.path == query.needle
+                } else {
+                    m.path.to_lowercase().contains(&needle_lower)
+                };
+                // `path_in_scope` always returns `true` for a `Module`
+                // node (ADR-0014: packages have no directory) — called
+                // anyway for symmetry with the symbol arm above, not
+                // because it can filter anything here.
+                if !is_match || !qg.path_in_scope(&node.id, query.subpath.as_deref()) {
+                    continue;
+                }
+                module_matches.push(ModuleMatch {
+                    id: node.id.clone(),
+                    path: m.path.clone(),
+                    external: m.external,
+                });
+            }
+            NodeData::File(_) => {}
         }
-        if !qg.path_in_scope(&node.id, query.subpath.as_deref()) {
-            continue;
-        }
-        matches.push(SymbolMatch {
-            id: node.id.clone(),
-            name: sym.name.clone(),
-            sym_kind: sym.sym_kind,
-            location: qg.location(sym),
-            signature: sym.signature.clone(),
-            provenance: node.provenance,
-        });
     }
 
     // Deterministic order, not a relevance score — an unexplained score
@@ -103,9 +150,13 @@ pub fn run(qg: &QueryGraph, query: &FindQuery) -> FindResult {
             .cmp(&b.name)
             .then_with(|| a.location.cmp(&b.location))
     });
+    module_matches.sort_by(|a, b| a.path.cmp(&b.path));
 
-    let truncated = matches.len() > query.limit;
+    let total = matches.len() + module_matches.len();
+    let truncated = total > query.limit;
     matches.truncate(query.limit);
+    let remaining = query.limit.saturating_sub(matches.len());
+    module_matches.truncate(remaining);
 
     let truncation = if truncated {
         Truncation::more(format!(
@@ -119,6 +170,7 @@ pub fn run(qg: &QueryGraph, query: &FindQuery) -> FindResult {
 
     FindResult {
         matches,
+        module_matches,
         truncation,
     }
 }
@@ -334,6 +386,97 @@ mod tests {
         let qg = QueryGraph::from_document(doc_with_symbols(&["a"]));
         let result = run(&qg, &FindQuery::new("nonexistent"));
         assert!(result.matches.is_empty());
+        assert!(!result.truncation.truncated);
+    }
+
+    fn doc_with_module(path: &str, external: bool) -> GraphDocument {
+        GraphDocument {
+            carto_version: "0.1.0".to_string(),
+            schema_version: crate::consts::SCHEMA_VERSION,
+            nodes: vec![Node::module(
+                crate::graph::module_id(path, external),
+                Provenance::Syntactic,
+                "test@1",
+                crate::graph::ModuleNode {
+                    path: path.to_string(),
+                    external,
+                },
+            )],
+            edges: vec![],
+        }
+    }
+
+    #[test]
+    fn module_path_matches_by_substring_and_carries_external_flag() {
+        let qg = QueryGraph::from_document(doc_with_module("carto_core", true));
+        let result = run(&qg, &FindQuery::new("carto"));
+        assert!(result.matches.is_empty());
+        assert_eq!(result.module_matches.len(), 1);
+        assert_eq!(result.module_matches[0].path, "carto_core");
+        assert!(result.module_matches[0].external);
+    }
+
+    #[test]
+    fn module_path_exact_match_is_case_sensitive() {
+        let qg = QueryGraph::from_document(doc_with_module("carto_core", false));
+        let mut query = FindQuery::new("Carto_Core");
+        query.exact = true;
+        assert!(run(&qg, &query).module_matches.is_empty());
+
+        let query = FindQuery {
+            needle: "carto_core".to_string(),
+            exact: true,
+            limit: DEFAULT_LIMIT,
+            subpath: None,
+        };
+        assert_eq!(run(&qg, &query).module_matches.len(), 1);
+    }
+
+    #[test]
+    fn module_matches_are_never_excluded_by_subpath() {
+        // ADR-0014: modules have no directory, so --subpath never
+        // filters them out directly.
+        let qg = QueryGraph::from_document(doc_with_module("carto_core", true));
+        let query = FindQuery {
+            needle: "carto_core".to_string(),
+            exact: true,
+            limit: DEFAULT_LIMIT,
+            subpath: Some("some/unrelated/dir".to_string()),
+        };
+        assert_eq!(run(&qg, &query).module_matches.len(), 1);
+    }
+
+    #[test]
+    fn symbols_and_modules_share_a_combined_limit_symbols_first() {
+        // Two symbols + one module all match "x", limit 2: symbols win
+        // the shared budget, the module is dropped and truncation fires.
+        let mut doc = doc_with_symbols(&["x1", "x2"]);
+        let module_doc = doc_with_module("x_pkg", true);
+        doc.nodes.extend(module_doc.nodes);
+        let qg = QueryGraph::from_document(doc);
+
+        let query = FindQuery {
+            needle: "x".to_string(),
+            exact: false,
+            limit: 2,
+            subpath: None,
+        };
+        let result = run(&qg, &query);
+        assert_eq!(result.matches.len(), 2);
+        assert!(result.module_matches.is_empty());
+        assert!(result.truncation.truncated);
+    }
+
+    #[test]
+    fn symbols_and_modules_both_fit_under_a_generous_combined_limit() {
+        let mut doc = doc_with_symbols(&["x1"]);
+        let module_doc = doc_with_module("x_pkg", true);
+        doc.nodes.extend(module_doc.nodes);
+        let qg = QueryGraph::from_document(doc);
+
+        let result = run(&qg, &FindQuery::new("x"));
+        assert_eq!(result.matches.len(), 1);
+        assert_eq!(result.module_matches.len(), 1);
         assert!(!result.truncation.truncated);
     }
 }

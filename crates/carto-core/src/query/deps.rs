@@ -78,6 +78,14 @@ pub struct DepEdge {
     /// hop can contain edges pointing either direction.
     pub direction: Direction,
     pub node: NodeSummary,
+    /// Whether this edge's node lives in the same file as `root`
+    /// (ADR-0021, §1.4) — `false` for a `Module` node (which has no
+    /// file) or when `root` itself is a `Module`. Motivated by T5: a
+    /// caller in the same file as the symbol it calls was misread as
+    /// "the method definition itself" rather than a distinct call site,
+    /// a legibility gap this flag exists to close without changing the
+    /// data model.
+    pub same_file_as_root: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -129,6 +137,7 @@ pub fn run(qg: &QueryGraph, query: &DepsQuery) -> Result<DepsResult> {
 
     let root_id = resolve_target(qg, &query.target, query.subpath.as_deref())?;
     let root = summarize(qg, &root_id);
+    let root_file = owning_file(qg, &root_id);
     let root_unresolved_calls = match qg.node(&root_id).map(|n| &n.data) {
         Some(NodeData::Symbol(s)) => s.unresolved_calls.clone(),
         _ => Vec::new(),
@@ -173,12 +182,17 @@ pub fn run(qg: &QueryGraph, query: &DepsQuery) -> Result<DepsResult> {
                 // silently broken). Only whether this edge gets
                 // *reported* is scoped.
                 if qg.path_in_scope(&other, query.subpath.as_deref()) {
+                    let same_file_as_root = match (&root_file, owning_file(qg, &other)) {
+                        (Some(rf), Some(of)) => *rf == of,
+                        _ => false,
+                    };
                     edges_this_hop.push(DepEdge {
                         kind: edge.kind,
                         confidence: edge.confidence,
                         evidence: edge.evidence.clone(),
                         direction,
                         node: summarize(qg, &other),
+                        same_file_as_root,
                     });
                 }
                 next_frontier.push(other);
@@ -239,40 +253,93 @@ pub fn run(qg: &QueryGraph, query: &DepsQuery) -> Result<DepsResult> {
     })
 }
 
+/// One candidate a bare `target` string resolved to, before the
+/// ambiguity check — carries enough to both extract the `NodeId` and
+/// describe itself in a multi-match error message, since the three
+/// kinds have no field in common besides the ID (ADR-0021).
+enum Candidate {
+    Symbol(NodeId, String),
+    Module(NodeId, String),
+    File(NodeId, String),
+}
+
+impl Candidate {
+    fn id(&self) -> &NodeId {
+        match self {
+            Candidate::Symbol(id, _) | Candidate::Module(id, _) | Candidate::File(id, _) => id,
+        }
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            Candidate::Symbol(id, location) => format!("{id} ({location})"),
+            Candidate::Module(id, path) => format!("{id} (module {path})"),
+            Candidate::File(id, path) => format!("{id} (file {path})"),
+        }
+    }
+}
+
 /// Resolves `target` to a [`NodeId`]: used as-is if it's already an
-/// existing node's ID; otherwise looked up as an exact symbol name via
-/// [`super::find`]. `subpath` is deliberately **not** applied to this
-/// initial lookup — the deps root is very commonly outside the subtree
-/// being reported on (e.g. `deps handle --subpath src/orders` to see
-/// only `handle`'s dependencies that land in `orders`, where `handle`
-/// itself lives elsewhere entirely), so scoping the root lookup
-/// unconditionally would break that common case. `subpath` only comes
-/// into play as a **tiebreaker**: if the unscoped lookup is ambiguous
-/// (more than one candidate), it's retried scoped, so `--subpath` can
-/// still resolve an otherwise-ambiguous name (e.g. the same symbol name
-/// present in a live tree and in some unrelated vendored/dead-code
-/// directory) — a side effect of narrowing the candidate set, not a
-/// separate mechanism, and never invoked for a name that was already
-/// unambiguous. Zero matches or more than one match (after any
-/// tiebreak attempt) are both `UserError`s (INV-8's honesty rule,
-/// applied to the CLI surface: no silent pick among ambiguous
-/// candidates) — the multi-match case lists every candidate's ID so
-/// the caller can re-run with one.
+/// existing node's ID; otherwise looked up as an exact match against a
+/// symbol name, a `Module.path`, or a `File.path` (ADR-0021 widens this
+/// from symbol-name-only — a deps root is at least as often a file or
+/// package as a specific symbol, and node IDs are blake3 hashes with no
+/// other reachable lookup path). Symbol/module matching reuses
+/// [`super::find`]; file matching is a direct scan here, since `find`
+/// deliberately doesn't search `File` nodes (see `find.rs`'s module
+/// doc). `subpath` is deliberately **not** applied to this initial
+/// lookup — the deps root is very commonly outside the subtree being
+/// reported on (e.g. `deps handle --subpath src/orders` to see only
+/// `handle`'s dependencies that land in `orders`, where `handle` itself
+/// lives elsewhere entirely), so scoping the root lookup unconditionally
+/// would break that common case. `subpath` only comes into play as a
+/// **tiebreaker**: if the unscoped lookup is ambiguous (more than one
+/// candidate), it's retried scoped, so `--subpath` can still resolve an
+/// otherwise-ambiguous name (e.g. the same symbol name present in a live
+/// tree and in some unrelated vendored/dead-code directory) — a side
+/// effect of narrowing the candidate set, not a separate mechanism, and
+/// never invoked for a name that was already unambiguous. Zero matches
+/// or more than one match (after any tiebreak attempt) are both
+/// `UserError`s (INV-8's honesty rule, applied to the CLI surface: no
+/// silent pick among ambiguous candidates) — the multi-match case lists
+/// every candidate's ID so the caller can re-run with one.
 fn resolve_target(qg: &QueryGraph, target: &str, subpath: Option<&str>) -> Result<NodeId> {
     if let Some(node) = qg.nodes().find(|n| n.id.as_str() == target) {
         return Ok(node.id.clone());
     }
 
-    let find_query = |scope: Option<&str>| FindQuery {
-        needle: target.to_string(),
-        exact: true,
-        limit: usize::MAX,
-        subpath: scope.map(str::to_string),
+    let candidates = |scope: Option<&str>| -> Vec<Candidate> {
+        let find_query = FindQuery {
+            needle: target.to_string(),
+            exact: true,
+            limit: usize::MAX,
+            subpath: scope.map(str::to_string),
+        };
+        let found = find(qg, &find_query);
+        let mut out: Vec<Candidate> = found
+            .matches
+            .into_iter()
+            .map(|m| Candidate::Symbol(m.id, m.location))
+            .collect();
+        out.extend(
+            found
+                .module_matches
+                .into_iter()
+                .map(|m| Candidate::Module(m.id, m.path)),
+        );
+        for node in qg.nodes() {
+            if let NodeData::File(f) = &node.data {
+                if f.path == target && qg.path_in_scope(&node.id, scope) {
+                    out.push(Candidate::File(node.id.clone(), f.path.clone()));
+                }
+            }
+        }
+        out
     };
 
-    let unscoped = find(qg, &find_query(None)).matches;
+    let unscoped = candidates(None);
     let matches = if unscoped.len() > 1 && subpath.is_some() {
-        find(qg, &find_query(subpath)).matches
+        candidates(subpath)
     } else {
         unscoped
     };
@@ -282,20 +349,28 @@ fn resolve_target(qg: &QueryGraph, target: &str, subpath: Option<&str>) -> Resul
             ErrorKind::UserError,
             format!("no node ID or symbol named `{target}` found in this index"),
         )),
-        1 => Ok(matches.into_iter().next().unwrap().id),
+        1 => Ok(matches.into_iter().next().unwrap().id().clone()),
         _ => {
-            let candidates: Vec<String> = matches
-                .iter()
-                .map(|m| format!("{} ({})", m.id, m.location))
-                .collect();
+            let descriptions: Vec<String> = matches.iter().map(Candidate::describe).collect();
             Err(Error::new(
                 ErrorKind::UserError,
                 format!(
-                    "`{target}` matches multiple symbols; specify one by ID: {}",
-                    candidates.join(", ")
+                    "`{target}` matches multiple nodes; specify one by ID: {}",
+                    descriptions.join(", ")
                 ),
             ))
         }
+    }
+}
+
+/// The `File` node `id` "lives in", for `same_file_as_root` (§1.4):
+/// a `Symbol`'s own `file` field; a `File` node is its own answer;
+/// `None` for a `Module` (no file) or a dangling reference.
+fn owning_file(qg: &QueryGraph, id: &NodeId) -> Option<NodeId> {
+    match qg.node(id).map(|n| &n.data) {
+        Some(NodeData::Symbol(s)) => Some(s.file.clone()),
+        Some(NodeData::File(_)) => Some(id.clone()),
+        Some(NodeData::Module(_)) | None => None,
     }
 }
 
@@ -681,12 +756,118 @@ mod tests {
         assert_eq!(result.root.label, "handle");
     }
 
+    /// ADR-0021: `deps`'s target resolution used to error outright on a
+    /// `Module`/`File` path (spec §7.1's L3 finding) since only symbol
+    /// names were matched — node IDs are blake3 hashes with no other
+    /// reachable lookup path, so a package or file was unreachable from
+    /// the tool surface entirely.
+    #[test]
+    fn target_can_be_a_module_path() {
+        let f = file("src/lib.rs");
+        let module_id = crate::graph::module_id("serde", true);
+        let module = Node::module(
+            module_id.clone(),
+            Provenance::Syntactic,
+            "test@1",
+            crate::graph::ModuleNode {
+                path: "serde".to_string(),
+                external: true,
+            },
+        );
+        let e = Edge::new(
+            EdgeKind::Imports,
+            f.id.clone(),
+            module_id.clone(),
+            Confidence::Certain,
+            "external-package".to_string(),
+        );
+        let qg = QueryGraph::from_document(doc(vec![f, module], vec![e]));
+
+        let result = run(
+            &qg,
+            &DepsQuery {
+                target: "serde".to_string(),
+                dir: Direction::In,
+                depth: 1,
+                kinds: None,
+                subpath: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(result.root.id, module_id);
+        assert_eq!(result.root.kind, "module");
+        assert_eq!(result.hops[0].edges[0].node.label, "src/lib.rs");
+    }
+
+    #[test]
+    fn target_can_be_a_file_path() {
+        let qg = QueryGraph::from_document(chain_doc());
+        let result = run(&qg, &DepsQuery::new("src/lib.rs")).unwrap();
+        assert_eq!(result.root.kind, "file");
+        assert_eq!(result.root.label, "src/lib.rs");
+    }
+
     #[test]
     fn confidence_and_evidence_are_surfaced_on_every_row() {
         let qg = QueryGraph::from_document(chain_doc());
         let result = run(&qg, &DepsQuery::new("handle")).unwrap();
         assert_eq!(result.hops[0].edges[0].confidence, Confidence::Inferred);
         assert_eq!(result.hops[0].edges[0].evidence, vec!["same-file"]);
+    }
+
+    /// T5: a caller living in the same file as the symbol it calls was
+    /// misread as "the method definition itself" rather than a distinct
+    /// call site — `chain_doc`'s `handle`/`parse_order` both live in
+    /// `src/lib.rs`, matching that failure mode exactly.
+    #[test]
+    fn same_file_as_root_is_true_when_caller_and_callee_share_a_file() {
+        let qg = QueryGraph::from_document(chain_doc());
+        let result = run(&qg, &DepsQuery::new("handle")).unwrap();
+        assert!(result.hops[0].edges[0].same_file_as_root);
+    }
+
+    #[test]
+    fn same_file_as_root_is_false_across_files() {
+        // handle (mg_site/handlers.rs) -> parse_order (vendor/orders.rs)
+        // — different files, unlike chain_doc's same-file case above.
+        let qg = QueryGraph::from_document(cross_boundary_chain_doc());
+        let result = run(
+            &qg,
+            &DepsQuery {
+                target: "handle".to_string(),
+                dir: Direction::Out,
+                depth: 1,
+                kinds: None,
+                subpath: None,
+            },
+        )
+        .unwrap();
+        assert!(!result.hops[0].edges[0].same_file_as_root);
+    }
+
+    #[test]
+    fn same_file_as_root_is_false_for_a_module_endpoint() {
+        let f = file("src/lib.rs");
+        let module_id = crate::graph::module_id("serde", true);
+        let module = Node::module(
+            module_id.clone(),
+            Provenance::Syntactic,
+            "test@1",
+            crate::graph::ModuleNode {
+                path: "serde".to_string(),
+                external: true,
+            },
+        );
+        let e = Edge::new(
+            EdgeKind::Imports,
+            f.id.clone(),
+            module_id,
+            Confidence::Certain,
+            "external-package".to_string(),
+        );
+        let qg = QueryGraph::from_document(doc(vec![f, module], vec![e]));
+        let result = run(&qg, &DepsQuery::new("src/lib.rs")).unwrap();
+        assert!(!result.hops[0].edges[0].same_file_as_root);
     }
 
     #[test]

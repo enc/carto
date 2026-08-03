@@ -56,7 +56,7 @@ pub fn run(args: &WhereArgs) -> Result<query::FindResult> {
 }
 
 pub fn print_human(result: &query::FindResult) {
-    if result.matches.is_empty() {
+    if result.matches.is_empty() && result.module_matches.is_empty() {
         println!("no matches");
         return;
     }
@@ -77,6 +77,20 @@ pub fn print_human(result: &query::FindResult) {
     }
     if has_signature {
         println!("{}", consts::FENCE_CLOSE);
+    }
+
+    // Modules carry no tainted text (a `path` is extractor-computed, not
+    // captured source), so no fence is needed here.
+    if !result.module_matches.is_empty() {
+        println!("## modules");
+        for m in &result.module_matches {
+            println!(
+                "{}  {}  {}",
+                m.path,
+                if m.external { "external" } else { "internal" },
+                m.id
+            );
+        }
     }
 
     if result.truncation.truncated {

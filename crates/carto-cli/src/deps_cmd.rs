@@ -166,8 +166,16 @@ pub fn print_human(result: &query::DepsResult, dir: Direction) {
                 Direction::In => "<--",
                 _ => "-->",
             };
+            // T5: a caller in the same file as the callee reads as "the
+            // definition itself" without this marker — see
+            // `same_file_as_root`'s own doc comment.
+            let same_file_note = if edge.same_file_as_root {
+                "  [same file as root]"
+            } else {
+                ""
+            };
             println!(
-                "  [{}] {} {} {} ({})  {}",
+                "  [{}] {} {} {} ({})  {}{same_file_note}",
                 hop.depth,
                 arrow,
                 edge.kind.as_str(),

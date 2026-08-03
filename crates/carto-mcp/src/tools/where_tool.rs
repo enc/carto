@@ -56,7 +56,7 @@ pub fn call(args: &Value) -> Result<Value, String> {
 }
 
 fn render_text(result: &query::FindResult) -> String {
-    if result.matches.is_empty() {
+    if result.matches.is_empty() && result.module_matches.is_empty() {
         return "no matches".to_string();
     }
 
@@ -80,6 +80,22 @@ fn render_text(result: &query::FindResult) -> String {
     if has_signature {
         out.push_str(consts::FENCE_CLOSE);
         out.push('\n');
+    }
+
+    // Modules carry no tainted text (a `path` is extractor-computed, not
+    // captured source), so no fence is needed here — same reasoning
+    // `map_tool.rs`'s module doc comment already gives for its own
+    // paths-only output.
+    if !result.module_matches.is_empty() {
+        out.push_str("## modules\n");
+        for m in &result.module_matches {
+            out.push_str(&format!(
+                "{}  {}  {}\n",
+                m.path,
+                if m.external { "external" } else { "internal" },
+                m.id
+            ));
+        }
     }
 
     if result.truncation.truncated {
@@ -129,6 +145,7 @@ mod tests {
                 )),
                 provenance: carto_core::taint::Provenance::Syntactic,
             }],
+            module_matches: vec![],
             truncation: query::Truncation::none(),
         };
 
@@ -152,6 +169,7 @@ mod tests {
                 signature: None,
                 provenance: carto_core::taint::Provenance::Syntactic,
             }],
+            module_matches: vec![],
             truncation: query::Truncation::none(),
         };
 

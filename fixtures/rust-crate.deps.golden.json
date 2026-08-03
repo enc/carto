@@ -15,7 +15,8 @@
             "kind": "symbol",
             "label": "audit_order",
             "location": "src/orders.rs:20-22"
-          }
+          },
+          "same_file_as_root": false
         },
         {
           "confidence": "inferred",
@@ -29,7 +30,8 @@
             "kind": "symbol",
             "label": "parse_order",
             "location": "src/orders.rs:11-14"
-          }
+          },
+          "same_file_as_root": false
         },
         {
           "confidence": "inferred",
@@ -43,7 +45,8 @@
             "kind": "symbol",
             "label": "log_order",
             "location": "src/handlers.rs:11-13"
-          }
+          },
+          "same_file_as_root": true
         },
         {
           "confidence": "inferred",
@@ -57,7 +60,8 @@
             "kind": "symbol",
             "label": "summary",
             "location": "src/orders.rs:6-8"
-          }
+          },
+          "same_file_as_root": false
         }
       ]
     },
@@ -76,7 +80,8 @@
             "kind": "symbol",
             "label": "validate",
             "location": "src/orders.rs:16-18"
-          }
+          },
+          "same_file_as_root": false
         }
       ]
     }
