@@ -1,6 +1,6 @@
 # carto — status / handoff
 
-**Milestone:** M1.b.2b done (Rust, Python, PHP, TS/TSX/JS, Go — spec §5.2's full v1 language set), plus C# added post-v1 on user request (ADR-0016). M2's first slice — real redaction (ADR-0017) — is also done. An MCP server slice (normally M4 scope) was pulled ahead on user request, to measure spec §11.4's S-1 benchmark before further capability work (ADR-0018). **The S-1 benchmark has now been run (ADR-0019): neither threshold is met on a one-trial measurement** (combined input tokens: carto uses 18.0% more, not ≥30% fewer; accuracy: carto is 6.2 points lower, not ≥20 higher) — full per-task result in [`bench/`](../bench/) and ADR-0019; **M3 does not proceed automatically on this result — spec §11.4 requires the user's decision, and that decision is pending.**
+**Milestone:** M1.b.2b done (Rust, Python, PHP, TS/TSX/JS, Go — spec §5.2's full v1 language set), plus C# added post-v1 on user request (ADR-0016). M2's first slice — real redaction (ADR-0017) — is also done. An MCP server slice (normally M4 scope) was pulled ahead on user request, to measure spec §11.4's S-1 benchmark before further capability work (ADR-0018). **The S-1 benchmark has now been run (ADR-0019): neither threshold is met on a one-trial measurement** (combined input tokens: carto uses 18.0% more, not ≥30% fewer; accuracy: carto is 6.2 points lower, not ≥20 higher) — full per-task result in [`bench/`](../bench/) and ADR-0019. **The post-S-1 improvement plan's slices 1–4 are now implemented** (`docs/post-s1-improvement-plan.md`, ADRs 0020–0022: the honest-absence signal, `map --section`, `Module`/`File` discovery plus the same-file caller flag, and Rust grouped-`use` extraction) — see the milestone entry below. **M3 still does not proceed automatically — spec §11.4 requires the user's decision, presented and pending; re-running S-1 against this slice (plan step 5) is a separate, not-yet-run step.**
 
 Where the implementation is in the milestone sequence, what's deliberately
 absent, and what's next. Everything else lives elsewhere on purpose:
@@ -98,6 +98,49 @@ so they've been subdivided. Current state:
   moment and fell back to grep rather than trusting an incomplete
   answer. **Per spec §11.4, this ADR does not decide whether M3
   proceeds — that's the user's call, presented and pending.**
+- **Post-S-1 improvement plan, slices 1–4** (2026-08-03, ADRs 0020–0022;
+  `docs/post-s1-improvement-plan.md`) — the four highest-confidence,
+  most directly-evidenced fixes the S-1 result pointed at, landed ahead
+  of the user's M3 go/no-go decision (which these slices don't
+  determine, only prepare a better-measured foundation for):
+  - **§1.1 honest absence** (ADR-0020): `SymbolNode.uncaptured_inbound_calls`
+    counts (never resolves) call sites a language's extractor
+    deliberately never attempts — today only Rust's path-qualified
+    calls. Surfaced on `deps` as `root_uncaptured_inbound_calls`,
+    rendered as a text note only on `--dir in`/`both`. `SCHEMA_VERSION`
+    bumped 1 → 2 so a stale v1 `graph.json` is rejected with "re-run
+    `carto index`" rather than silently reporting a fabricated `0`.
+  - **§2.1 `map --section`** (`counts`/`modules`/`entry-points`/`infra`,
+    repeatable): lets a caller render only the sections a question
+    needs instead of paying for the full overview every time; `None`
+    (the default) is unchanged full-overview behavior. The structured
+    `counts` field is always exact regardless of this filter.
+  - **§1.2/§1.4** (ADR-0021): `where`/`find` now also match `Module.path`
+    (a separate `module_matches` list); `deps`'s target resolution now
+    also matches `Module.path`/`File.path` exactly (previously
+    symbol-name-only) — closing L3's "a package/file's blake3-hashed ID
+    has no other reachable lookup path" gap. `deps`'s `DepEdge` also
+    gained `same_file_as_root`, flagging when a caller and its callee
+    share a file (T5's misread: a same-file caller read as "the
+    definition itself").
+  - **§1.3 Rust grouped-`use` extraction** (ADR-0022, amends ADR-0008):
+    `use a::{b, c};` (including nested groups and a `self` member) is
+    now extracted — previously **zero** import edges, not reduced
+    precision, for any grouped `use`. `use_wildcard`/`use_as_clause`
+    remain excluded, per the plan's scope. Checked (not deferred)
+    whether Python/TS-JS/PHP/C# share this gap — they don't; it was
+    Rust-specific.
+  - **§3.1/§3.2/§2.3 skill-file wording** (no code): `skill/
+    carto.skill.md` names these specific known gaps as actions rather
+    than describing them generically, and frames carto+grep as
+    complementary by default for transitive/blast-radius questions.
+  - Every fixture golden regenerated where output changed
+    (`fixtures/mixed.graph.golden.json`,
+    `fixtures/rust-crate.{where,deps}.golden.json`; `map`'s golden is
+    unaffected). `bash scripts/gates.sh` green at each of the six
+    commits landing this work. **Not yet done: re-running S-1
+    (the plan's step 5) against these changes** — that's the
+    measurement round the user approves separately, per spec §11.4.
 - **M2+ remaining** — infra graph, join, ingest. Per spec §10. **Paused
   at the S-1 gate, pending the user's M3 go/no-go decision above** —
   not proceeding automatically.
@@ -123,9 +166,24 @@ Do not "fix" these without checking the linked reasoning first:
   (`pkg.func()`) vs. an instance call (`order.summary()`), so both
   resolve through the same tiers. A genuine cross-language difference,
   not an inconsistency — [ADR-0011](adr/0011-python-resolution-policy-mapping.md).
-- **`use_list` / `use_wildcard` / `use_as_clause`** Rust import shapes —
-  extracted as nothing rather than partially interpreted. Same ADR.
-  Python's `from x import *` is excluded the same way (ADR-0011).
+  **Since 2026-08-03 (ADR-0020), this exclusion is no longer silent**:
+  every such call site is counted (not resolved) into
+  `SymbolNode::uncaptured_inbound_calls`, surfaced on `deps --dir in`
+  as `root_uncaptured_inbound_calls` — a nonzero count is a direct
+  signal that a small/empty `--dir in` answer may be incomplete, not
+  evidence the symbol has few callers.
+- **`use_wildcard` / `use_as_clause`** Rust import shapes — extracted
+  as nothing rather than partially interpreted (an aliased member
+  *inside* a group is skipped individually, not the whole statement).
+  Same ADR. Python's `from x import *` is excluded the same way
+  (ADR-0011). **`use_list` (grouped imports, `use a::{b, c};`,
+  including nested groups and a `self` member) is no longer in this
+  list** — extracted since 2026-08-03
+  ([ADR-0022](adr/0022-rust-grouped-use-extraction.md)), which amends
+  ADR-0008's original blanket exclusion of all three shapes. The
+  consequence of the old exclusion was silent, not just reduced,
+  under-reporting on any Rust fan-in/fan-out question whose only
+  relevant import happened to be grouped — see ADR-0022's Context.
 - **Python has no visibility keyword; a leading underscore is the
   is_pub proxy** for call-resolution tiers (b)/(c), applied uniformly to
   functions/classes/methods (including dunder methods, e.g. `__init__`,
@@ -150,9 +208,17 @@ Do not "fix" these without checking the linked reasoning first:
   carve-out — [ADR-0007](adr/0007-carto-grammars-unsafe-carveout.md).
 - **"Same-package" means "same walked repo"** — no `Cargo.toml`/workspace
   parsing. Revisit only if multi-crate false positives show up in practice.
-- **`where` matches `Symbol.name` only** — `File`/`Module` nodes aren't
-  searched. Spec §7.1 names "symbol name" specifically; broadening this
-  is a real decision, not an oversight.
+- **`where` matches `Symbol.name` and, since 2026-08-03
+  ([ADR-0021](adr/0021-module-file-discovery-and-same-file-caller-flag.md)),
+  `Module.path` too** (a separate `module_matches` list, sharing a
+  combined limit/truncation with symbol matches). `File` nodes still
+  aren't searched by `where` — spec §7.1 names "symbol name"
+  specifically, and a file is a traversal starting point more than a
+  name-lookup target; `deps`'s own target resolution (same ADR) is
+  where a `File.path` becomes reachable instead, alongside a
+  `Module.path` — previously, a `Module`/`File` node's blake3-hashed ID
+  had no other reachable lookup path at all, making it unreachable from
+  the tool surface entirely (the motivating S-1/L3 finding).
 - **`deps` reports a spanning-tree view, not every edge in the reachable
   subgraph** — each node listed once via the edge that first discovered
   it; a "cross edge" between two already-discovered nodes isn't shown
@@ -335,6 +401,19 @@ here — that decision is **pending**. Until it lands, M2's remaining
 scope (the infrastructure graph, Terraform/CFN/CDK, and the code↔infra
 join — spec §6, not sliced yet the way M1.b was) and M3 are both paused,
 not proceeding by default.
+
+**Since then, `docs/post-s1-improvement-plan.md`'s slices 1–4 have been
+implemented** (ADRs 0020–0022; the milestone entry above has the full
+list) — the concrete, evidenced fixes the S-1 result itself pointed at:
+an honest absence signal for calls a language's extractor never
+attempts, `map --section`, `Module`/`File` discovery in `where`/`deps`
+plus a same-file caller flag, and Rust grouped-`use` extraction. This
+does **not** decide the M3 go/no-go question either — spec §11.4 still
+requires the user's decision, and the plan's own step 5 (re-running
+`bench/run.sh` as a full three-arm batch against these changes, then
+comparing against `bench/results/20260803T112447/`) is a separate,
+not-yet-run measurement round the user approves independently before
+that decision is made.
 
 Also worth knowing before touching `resolve.rs` again: building
 `fixtures/php-app` surfaced a real, language-agnostic bug in call

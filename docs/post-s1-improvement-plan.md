@@ -2,10 +2,14 @@
 
 **Date:** 2026-08-03 · **Basis:** ADR-0019's S-1 result
 (`bench/results/20260803T112447/`, `bench/tasks.md`,
-`bench/field-log.md`) · **Status:** proposed — not yet approved for
-implementation. Written in response to the S-1 result, at the user's
-request, to turn "neither threshold met" into a concrete next-slice plan
-rather than a dead end.
+`bench/field-log.md`) · **Status:** slices 1–4 of the slice order below
+are **implemented** (ADRs 0020–0022; `docs/STATUS.md`'s milestone entry
+has the full list). Slice order step 5 (re-running `bench/run.sh` as a
+full three-arm batch against these changes) is **not yet run** — a
+separate measurement round the user approves independently, per spec
+§11.4. Written in response to the S-1 result, at the user's request, to
+turn "neither threshold met" into a concrete next-slice plan rather
+than a dead end.
 
 ## Why this plan exists instead of a straight M3 go/no-go
 
@@ -70,7 +74,7 @@ argued from this section's reasoning alone.
 
 ## 1. What features help
 
-### 1.1 Make "zero edges" distinguishable from "we didn't look" (highest priority)
+### 1.1 Make "zero edges" distinguishable from "we didn't look" (highest priority) — **implemented, ADR-0020**
 
 **Evidence:** T6 is the sharpest example in the whole benchmark.
 `deps load --dir in` returns 5 *real but irrelevant* edges (the
@@ -95,7 +99,7 @@ requires the extractor to *count* what it's skipping, which it already
 walks past today. Directly extends INV-8 ("nothing heuristic is
 presented as resolved") to cover *absence*, not just presence.
 
-### 1.2 A `Module`-node discovery path
+### 1.2 A `Module`-node discovery path — **implemented, ADR-0021**
 
 **Evidence:** L3. `carto deps carto_core --dir in` fails outright ("no
 node ID or symbol named `carto_core` found") — `where` only searches
@@ -113,7 +117,7 @@ and raw IDs. Small, mechanical change — `where`'s matching loop already
 special-cases `NodeData::Symbol`; this is one more arm, not a new
 subsystem.
 
-### 1.3 Group-import extraction (the biggest, most surprising finding)
+### 1.3 Group-import extraction (the biggest, most surprising finding) — **implemented for Rust, ADR-0022**
 
 **Evidence:** L3's root-cause investigation (`bench/tasks.md`, `bench/
 field-log.md`). A minimal one-file repro confirmed: any Rust
@@ -142,7 +146,7 @@ Python's `from x import (a, b)`, PHP's `use X\{A, B}`, and C#'s grouped
 it for Rust, but the risk is structural to "one query pattern, list
 form excluded" and may be repo-wide across languages, not Rust-specific.
 
-### 1.4 Legible edge provenance (motivated by T5)
+### 1.4 Legible edge provenance (motivated by T5) — **implemented, ADR-0021**
 
 **Evidence:** T5. carto's own `deps render_capped --dir in --depth 1`
 output (independently verified while writing `bench/tasks.md`) *does*
@@ -166,7 +170,7 @@ clearer" mandate.
 
 ## 2. More efficient output
 
-### 2.1 `map`'s all-sections-every-call payload (the clearest, cheapest win)
+### 2.1 `map`'s all-sections-every-call payload (the clearest, cheapest win) — **implemented**
 
 **Evidence:** the free replay arm (`bench/replay/replay.sh`) measured
 this directly: `map --budget 400 --json` on carto's own repo is 6,874
@@ -227,7 +231,7 @@ not structural.
 
 ## 3. Stricter usage instructions
 
-### 3.1 The skill file should name carto's specific known gaps, not just its capabilities
+### 3.1 The skill file should name carto's specific known gaps, not just its capabilities — **implemented**
 
 **Evidence:** `skill/carto.skill.md`'s current "What carto does not do"
 section is generic ("some call shapes... aren't captured at all, by
@@ -260,7 +264,7 @@ no code, no re-test of gates.sh) and the evidence most directly supports
 it: it formalizes a behavior already observed working, rather than
 asking for new behavior.
 
-### 3.2 Encourage blended answers, not either/or
+### 3.2 Encourage blended answers, not either/or — **implemented**
 
 **Evidence:** every task graded "correct" for the carto arm in Category
 T did so by combining carto's tool output with source verification, not
@@ -311,25 +315,32 @@ showed, not from the original hypothesis:
    re-running S-1 against the same 8 tasks before deciding whether M3
    proceeds — not re-arguing the case from this document alone.
 
-## Suggested slice order (not yet approved — for discussion)
+## Suggested slice order (steps 0–4 implemented; step 5 pending)
 
 0. §0 (`cli` benchmark arm) — **implemented** (`bench/run.sh`, `bench/
    score.py`, `bench/cli-arm-prompt.md`), smoke-tested, not yet run as a
    full batch. Runs alongside the next full measurement (step 5), not as
    a separate pass.
 1. §1.1 (honest absence signal on `deps`) + §3.1 (skill file known-gaps
-   section) together — cheapest, highest-evidence, no new dependencies,
-   directly targets T6's failure mode.
-2. §2.1 (`map --section`) — cheap, clear token-efficiency win, additive
-   API change.
-3. §1.2 (`Module`-node discovery) — small, closes L3's "correct answer
-   is architecturally unreachable" gap.
-4. §1.3 (group-import extraction) — the largest single item here; scope
-   to Rust `use_list` first (the demonstrated case), decide on other
-   languages after checking whether they share the failure mode.
-5. Re-run `bench/run.sh` against the same 8 tasks, now with all three
-   arms (grep, cli, carto-MCP). Compare against this session's
-   `bench/results/20260803T112447/` baseline (grep/carto only) before
-   deciding on M3 — and let the cli-vs-MCP numbers from this run decide
-   which surface `skill/carto.skill.md`/README lead with, rather than
-   this document's own reasoning in §0.
+   section) together — **implemented** (ADR-0020; skill-file wording
+   commit). Cheapest, highest-evidence, no new dependencies, directly
+   targets T6's failure mode.
+2. §2.1 (`map --section`) — **implemented**. Cheap, clear
+   token-efficiency win, additive API change.
+3. §1.2 (`Module`-node discovery) — **implemented** (ADR-0021, alongside
+   §1.4's same-file caller flag). Closes L3's "correct answer is
+   architecturally unreachable" gap.
+4. §1.3 (group-import extraction) — **implemented for Rust** (ADR-0022),
+   the largest single item here. Scoped to Rust `use_list` as planned;
+   the cross-language check (Python/TS-JS/PHP/C#) was done rather than
+   deferred — none of the other four extractors shared the failure mode,
+   so no further language-specific work followed from it.
+5. **Not yet run.** Re-run `bench/run.sh` against the same 8 tasks, now
+   with all three arms (grep, cli, carto-MCP) and steps 0–4's changes in
+   place. Compare against this session's `bench/results/20260803T112447/`
+   baseline (grep/carto only) before deciding on M3 — and let the
+   cli-vs-MCP numbers from this run decide which surface `skill/
+   carto.skill.md`/README lead with, rather than this document's own
+   reasoning in §0. This is a separate measurement round the user
+   approves independently, per spec §11.4 — implementing steps 0–4 does
+   not itself decide the M3 go/no-go question.

@@ -113,7 +113,12 @@ walk ──► lang::extract_and_resolve ──► Graph ──► graph::persis
 serde types over `&QueryGraph` — spec §7.1's "commands = MCP tools, same
 core functions" means these are also the MCP server's payloads, so their
 serde shape is a compatibility surface both front ends only render, not
-an internal detail either reshapes freely.
+an internal detail either reshapes freely. `find`'s `where` also
+matches `Module.path` now (`FindResult::module_matches`, a separate
+list from `SymbolMatch`), and `deps`'s target resolution matches
+`Module.path`/`File.path` in addition to a symbol name — ADR-0021;
+previously a `Module`/`File` node's blake3-hashed ID had no other
+reachable lookup path at all.
 
 - **`crates/carto-core`** — everything above; no clap, no rmcp, no I/O
   besides fs.
@@ -155,7 +160,15 @@ each file to its extractor by `Lang` (a small registry,
    deliberately modest: first-match-wins across tiers, `calls` edges
    are **always `inferred`, never `certain`**, and zero-or-multiple
    candidates produce **no edge**, recorded in the caller's
-   `unresolved_calls` instead. Missing honestly beats guessing. The
+   `unresolved_calls` instead. Missing honestly beats guessing — and
+   since ADR-0020, that honesty extends to *absence* on the inbound
+   side too: an extractor that deliberately never attempts a call shape
+   at all (`RawCallSite` vs. `ExtractOut::uncaptured_call_sites` —
+   Rust's path-qualified `Type::method()`/`module::func()` is the only
+   producer today) has those sites counted, not resolved, into
+   `SymbolNode::uncaptured_inbound_calls`, so `deps --dir in` can say
+   "N sites here spell this name in an unattempted shape" rather than
+   silently looking like the symbol has few callers. The
    tier-resolution logic itself is language-agnostic; only import
    handling (`RawImport::Relative`/`Absolute`/`Qualified`/`PackagePath`/
    `NamespaceImport`, spanning every language today) and each
@@ -184,7 +197,10 @@ each file to its extractor by `Lang` (a small registry,
 Adding a language means: a `.scm` query set, a `LangExtractor` impl
 (registered in `extractors()`), and an ADR mapping §5.3's generic rules
 onto that language's actual import/call semantics.
-[ADR-0008](docs/adr/0008-rust-resolution-policy-mapping.md) (Rust),
+[ADR-0008](docs/adr/0008-rust-resolution-policy-mapping.md) (Rust — its
+`use_list`/grouped-import exclusion was later narrowed by
+[ADR-0022](docs/adr/0022-rust-grouped-use-extraction.md); `use_wildcard`/
+`use_as_clause` remain excluded, unchanged),
 [ADR-0011](docs/adr/0011-python-resolution-policy-mapping.md) (Python),
 [ADR-0012](docs/adr/0012-php-resolution-policy-mapping.md) (PHP — also
 the ADR that added PHP to spec §5.2's v1 set),
