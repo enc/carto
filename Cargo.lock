@@ -128,6 +128,7 @@ version = "0.1.0"
 dependencies = [
  "assert_cmd",
  "carto-core",
+ "carto-mcp",
  "clap",
  "serde",
  "serde_json",
@@ -161,6 +162,15 @@ dependencies = [
  "tree-sitter-python",
  "tree-sitter-rust",
  "tree-sitter-typescript",
+]
+
+[[package]]
+name = "carto-mcp"
+version = "0.1.0"
+dependencies = [
+ "carto-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -1,6 +1,7 @@
 //! carto: bin target for the `carto` CLI. clap root, exit-code mapping
-//! (spec §9.2). `selfcheck` (M1.a), `index` (M1.b.1), and
-//! `where`/`deps`/`map` (M1.b.3) exist.
+//! (spec §9.2). `selfcheck` (M1.a), `index` (M1.b.1),
+//! `where`/`deps`/`map` (M1.b.3), and `serve` (the MCP stdio server,
+//! spec §7.3, mounted from `carto-mcp`) exist.
 
 mod deps_cmd;
 mod index;
@@ -38,6 +39,13 @@ enum Command {
     Deps(deps_cmd::DepsArgs),
     /// Layered overview, hard-capped at --budget lines (spec §7.1).
     Map(map_cmd::MapArgs),
+    /// Run the MCP stdio server (spec §7.3): newline-delimited JSON-RPC
+    /// on stdin/stdout, exposing `index`/`where`/`deps`/`map`/`selfcheck`
+    /// as tools — the same core functions this CLI's own subcommands
+    /// call. Runs until stdin closes (EOF). `--json` has no effect here;
+    /// the wire format is always JSON-RPC, never this CLI's human/--json
+    /// output split.
+    Serve,
 }
 
 fn main() {
@@ -77,6 +85,15 @@ fn run(cli: &Cli) -> carto_core::Result<u8> {
         Command::Map(args) => {
             let result = map_cmd::run(args)?;
             emit(cli.json, &result, || map_cmd::print_human(&result))?;
+        }
+        Command::Serve => {
+            // Own protocol, own framing — bypasses `emit`'s human/--json
+            // split entirely; the JSON-RPC wire format on stdout *is* the
+            // output for the whole lifetime of this command, not one
+            // summary printed at the end.
+            let stdin = std::io::stdin();
+            let stdout = std::io::stdout();
+            carto_mcp::serve(stdin.lock(), stdout.lock())?;
         }
     }
     Ok(0)

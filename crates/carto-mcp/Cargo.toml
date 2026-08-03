@@ -1,25 +1,16 @@
 [package]
-name = "carto-cli"
+name = "carto-mcp"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "carto: bin target `carto`; clap; human+json output."
-
-[[bin]]
-name = "carto"
-path = "src/main.rs"
+description = "carto: MCP stdio server library, mounted by carto-cli's `serve` command. Hand-rolled JSON-RPC 2.0 over stdio (docs/adr/0018) — no rmcp, no async runtime."
 
 [lints]
 workspace = true
 
 [dependencies]
 carto-core = { path = "../carto-core", version = "0.1.0" }
-carto-mcp = { path = "../carto-mcp", version = "0.1.0" }
-clap = { version = "4.6", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-
-[dev-dependencies]
-assert_cmd = "2.2"
