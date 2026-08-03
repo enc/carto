@@ -1,0 +1,24 @@
+This is a plain-text function (defined in `crates/util/src/util.rs:58`), and every call site is a direct, syntactically unambiguous invocation — grep found all of them and each is verifiable by reading the surrounding line, so I'd treat this whole list as **certain** confidence, not inferred. There are 18 actual call sites (excluding the definition, its test, and `use` import lines) across 12 files:
+
+| File:Line | Call |
+|---|---|
+| `activity_indicator/src/activity_indicator.rs:579` | `truncate_and_trailoff(...)` |
+| `activity_indicator/src/activity_indicator.rs:668` | `truncate_and_trailoff(&content.message, MAX_MESSAGE_LEN)` |
+| `agent_ui/src/conversation_view/thread_view.rs:1461` | `util::truncate_and_trailoff(text, 200)` |
+| `search/src/project_search.rs:661` | `util::truncate_and_trailoff(&query, MAX_TAB_TITLE_LEN)` |
+| `debugger_ui/src/dropdown_menus.rs:35` | `truncate_and_trailoff(&label, MAX_LABEL_CHARS)` |
+| `debugger_ui/src/dropdown_menus.rs:83` | `truncate_and_trailoff(&label.into(), MAX_LABEL_CHARS)` |
+| `debugger_ui/src/dropdown_menus.rs:315` | `truncate_and_trailoff(&entry_name, MAX_LABEL_CHARS)` |
+| `title_bar/src/title_bar.rs:730` | `util::truncate_and_trailoff(name, MAX_PROJECT_NAME_LENGTH)` |
+| `title_bar/src/title_bar.rs:878` | `util::truncate_and_trailoff(name, MAX_BRANCH_NAME_LENGTH)` |
+| `terminal/src/terminal.rs:2162` | `truncate_and_trailoff(&task_state.spawned_task.label, MAX_CHARS)` |
+| `terminal/src/terminal.rs:2195-2196` | `truncate_and_trailoff(&process_file/&process_name, MAX_CHARS)` (x2) |
+| `editor/src/items.rs:770` | `util::truncate_and_trailoff(description, MAX_TAB_TITLE_LEN)` |
+| `editor/src/items.rs:784` | `util::truncate_and_trailoff(...)` |
+| `tasks_ui/src/modal.rs:529` | `truncate_and_trailoff(...)` |
+| `agent/src/tools/update_title_tool.rs:96` | `util::truncate_and_trailoff(title, MAX_TITLE_LEN)` |
+| `git_ui/src/picker_prompt.rs:220` | `util::truncate_and_trailoff(&hit.string, self.max_match_length)` |
+| `git_ui/src/commit_view.rs:935` | `truncate_and_trailoff(self.commit.message.split('\n').next().unwrap(), 20)` |
+| `git_ui/src/blame_ui.rs:44` | `util::truncate_and_trailoff(author_name, GIT_BLAME_MAX_AUTHOR_CHARS_DISPLAYED)` |
+
+No overloading, trait dispatch, or macro indirection is involved (it's a single free function in `util`), so there's no ambiguity to worry about — this is as close to ground truth as static analysis gets, carto or not.

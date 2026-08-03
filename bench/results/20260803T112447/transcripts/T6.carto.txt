@@ -1,0 +1,13 @@
+`graph::load` (`crates/carto-core/src/graph/load.rs:23`, `pub fn load(out_root: &Path) -> Result<GraphDocument>`) has 6 real call sites, all consuming `doc = graph::load(...)?`:
+
+**carto-cli** (`crates/carto-cli/src/`):
+- `deps_cmd.rs:72`
+- `where_cmd.rs:47`
+- `map_cmd.rs:41`
+
+**carto-mcp** (`crates/carto-mcp/src/tools/`):
+- `deps_tool.rs:66`
+- `where_tool.rs:43`
+- `map_tool.rs:35`
+
+Note: carto's own `deps` graph only surfaces same-file calls and the `load.rs`→`graph/mod.rs`→`lib.rs` module-declaration chain — it doesn't show these 6 sites because they're module-qualified calls (`graph::load(...)`), a call shape the Rust extractor doesn't capture (per CLAUDE.md/ADR notes). I confirmed the real callers with a grep instead. If the signature changes, also check each call site's error handling — the CLI sites propagate with `?` while the MCP sites additionally `.map_err(|e| e.to_string())`, so a changed `Result` error type or added parameter touches both patterns.

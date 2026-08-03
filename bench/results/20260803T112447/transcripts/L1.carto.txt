@@ -1,0 +1,68 @@
+I have enough to give a solid structural orientation.
+
+## Zed — structural orientation
+
+**Shape:** A Cargo **workspace** (`resolver = "2"`) with **236 member crates** under `crates/`, plus a separate `extensions/` directory for bundled extensions. ~1,792 Rust source files, ~4,000 tracked files total. This is the [zed-industries/zed](https://github.com/zed-industries/zed) editor repo — not a single-crate project.
+
+**Top-level layout:**
+- `crates/` — all Rust code (the app itself)
+- `extensions/` — bundled/first-party extensions
+- `docs/` — mdBook documentation site source
+- `script/`, `tooling/`, `ci/`, `nix/` — build/dev tooling
+- `assets/` — icons, themes, fonts, keymaps
+
+### Main architectural pieces
+
+**1. UI framework (foundation layer)**
+- `gpui` — the custom GPU-accelerated, hybrid immediate/retained-mode UI framework everything is built on (windows, entities, async tasks, rendering). Platform backends split out into `gpui_macos`, `gpui_linux`, `gpui_windows`, `gpui_wgpu`, `gpui_web`.
+- `ui`, `ui_input`, `theme`, `theme_settings` — design-system components and theming built atop gpui.
+
+**2. Editor core**
+- `editor` — the text editing widget itself (selections, multi-cursor, folds, inlays, etc.)
+- `text`, `rope`, `sum_tree`, `multi_buffer` — the underlying buffer/rope data structures (CRDT-ish text representation).
+- `language`, `language_core`, `languages` — language configuration, syntax highlighting (via `grammars`, tree-sitter), and per-language definitions.
+- `lsp` — Language Server Protocol client.
+- `syntax_theme`, `markdown` — supporting rendering pieces.
+
+**3. Project/workspace management**
+- `project` — the model of a project: files, buffers, LSP coordination, search, diagnostics.
+- `worktree` — filesystem watching/indexing for a project root.
+- `workspace` — the window/pane/tab management shell that hosts editors and panels.
+- `fs` — filesystem abstraction (local + remote).
+
+**4. Remote & collaboration**
+- `remote`, `remote_server`, `remote_connection` — SSH-based remote development (run Zed's backend on a remote host).
+- `rpc`, `proto` — the wire protocol (protobuf-based) shared between client and collab server.
+- `collab` — the actual collaboration backend server (what runs at collab.zed.dev), plus `collab_ui`, `call`, `channel`, `livekit_client`/`livekit_api` for voice/screen-share.
+- `client` — client-side connection to Zed's cloud services.
+
+**5. AI / agent features**
+- `agent`, `agent_ui`, `agent_servers`, `agent_settings`, `agent_skills` — the agentic assistant panel and orchestration.
+- `acp_thread`, `acp_tools` — Agent Client Protocol support.
+- Model provider crates: `anthropic`, `open_ai`, `google_ai`, `bedrock`, `ollama`, `mistral`, `deepseek`, `x_ai`, `open_router`, `lmstudio`, `copilot`/`copilot_chat`, `codestral` — each wraps a specific LLM API.
+- `language_model`, `language_models`, `language_models_cloud` — the abstraction layer unifying providers.
+- `edit_prediction*` — Zeta-style inline edit prediction (Zed's AI autocomplete).
+- `context_server` — MCP-style context server integration.
+- `prompt_store`, `rules_library` — prompt/rules management for the agent.
+
+**6. Extensibility**
+- `extension`, `extension_api`, `extension_host`, `extension_cli`, `extensions_ui` — WASM-based extension system (grammars, language servers, themes, slash commands are pluggable).
+- `dap`, `dap_adapters`, `debugger_ui`, `debug_adapter_extension` — Debug Adapter Protocol support.
+
+**7. Terminal, VCS, misc panels**
+- `terminal`, `terminal_view` — embedded terminal (built on `alacritty_terminal` under the hood, not a workspace member).
+- `git`, `git_ui`, `git_graph`, `git_hosting_providers` — git integration.
+- `vim`, `vim_mode_setting` — Vim emulation.
+- `outline_panel`, `project_panel`, `file_finder`, `tab_switcher`, `search`, `diagnostics`, `tasks_ui`, `debugger_tools` — various IDE panels/pickers.
+
+**8. App shell / settings / persistence**
+- `zed` — the final binary crate; wires together essentially all of the above.
+- `settings`, `settings_content`, `settings_ui`, `settings_json` — layered settings system.
+- `db`, `sqlez`, `sqlez_macros` — local SQLite persistence.
+- `release_channel`, `auto_update`, `feature_flags` — release/update machinery.
+- `zlog`, `telemetry`, `telemetry_events` — logging/telemetry.
+
+### How to read the dependency direction
+Roughly layered: **gpui** (UI substrate) → **text/rope/language/lsp** (editing primitives) → **project/worktree/fs** (project model) → **workspace** (window shell) → feature crates (`editor`, `terminal_view`, `agent_ui`, `git_ui`, panels, etc.) → **zed** (binary that assembles everything into the app). Collaboration (`collab`, `rpc`, `proto`) and remote development (`remote*`) are separate axes that cut across this, providing networked/remote variants of the same primitives.
+
+Note: `carto` (the structural-graph MCP tool) wasn't connected in this session, so this is based on Cargo workspace metadata, `git ls-files`, and crate READMEs rather than a call-graph traversal — happy to go deeper into any specific area (e.g. how `agent` talks to `language_model`, or the `gpui` entity/context system) if useful.

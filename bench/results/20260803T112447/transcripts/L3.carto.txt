@@ -1,0 +1,9 @@
+21 Rust files import from `carto_core` (via `use carto_core...` or `carto_core::` paths):
+
+**`carto-cli`** (5): `main.rs`, `index.rs`, `where_cmd.rs`, `map_cmd.rs`, `deps_cmd.rs`, `selfcheck.rs` — actually 6.
+
+**`carto-mcp`** (8): `lib.rs`, `server.rs`, `render.rs`, `tools/mod.rs`, `tools/where_tool.rs`, `tools/map_tool.rs`, `tools/index_tool.rs`, `tools/deps_tool.rs`, `tools/selfcheck_tool.rs`.
+
+**`carto-core` UI compile-fail tests** (6, under `crates/carto-core/tests/ui/`): `no_display.rs`, `no_display_via_query_result.rs`, `no_field_access.rs`, `no_deref.rs`, `no_as_ref_str.rs`, `no_into_string.rs` — these import their own crate's types to verify the `TaintedString` trybuild guarantees (INV-5).
+
+`carto-grammars` has no dependency on `carto-core`. (A broader grep also turned up non-code mentions of "carto_core" in `docs/`, `bench/`, and `CLAUDE.md` — those are prose references, not imports.)

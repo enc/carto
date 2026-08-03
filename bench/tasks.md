@@ -187,14 +187,26 @@ crates/carto-mcp/src/tools/selfcheck_tool.rs
 crates/carto-mcp/src/tools/where_tool.rs
 ```
 
-**18 files.**
+**18 files by this grep.** (**Further correction, found grading the
+real-run batch, not repeated here**: this `^use` pattern itself
+undercounts by one — `crates/carto-cli/src/main.rs` references
+`carto_core::` only via fully-qualified inline paths, e.g.
+`carto_core::Result<u8>`, never a `use` statement, and both real
+sessions' answers correctly caught it. True total: 19. Full accounting
+in `bench/results/20260803T112447/GRADES.md`'s L3 section, including a
+second, opposite-direction correction: `carto-mcp/src/lib.rs` and
+`carto-mcp/src/tools/mod.rs` mention `carto_core::` only inside `//!`
+doc comments, not real code — both real sessions incorrectly counted
+these as importers too, landing on 21, not 19. Left as originally
+written below since the tool-reachability finding it documents is
+unaffected by the exact total.)
 
 **Carto's actual answer** (`carto deps <carto_core-module-id> --dir in`
 — the external `Module` node for the whole crate; `where` can't find it
 directly since it only searches `Symbol` nodes, a separately-documented
-limitation): **11 of the 18**, missing exactly 7:
-`carto-cli/src/selfcheck.rs`, all 5 `tests/ui/*.rs` files, and
-`carto-mcp/src/tools/map_tool.rs`.
+limitation): **11 of the 18** in this section's own (slightly
+undercounted) list, missing exactly 7: `carto-cli/src/selfcheck.rs`, all
+5 `tests/ui/*.rs` files, and `carto-mcp/src/tools/map_tool.rs`.
 
 **Root cause, isolated with a minimal reproduction** (a one-file crate
 with a single `use carto_core::query::{self, MapQuery, QueryGraph};`

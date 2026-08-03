@@ -1,0 +1,11 @@
+This is a 4-crate Cargo workspace with exactly one binary:
+
+**Binary**
+- `carto` — `crates/carto-cli/src/main.rs`, the only `[[bin]]` in the workspace. Thin dispatch (`run(cli) -> Result<u8>`), mounts the MCP server behind `carto serve`.
+
+**Library crate roots** (all `src/lib.rs`)
+- `crates/carto-core` — repo walk, graph store, invariant types (`TaintedString`, `PathGuard`), language extraction/resolution. No clap, no rmcp, no I/O besides fs.
+- `crates/carto-mcp` — hand-rolled MCP stdio server (JSON-RPC 2.0 over stdio), depends only on `carto-core`; mounted by `carto-cli`'s `serve` subcommand.
+- `crates/carto-grammars` — tree-sitter grammar loading; the workspace's one `unsafe_code`-allowed crate (isolated FFI surface for the native grammar crates).
+
+Dependency direction: `carto-cli` → `carto-mcp` + `carto-core`; `carto-mcp` → `carto-core`; `carto-core` → `carto-grammars`. So `carto-cli/src/main.rs` is the single real entry point at the process level, with `carto-core` as the actual logic root everything else wraps.

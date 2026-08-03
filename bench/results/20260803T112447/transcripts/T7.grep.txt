@@ -1,0 +1,19 @@
+`truncate_and_trailoff` is defined at `crates/util/src/util.rs:58` and carries one invariant worth tracking: `debug_assert!(max_chars >= 5)`. In debug/test builds, calling it with `max_chars < 5` panics; in release the `debug_assert!` is stripped, so it just degrades to `"…"`. Otherwise the implementation is char-boundary-safe (no indexing panics).
+
+**Callers, by confidence:**
+
+High confidence — `max_chars` is a hardcoded constant that's always safely ≥ 5, no way to violate the invariant:
+- `activity_indicator.rs:668` (`MAX_MESSAGE_LEN = 50`)
+- `agent_ui/conversation_view/thread_view.rs:1461` (literal `200`)
+- `debugger_ui/dropdown_menus.rs:35,83,315` (`MAX_LABEL_CHARS = 150 / 50 / 150`)
+- `tasks_ui/modal.rs:529` (`MAX_TAGS_LINE_LEN = 30`)
+- `terminal.rs:2162,2195,2196` (`MAX_CHARS = 25`)
+- `title_bar.rs:730,878` (`MAX_PROJECT_NAME_LENGTH` / `MAX_BRANCH_NAME_LENGTH = 40`)
+- `search/project_search.rs:661` and `editor/items.rs:770,784` (`MAX_TAB_TITLE_LEN = 24`)
+- `agent/tools/update_title_tool.rs:96` (`MAX_TITLE_LEN = 200`)
+- `git_ui/blame_ui.rs:44` (literal `20`)
+- `git_ui/commit_view.rs:935` (literal `20`; the adjacent `.unwrap()` on `split('\n').next()` is also safe since `split` always yields at least one item)
+- `git_ui/picker_prompt.rs:220` (`max_match_length` is a struct field, but its only construction site passes a literal `70`)
+
+Low confidence — one real latent bug:
+- `activity_indicator.rs:579-581`: `truncate_and_trailoff(&single_line_message, MAX_MESSAGE_LEN.saturating_sub(health_str.len()))`. `health_str` is built as `format!("({server_name}) Warning: ")` from an **unbounded** language-server name. If `health_str.len()` gets within 5 of 50 (or exceeds it), the computed `max_chars` drops below 5 (or to 0 via saturation), violating the debug_assert. Since server names aren't length-limited (extensions can register arbitrarily-named LSPs), this can panic in debug/test builds and silently mis-truncate in release. This is the one call site I wouldn't trust without a fix (e.g. clamping with `.max(5)`).

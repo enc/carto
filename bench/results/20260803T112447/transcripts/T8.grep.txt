@@ -1,0 +1,12 @@
+`carto_core::indexer::build_and_persist` (crates/carto-core/src/indexer.rs:36-77) directly calls/depends on:
+
+- **`pathguard::PathGuard::new`** — constructs the write-confinement guard (INV-3/INV-4) from `repo_root`/`out_root`/`allow_writes_in_repo`.
+- **`walk::walk`** — walks `repo_root` respecting `.gitignore` per the `respect_gitignore` flag, producing `walked.nodes` (File nodes), `walked.ignore_rule_digest`, and `walked.file_sha256`.
+- **`lang::extract_and_resolve`** — runs the two-phase extract+resolve over the walked file nodes, producing `resolved.nodes`/`resolved.edges`.
+- **`graph::Graph`** — builds the in-memory graph via `Graph::new()`, `insert_node()`, `insert_edge()`.
+- **`gitinfo::head_sha`** — reads the repo's current commit SHA for the manifest.
+- **`graph::PersistMeta`** — struct bundling `commit_sha`, `ignore_rule_digest`, and `file_sha256` for persistence.
+- **`graph::persist`** — the sole write choke-point (sort → redact → validate → size caps → atomic write through `PathGuard`), returning the `manifest` used to build the result.
+- Its own return type **`IndexReport`** (serialized via `serde::Serialize`), and standard library `Path`/`PathBuf`, plus `crate::error::Result`.
+
+No direct dependency on `query`, `carto-cli`, or `carto-mcp` — this function is the shared core both front ends call into.

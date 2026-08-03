@@ -1,0 +1,34 @@
+That's just the crate's own package name, not a self-dependency — so it doesn't count.
+
+**21 Rust source files actually import (`use carto_core::…`) the crate:**
+
+`carto-cli` (6):
+- `crates/carto-cli/src/main.rs`
+- `crates/carto-cli/src/index.rs`
+- `crates/carto-cli/src/where_cmd.rs`
+- `crates/carto-cli/src/map_cmd.rs`
+- `crates/carto-cli/src/deps_cmd.rs`
+- `crates/carto-cli/src/selfcheck.rs`
+
+`carto-mcp` (9):
+- `crates/carto-mcp/src/lib.rs`
+- `crates/carto-mcp/src/server.rs`
+- `crates/carto-mcp/src/render.rs`
+- `crates/carto-mcp/src/tools/mod.rs`
+- `crates/carto-mcp/src/tools/where_tool.rs`
+- `crates/carto-mcp/src/tools/map_tool.rs`
+- `crates/carto-mcp/src/tools/index_tool.rs`
+- `crates/carto-mcp/src/tools/deps_tool.rs`
+- `crates/carto-mcp/src/tools/selfcheck_tool.rs`
+
+`carto-core`'s own `trybuild` UI test fixtures (6, INV-5 compile-fail suite):
+- `crates/carto-core/tests/ui/no_display.rs`
+- `crates/carto-core/tests/ui/no_display_via_query_result.rs`
+- `crates/carto-core/tests/ui/no_field_access.rs`
+- `crates/carto-core/tests/ui/no_deref.rs`
+- `crates/carto-core/tests/ui/no_as_ref_str.rs`
+- `crates/carto-core/tests/ui/no_into_string.rs`
+
+Correspondingly, `carto_core` is declared as a Cargo dependency in `crates/carto-cli/Cargo.toml` and `crates/carto-mcp/Cargo.toml` (plus the workspace root `Cargo.toml`).
+
+The other files matched in the raw grep (bench scripts/docs, `CLAUDE.md`, `docs/STATUS.md`, `docs/carto-design-spec.md`, ADR-0018) just *mention* `carto_core`/`carto-core` in prose, not Rust `use` imports.

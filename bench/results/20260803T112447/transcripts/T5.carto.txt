@@ -1,0 +1,6 @@
+Two direct call sites in production code, both a helper named `capped` that wraps a symbol's signature for display:
+
+- `crates/carto-cli/src/where_cmd.rs:90` — `capped()` used by the CLI's `where` renderer
+- `crates/carto-mcp/src/tools/where_tool.rs:95` — `capped()` used by the MCP `where` tool's renderer
+
+Both truncate a symbol's `TaintedString` signature to `consts::SIGNATURE_CAP` before rendering. No other production call sites (e.g. in `deps`/`map` rendering) call `render_capped` directly — the other matches are in `taint.rs` (the method definition itself), `redact/*` (unrelated, uses `render_fenced`/pattern scanning, not this method), docs/ADRs, and bench files.

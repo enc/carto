@@ -168,6 +168,22 @@ def main() -> int:
         print("This is ONE trial per task-arm cell — treat as directional, "
               "not a confidence interval, per bench/tasks.md's own caveat.")
 
+    grade_weight = {"correct": 1.0, "partial": 0.5, "wrong": 0.0}
+    for arm in ARMS:
+        graded = [grades.get(t, {}).get(arm) for t in TASKS]
+        graded = [g for g in graded if g in grade_weight]
+        if graded:
+            score = sum(grade_weight[g] for g in graded) / len(graded) * 100
+            print(f"S-1 accuracy ({arm}): {score:.1f}% ({len(graded)}/{len(TASKS)} tasks graded)")
+    grep_graded = [grades.get(t, {}).get("grep") for t in TASKS]
+    carto_graded = [grades.get(t, {}).get("carto") for t in TASKS]
+    if all(g in grade_weight for g in grep_graded) and all(g in grade_weight for g in carto_graded):
+        grep_score = sum(grade_weight[g] for g in grep_graded) / len(TASKS) * 100
+        carto_score = sum(grade_weight[g] for g in carto_graded) / len(TASKS) * 100
+        acc_pct = carto_score - grep_score
+        print(f"S-1 accuracy check: carto is {acc_pct:+.1f} points vs. grep-only "
+              f"(threshold: ≥20% higher, i.e. pct ≥ 20).")
+
     n_graded = sum(1 for t in TASKS for a in ARMS if grades.get(t, {}).get(a))
     if n_graded == 0:
         print(

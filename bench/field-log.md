@@ -232,3 +232,129 @@ as clean as `--bare` would have been — CLAUDE.md/hook auto-discovery
 isn't as provably absent as it would be under `--bare`, an accepted,
 user-confirmed caveat on every real-run number that follows, not a
 silent substitution.
+
+## 2026-08-03 — Part B: the real-run arm's first full batch, half-invalidated, and why
+
+Ran the full 16-session batch under the setup above. `score.py` reported
+a real headline number (carto used ~12% *more* combined input tokens
+than grep overall) — but reading every session's actual answer text
+before trusting that number caught something more serious than "S-1
+failed": **5 of the 8 tasks (L3, L4, T5, T6, T8 — every task using
+carto's own repo as corpus) failed completely on *both* arms.** Both
+grep and carto sessions reported the working directory as empty ("no
+Cargo project here at all"), some carto-arm sessions additionally
+reported the MCP server "isn't connected in this session," and every
+one of these sessions finished in 2–4 turns with zero permission
+denials — meaning the model didn't even attempt to explore the given
+path, not that it tried and got blocked.
+
+Root cause, confirmed with cheap (non-benchmark) diagnostic sessions
+before touching the real batch again: `bench/run.sh` invoked every
+session from a neutral `mktemp` directory and communicated the target
+repo only as a path *string* inside the prompt text — never via `cd`,
+never via `--add-dir`. Claude Code's filesystem tools (Read/Glob/Grep,
+and the permission layer even Bash goes through) are scoped to the
+session's actual working directory; a path mentioned in prose carries no
+access grant. This *happened* to work for zed in the first run — some
+tool calls used a bare `find /path/to/zed/...` that the model chose to
+issue with an absolute path baked into the command, which apparently
+sailed through — while for carto's own repo, the sessions never
+attempted the equivalent and simply reported nothing there. (`--add-dir`
+would have been the documented fix, but it's a variadic flag —
+`--add-dir <directories...>` — and swallows a following positional
+prompt argument whole if not carefully ordered; confirmed this exact
+failure mode with a diagnostic session too, before choosing the simpler
+fix.)
+
+**Fix:** run each session with cwd set to the actual corpus directory
+(`cd "$corpus" && claude -p ...`), dropping the neutral-tempdir
+indirection entirely. Verified with one cheap diagnostic (L3's grep
+arm, $0.11) before re-running the full paid batch: the same prompt that
+previously produced "no repo here" now correctly listed 21 real files
+importing from `carto_core`, in two turns, zero denials.
+
+**Cost of the mistake:** the first full batch cost $1.51 and is
+unusable for 5 of 8 tasks; combined with the earlier `--safe-mode`
+dead-end ($0.68), this session spent roughly $2.20 discovering harness
+bugs before getting a trustworthy setup. Surfaced to the user before
+spending on the re-run — see this repo's commit history for the
+check-in — rather than silently absorbing the cost or, worse, reporting
+the broken batch's numbers as if they were valid. The fixed batch's
+real results are in `bench/results/<timestamp>/` (the invalidated batch
+was deleted, not committed — `bench/results/` was never tracked by
+git).
+
+## 2026-08-03 — Part B: the fixed batch's real results, one more flake, and the final numbers
+
+Re-ran all 16 sessions under the cwd fix. One more isolated issue
+surfaced immediately, checked before trusting anything else: **L1's
+carto-arm session again reported the MCP server "wasn't connected in
+this session"** — its answer was accurate (drawn from `git ls-files`/
+`Cargo.toml` reading instead) but wasn't actually exercising carto at
+all, which would have silently mis-measured the one task most likely to
+show carto's real value (whole-repo orientation). Confirmed this was an
+isolated flake, not systemic, by checking all 8 carto-arm transcripts for
+the same "not connected" language — only L1 showed it. Re-ran L1's carto
+arm alone ($0.16, cheap given it's an isolated single-session fix): this
+time the MCP tools connected correctly and the answer cited exact
+figures straight from `map`'s output ("3,754 source files, ~54,554
+symbols, 330 modules — per carto's index"), matching Part 0's
+independently-measured numbers exactly.
+
+Every one of the 16 final sessions' actual answer text was read and
+graded against `bench/tasks.md`'s ground truth — see
+`bench/results/20260803T112447/GRADES.md` for the full per-task
+reasoning. Grading itself surfaced one more correction: L3's own ground
+truth (18 files, from an earlier `rg -l "^use carto_core::"` pass) was
+*also* wrong — missing `main.rs` (which references `carto_core::` only
+via fully-qualified inline paths, never a `use` statement). Both real
+sessions independently said 21, which led to finding the true count is
+**19**: both sessions share 2 identical false positives
+(`carto-mcp/src/lib.rs` and `tools/mod.rs`, which mention `carto_core::`
+only inside `//!` doc comments) — the exact prose-vs-code confusion this
+task's very first draft predicted as a risk, just landing on both arms
+equally rather than singling out either one.
+
+**Final numbers** (`bench/score.py bench/results/20260803T112447/`,
+`GRADES.json`):
+
+| | grep-only | carto | S-1 threshold | met? |
+|---|---:|---:|---|---|
+| combined input tokens | 1,323,356 | 1,329,234 | carto ≥30% fewer | **no** — carto uses 18.0% *more* |
+| accuracy | 93.8% (7.5/8) | 87.5% (7/8) | carto ≥20 points higher | **no** — carto is 6.2 points *lower* |
+| total real cost | $1.43 | $1.20 | — | carto ~16% cheaper in dollars despite more tokens (cheaper cache-read pricing) |
+
+**Neither S-1 threshold is met, on this one-trial measurement.** But the
+per-task pattern underneath that headline is more informative than the
+headline itself:
+
+- **3 of 8 tasks are clean carto wins on tokens** (L1: 9,327 vs. 36,084
+  — a 74% reduction; T5: 10,226 vs. 13,658; T7: 14,693 vs. 19,558), and
+  L1's margin alone is large enough that a slightly different task mix
+  could flip the aggregate sign entirely — this is exactly the "one
+  trial per cell, don't over-read the aggregate" caveat `bench/tasks.md`
+  built in from the start, demonstrated with real numbers rather than
+  asserted in the abstract.
+- **The single accuracy loss (T5) has a specific, legible cause**: the
+  agent read carto's own tool output *incompletely* (missed 2 of 4 real
+  callers, including misreading one as "the definition itself" rather
+  than a separate call site in the same file) — not a case where carto's
+  underlying data was wrong. `bench/tasks.md`'s own earlier verification
+  of `deps render_capped --dir in --depth 1` confirmed all 4 real callers
+  *are* present in carto's actual output at that exact query.
+- **The three hardest transitive tasks (T6, T7, T8) are all correct for
+  carto — via an honest, repeatedly-observed fallback pattern**: each
+  transcript explicitly states that carto's own tool has a known,
+  named limitation on that specific call shape (path-qualified Rust
+  calls, ADR-0008) and falls back to reading source directly, landing on
+  the fully correct answer rather than reporting carto's incomplete data
+  as if it were the whole picture. This is the single most encouraging
+  qualitative finding in the whole exercise: an agent with both tool
+  sets available used carto when it helped and correctly stopped relying
+  on it when it didn't, rather than trusting a tool's confident-looking
+  but incomplete answer.
+- **L3's outcome says something about the skill file, not carto's data**:
+  both arms made the identical doc-comment-vs-code-import mistake,
+  independent of which tools were available — a prompt/skill wording
+  issue (or just an inherent ambiguity in "imports from a crate") more
+  than a carto-specific one.

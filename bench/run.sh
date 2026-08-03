@@ -8,14 +8,27 @@
 # Auth note: `--bare` (the cleanest isolation — no CLAUDE.md/hook/plugin
 # auto-discovery) requires ANTHROPIC_API_KEY, which isn't set in the
 # environment this was built in. Runs instead under normal session auth,
-# invoked from a neutral cwd (this script's own tempdir, not inside
-# either target repo) specifically to avoid triggering carto's own
-# elaborate CLAUDE.md via directory walk-up, and with `--strict-mcp-config`
-# on BOTH arms (the grep arm gets an empty MCP config) so MCP-server
-# exposure is at least cleanly controlled even though CLAUDE.md/hook
-# isolation isn't as complete as --bare would give. Flagged here, and
-# again in every results writeup, as a real methodology caveat — not
-# silently treated as equivalent to --bare.
+# with `--strict-mcp-config` on BOTH arms (the grep arm gets an empty MCP
+# config) so MCP-server exposure is at least cleanly controlled even
+# though CLAUDE.md/hook isolation isn't as complete as --bare would give.
+# Flagged here, and again in every results writeup, as a real methodology
+# caveat — not silently treated as equivalent to --bare.
+#
+# Working-directory note (fixed after a real, disclosed failure): the
+# first version of this script ran every session from a neutral tempdir
+# and pointed at the target repo only via prompt text. That's not enough
+# — Claude Code's filesystem tools (Read/Glob/Grep, and even Bash's own
+# access) are scoped to the session's cwd; a path outside it needs
+# `--add-dir` (which has to be ordered carefully, since it's variadic and
+# will otherwise swallow a following positional prompt argument — simpler
+# to avoid entirely here) or the session has to actually run *from*
+# that directory. It worked by accident for zed in the first run (the
+# model happened to `cd` there inside Bash before reading) and failed
+# completely for carto's own repo (both arms reported an empty
+# directory, invalidating those results) — see bench/field-log.md's
+# entry on this. Fixed by setting each session's cwd to the real corpus
+# directly, confirmed working in a standalone diagnostic before
+# re-running the full batch.
 set -euo pipefail
 
 CARTO_REPO="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
@@ -75,14 +88,16 @@ CORPUS[T8]="$CARTO_REPO"
 run_session() {
   local task="$1" arm="$2" corpus="$3" prompt="$4"
   local out="$RESULTS_DIR/$task.$arm.json"
-  local full_prompt="Repository to answer this about: $corpus
+  local full_prompt="Repository to answer this about: $corpus (this is also the session's current directory).
 
 $prompt"
 
   echo "== $task/$arm ==" >&2
-  # Run from RUN_DIR (neutral cwd), not inside either target repo.
+  # Run with cwd = the actual corpus (not RUN_DIR) — see this script's
+  # own header comment for why a neutral cwd silently broke every
+  # carto-repo task in the first version of this harness.
   (
-    cd "$RUN_DIR"
+    cd "$corpus"
     if [ "$arm" = "carto" ]; then
       claude -p \
         --mcp-config "$RUN_DIR/mcp-config.json" \

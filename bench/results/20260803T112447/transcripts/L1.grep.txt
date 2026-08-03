@@ -1,0 +1,43 @@
+This is Zed, the code editor. Here's the structural orientation:
+
+## Workspace
+A large Cargo **workspace**, not a single crate — 236 member crates under `crates/`, ~1.34M lines of Rust. `crates/zed` is the top-level binary crate that assembles everything into the app (`main`, feature flags like `tracy`, `track-project-leak`).
+
+## Main architectural pieces
+
+**Foundation / UI framework**
+- `gpui`, `gpui_macros`, plus platform backends `gpui_macos`, `gpui_linux`, `gpui_windows`, `gpui_web`, `gpui_wgpu` — Zed's own GPU-accelerated, immediate-ish UI framework (entities, contexts, elements — matches the GPUI conventions in this repo's CLAUDE.md).
+- `ui`, `ui_macros`, `ui_input`, `theme`, `theme_settings`, `icons` — design-system/component layer built on gpui.
+
+**Text & editing core**
+- `text`, `rope`, `sum_tree` — low-level text storage/data structures.
+- `buffer_diff`, `multi_buffer`, `editor` — the buffer and text-editing engine.
+- `language`, `language_core`, `languages`, `lsp`, `syntax_theme`, `grammars` — language support and LSP integration (tree-sitter based).
+
+**Project / workspace management**
+- `project`, `worktree`, `fs`, `settings`, `settings_content` — filesystem, project model, config.
+- `workspace`, `panel`, `sidebar`, `title_bar` — the app shell/window/pane layout system.
+- `git`, `git_ui`, `git_graph`, `git_hosting_providers` — version control integration.
+
+**Collaboration & networking**
+- `client`, `rpc`, `proto`, `channel`, `call`, `collab`, `collab_ui`, `livekit_api`, `livekit_client` — real-time collaboration backend/client (the `collab` server is a separate deployable service, not just editor-side code).
+
+**AI / agent features** (a substantial and fast-growing area)
+- `agent`, `agent_ui`, `agent_servers`, `agent_skills`, `acp_thread`, `language_model`, `language_models`, plus many per-provider crates: `anthropic`, `open_ai`, `google_ai`, `mistral`, `bedrock`, `ollama`, `deepseek`, `x_ai`, `open_router`, `copilot`, `copilot_chat`, `codestral`, `lmstudio`, `opencode`.
+- `edit_prediction*` crates — Zed's own edit-prediction (Zeta) feature.
+
+**Extensibility**
+- `extension`, `extension_host`, `extension_api`, `extension_cli`, `extensions_ui`, plus a separate `extensions/` directory at repo root for bundled extensions (distinct from `crates/`).
+
+**Dev tooling / peripheral features**
+- `terminal`, `terminal_view`, `dap`, `dap_adapters`, `debugger_ui` (DAP debugging), `task`, `tasks_ui`, `outline_panel`, `search`, `diagnostics`, `repl`, `journal`, `markdown`, `markdown_preview`.
+
+**Infra/build**
+- `db`, `sqlez`/`sqlez_macros` (SQLite layer), `settings_macros`, `util`, `collections`, `telemetry`, `zlog` (logging), `auto_update`, `remote`/`remote_server` (SSH remote development).
+
+## Rough scale
+- 236 crates, ~1.34M lines of Rust (excluding `target/` and bundled `extensions/`)
+- Repo checkout is ~16G (mostly `target/` build artifacts, not source)
+- Separate top-level `docs/` (mdBook docs site) and `extensions/` (bundled extension sources) directories outside the main crate workspace
+
+The architecture is a fairly clean layered stack: `gpui` (framework) → `ui`/`theme` (components) → domain crates (`editor`, `project`, `workspace`, `agent`, etc.) → `zed` (app binary), with `collab` as a separately-deployed server crate for real-time collaboration.

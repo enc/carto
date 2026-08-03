@@ -1,0 +1,7 @@
+`truncate_and_trailoff` is defined in `crates/util/src/util.rs:58`:
+
+```rust
+pub fn truncate_and_trailoff(s: &str, max_chars: usize) -> String
+```
+
+It takes a string slice and a max character count, returning an owned `String` — truncated with a trailing "…" if it exceeds `max_chars`.

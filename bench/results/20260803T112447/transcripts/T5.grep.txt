@@ -1,0 +1,8 @@
+Direct callers of `TaintedString::render_capped` in production (non-test) code:
+
+1. **`crates/carto-core/src/taint.rs:135`** — `TaintedString`'s own `Serialize` impl calls `self.render_capped(consts::SIGNATURE_CAP)`, which is how tainted fields get serialized into `graph.json`.
+2. **`crates/carto-core/src/redact/mod.rs:79`** — `redact_tainted_string` calls `t.render_capped(usize::MAX)` to get the full sanitized text to scan for secrets before redaction.
+3. **`crates/carto-cli/src/where_cmd.rs:90`** — helper `capped()` calls `sig.render_capped(consts::SIGNATURE_CAP)` for the CLI's human-readable `where` output.
+4. **`crates/carto-mcp/src/tools/where_tool.rs:95`** — the equivalent helper `capped()` for the MCP `where` tool's rendered output.
+
+The other hits in `redact/mod.rs` (lines 149/168/186) are inside `#[cfg(test)] mod tests`, so excluded.

@@ -1,0 +1,13 @@
+`build_and_persist` (crates/carto-core/src/indexer.rs:36-77) directly calls/depends on:
+
+- **`pathguard::PathGuard::new`** — constructs the write-confinement guard (INV-3/INV-4) from `repo_root`/`out_root`/`allow_writes_in_repo`.
+- **`walk::walk`** — walks `repo_root` respecting `.gitignore` per the `respect_gitignore` flag, returning file nodes + ignore digest + per-file hashes.
+- **`lang::extract_and_resolve`** — runs the two-phase extract/resolve pipeline over the walked files to produce symbol/import/call nodes and edges.
+- **`Graph::new`**, **`Graph::insert_node`**, **`Graph::insert_edge`** — builds up the in-memory graph from walked file nodes plus resolved nodes/edges.
+- **`gitinfo::head_sha`** — reads the current commit SHA for the manifest.
+- **`graph::PersistMeta`** (constructed, not called) — bundles commit SHA, ignore-rule digest, and file hashes for persistence.
+- **`graph::persist`** — the single write choke-point (sort → redact → validate → size caps → atomic write through `PathGuard`), returns the manifest.
+- **`PathGuard::out_root`** — used to build the returned `IndexReport.out_dir`.
+- Constructs an **`IndexReport`** (its own return type) from the manifest's counts/redaction total.
+
+Note: carto's `deps` query on this symbol only surfaced 4 low-confidence "inferred/same-package" edges (`total`, `out_root`, `insert_edge`, `insert_node`) and flagged `walk`, `extract_and_resolve`, `persist`, `head_sha` as unresolved — Rust's module-qualified calls (`walk::walk(...)`, `graph::persist(...)`, etc.) aren't captured by carto's call resolution by design, so I read the source directly to get the complete picture above.

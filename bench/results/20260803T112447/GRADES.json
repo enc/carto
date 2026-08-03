@@ -1,0 +1,10 @@
+{
+  "L1": { "grep": "correct", "carto": "correct" },
+  "L2": { "grep": "correct", "carto": "correct" },
+  "L3": { "grep": "partial", "carto": "partial" },
+  "L4": { "grep": "correct", "carto": "correct" },
+  "T5": { "grep": "correct", "carto": "partial" },
+  "T6": { "grep": "correct", "carto": "correct" },
+  "T7": { "grep": "correct", "carto": "correct" },
+  "T8": { "grep": "correct", "carto": "correct" }
+}

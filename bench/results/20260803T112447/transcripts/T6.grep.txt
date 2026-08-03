@@ -1,0 +1,15 @@
+These are just doc-comment references, not call sites requiring signature changes. Here's the full picture for `graph::load` (`crates/carto-core/src/graph/load.rs:23`, `pub fn load(out_root: &Path) -> Result<GraphDocument>`):
+
+**Actual call sites (would need updating if the signature changes):**
+- `crates/carto-cli/src/map_cmd.rs:41`
+- `crates/carto-cli/src/deps_cmd.rs:72`
+- `crates/carto-cli/src/where_cmd.rs:47`
+- `crates/carto-mcp/src/tools/map_tool.rs:35`
+- `crates/carto-mcp/src/tools/deps_tool.rs:66`
+- `crates/carto-mcp/src/tools/where_tool.rs:43`
+
+All six call it identically as `graph::load(&<target>.out_root)`, per the architecture doc's note that CLI and MCP tool handlers call the same core functions — no query logic duplicated in `carto-mcp`.
+
+**Re-export:** `crates/carto-core/src/graph/mod.rs:20` (`pub use load::load;`) — only needs touching if the function is renamed/moved, not for a signature change.
+
+**Doc-comment references only (no code change needed):** `crates/carto-core/src/query/mod.rs:2,82` link to `graph::load` in rustdoc; `crates/carto-core/src/query/find.rs` likely has a similar reference. Also `CLAUDE.md`, `docs/adr/0014-subpath-scoping.md`, and `bench/*` mention `graph::load` prose-wise — worth a skim if the change is semantically significant, but they don't need mechanical updates for a pure signature change.
