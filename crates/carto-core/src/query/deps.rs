@@ -100,6 +100,17 @@ pub struct DepsResult {
     /// every row of a possibly-large traversal; broaden only if a
     /// concrete need shows up.
     pub root_unresolved_calls: Vec<UnresolvedCall>,
+    /// The root symbol's own [`crate::graph::SymbolNode::
+    /// uncaptured_inbound_calls`] (0 for a File/Module root, or a
+    /// language with no such exclusion) — surfaced here for the same
+    /// reason as `root_unresolved_calls`, but for the *opposite*
+    /// direction: `--dir in` returning few/no `calls` edges is
+    /// otherwise indistinguishable from "this symbol genuinely has few
+    /// callers" vs. "N call sites spell this name in a shape this
+    /// repo's extractor never attempted to resolve" (§1.1's honest
+    /// absence signal, ADR-0020). Never itself evidence of a caller —
+    /// see the field's own doc comment on `SymbolNode`.
+    pub root_uncaptured_inbound_calls: u32,
     pub hops: Vec<Hop>,
     pub truncation: Truncation,
 }
@@ -121,6 +132,10 @@ pub fn run(qg: &QueryGraph, query: &DepsQuery) -> Result<DepsResult> {
     let root_unresolved_calls = match qg.node(&root_id).map(|n| &n.data) {
         Some(NodeData::Symbol(s)) => s.unresolved_calls.clone(),
         _ => Vec::new(),
+    };
+    let root_uncaptured_inbound_calls = match qg.node(&root_id).map(|n| &n.data) {
+        Some(NodeData::Symbol(s)) => s.uncaptured_inbound_calls,
+        _ => 0,
     };
 
     let mut visited: BTreeSet<NodeId> = BTreeSet::new();
@@ -218,6 +233,7 @@ pub fn run(qg: &QueryGraph, query: &DepsQuery) -> Result<DepsResult> {
     Ok(DepsResult {
         root,
         root_unresolved_calls,
+        root_uncaptured_inbound_calls,
         hops,
         truncation,
     })
@@ -361,6 +377,7 @@ mod tests {
                 end_line: line + 1,
                 signature: None,
                 unresolved_calls,
+                uncaptured_inbound_calls: 0,
             },
         )
     }

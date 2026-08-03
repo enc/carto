@@ -13,7 +13,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 #[derive(Clone, Copy, clap::ValueEnum)]
-enum DirArg {
+pub(crate) enum DirArg {
     In,
     Out,
     Both,
@@ -46,7 +46,7 @@ pub struct DepsArgs {
     /// Which direction to follow edges: `out` (what this depends on,
     /// default), `in` (what depends on this), or `both`.
     #[arg(long, value_enum, default_value_t = DirArg::Out)]
-    dir: DirArg,
+    pub(crate) dir: DirArg,
 
     /// How many hops to traverse (1..=5).
     #[arg(long, default_value_t = 1)]
@@ -116,7 +116,7 @@ fn parse_kinds(s: &str) -> Result<BTreeSet<EdgeKind>> {
 /// `counts` vs. `lines` already uses.
 const UNRESOLVED_CALLS_SHOWN: usize = 20;
 
-pub fn print_human(result: &query::DepsResult) {
+pub fn print_human(result: &query::DepsResult, dir: Direction) {
     println!(
         "{} ({})  {}",
         result.root.label,
@@ -140,6 +140,21 @@ pub fn print_human(result: &query::DepsResult) {
             "  ({total} unresolved call{} not shown as edges: {}{suffix})",
             if total == 1 { "" } else { "s" },
             names.join(", "),
+        );
+    }
+    // Only relevant to an inbound question — noise on --dir out, which
+    // never uses this count at all.
+    if result.root_uncaptured_inbound_calls > 0 && matches!(dir, Direction::In | Direction::Both) {
+        println!(
+            "  ({} call site{} elsewhere in this repo spell this symbol's name in a shape \
+             this language's extractor never attempts to resolve — not evidence of zero \
+             callers; INV-8 honest omission, not a claim)",
+            result.root_uncaptured_inbound_calls,
+            if result.root_uncaptured_inbound_calls == 1 {
+                ""
+            } else {
+                "s"
+            },
         );
     }
     for hop in &result.hops {

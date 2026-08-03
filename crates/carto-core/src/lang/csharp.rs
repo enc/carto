@@ -74,6 +74,10 @@ impl LangExtractor for CSharpExtractor {
             symbols: extract_symbols(root, src),
             imports,
             call_sites: extract_call_sites(root, src),
+            // No call shape is deliberately excluded from resolution the
+            // way Rust's path-qualified calls are (ADR-0016 excludes
+            // whole *symbol kinds*, not call syntax) — nothing to count.
+            uncaptured_call_sites: Vec::new(),
             declared_namespace,
         }
     }

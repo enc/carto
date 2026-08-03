@@ -261,6 +261,7 @@ mod tests {
                 end_line: 2,
                 signature: None,
                 unresolved_calls: vec![],
+                uncaptured_inbound_calls: 0,
             },
         ));
 

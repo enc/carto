@@ -117,6 +117,9 @@ fn extract_with(language: Language, src: &[u8], is_ts_family: bool) -> ExtractOu
         symbols: extract_symbols(root, src, &language, is_ts_family),
         imports: extract_imports(root, src, &language),
         call_sites: extract_call_sites(root, src, &language),
+        // TS/JS's member/selector calls are captured, not excluded
+        // (ADR-0013) — nothing to count here.
+        uncaptured_call_sites: Vec::new(),
         declared_namespace: None,
     }
 }

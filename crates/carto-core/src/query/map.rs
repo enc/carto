@@ -370,6 +370,7 @@ mod tests {
                 end_line: line + 1,
                 signature: None,
                 unresolved_calls: vec![],
+                uncaptured_inbound_calls: 0,
             },
         )
     }

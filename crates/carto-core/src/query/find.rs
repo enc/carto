@@ -157,6 +157,7 @@ mod tests {
                     end_line: i as u32 + 2,
                     signature: None,
                     unresolved_calls: vec![],
+                    uncaptured_inbound_calls: 0,
                 },
             ));
         }
@@ -211,6 +212,7 @@ mod tests {
                 end_line: 2,
                 signature: None,
                 unresolved_calls: vec![],
+                uncaptured_inbound_calls: 0,
             },
         );
         let dead_sym = Node::symbol(
@@ -225,6 +227,7 @@ mod tests {
                 end_line: 2,
                 signature: None,
                 unresolved_calls: vec![],
+                uncaptured_inbound_calls: 0,
             },
         );
         GraphDocument {

@@ -87,6 +87,7 @@
     "label": "handle",
     "location": "src/handlers.rs:3-9"
   },
+  "root_uncaptured_inbound_calls": 0,
   "root_unresolved_calls": [
     {
       "line": 8,

@@ -1,6 +1,6 @@
 {
   "carto_version": "<carto_version>",
-  "schema_version": 1,
+  "schema_version": 2,
   "nodes": [
     {
       "id": "01b1bf1a08742486",
@@ -49,7 +49,8 @@
       "start_line": 1,
       "end_line": 2,
       "signature": "def hello():",
-      "unresolved_calls": []
+      "unresolved_calls": [],
+      "uncaptured_inbound_calls": 0
     },
     {
       "id": "4f63a759c60441a5",
@@ -62,7 +63,8 @@
       "start_line": 1,
       "end_line": 3,
       "signature": "function hello(): string",
-      "unresolved_calls": []
+      "unresolved_calls": [],
+      "uncaptured_inbound_calls": 0
     },
     {
       "id": "600e84125eb01ca9",
@@ -111,7 +113,8 @@
       "start_line": 1,
       "end_line": 3,
       "signature": "fn main()",
-      "unresolved_calls": []
+      "unresolved_calls": [],
+      "uncaptured_inbound_calls": 0
     },
     {
       "id": "bc205a23aada60b5",

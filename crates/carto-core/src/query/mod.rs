@@ -241,6 +241,7 @@ mod tests {
                 end_line: 3,
                 signature: None,
                 unresolved_calls: vec![],
+                uncaptured_inbound_calls: 0,
             },
         )
     }
@@ -306,6 +307,7 @@ mod tests {
             end_line,
             signature: None,
             unresolved_calls: vec![],
+            uncaptured_inbound_calls: 0,
         });
         assert_eq!(rendered, "src/orders.rs:1-3");
     }
@@ -321,6 +323,7 @@ mod tests {
             end_line: 1,
             signature: None,
             unresolved_calls: vec![],
+            uncaptured_inbound_calls: 0,
         });
         assert_eq!(rendered, "<unknown-file>:1-1");
     }

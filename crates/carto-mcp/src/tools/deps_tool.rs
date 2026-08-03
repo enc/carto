@@ -74,7 +74,7 @@ pub fn call(args: &Value) -> Result<Value, String> {
     };
     let result = query::deps(&qg, &deps_query).map_err(|e| e.to_string())?;
 
-    let text = render_text(&result);
+    let text = render_text(&result, dir);
     let structured = serde_json::to_value(&result).map_err(|e| e.to_string())?;
     Ok(render::envelope(structured, &text))
 }
@@ -101,7 +101,7 @@ fn parse_kinds(s: &str) -> carto_core::error::Result<BTreeSet<EdgeKind>> {
     Ok(kinds)
 }
 
-fn render_text(result: &query::DepsResult) -> String {
+fn render_text(result: &query::DepsResult, dir: Direction) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "{} ({})  {}\n",
@@ -126,6 +126,21 @@ fn render_text(result: &query::DepsResult) -> String {
             "  ({total} unresolved call{} not shown as edges: {}{suffix})\n",
             if total == 1 { "" } else { "s" },
             names.join(", "),
+        ));
+    }
+    // Only relevant to an inbound question — noise on --dir out, which
+    // never uses this count at all.
+    if result.root_uncaptured_inbound_calls > 0 && matches!(dir, Direction::In | Direction::Both) {
+        out.push_str(&format!(
+            "  ({} call site{} elsewhere in this repo spell this symbol's name in a shape \
+             this language's extractor never attempts to resolve — not evidence of zero \
+             callers; INV-8 honest omission, not a claim)\n",
+            result.root_uncaptured_inbound_calls,
+            if result.root_uncaptured_inbound_calls == 1 {
+                ""
+            } else {
+                "s"
+            },
         ));
     }
     for hop in &result.hops {

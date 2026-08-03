@@ -125,6 +125,7 @@ mod tests {
                 end_line: 1,
                 signature: Some(TaintedString::new(signature, Provenance::Syntactic)),
                 unresolved_calls: vec![],
+                uncaptured_inbound_calls: 0,
             },
         )
     }

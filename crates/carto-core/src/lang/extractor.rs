@@ -194,6 +194,16 @@ pub struct ExtractOut {
     pub symbols: Vec<RawSymbol>,
     pub imports: Vec<RawImport>,
     pub call_sites: Vec<RawCallSite>,
+    /// Call sites this extractor recognizes but deliberately never
+    /// attempts to resolve — Rust's path-qualified `Type::method()`/
+    /// `module::func()` (ADR-0008) is the only producer today. Carried
+    /// *only* to be counted (`resolve` aggregates these by bare callee
+    /// name into `SymbolNode::uncaptured_inbound_calls`, ADR-0020) —
+    /// never to produce an edge or feed any resolution tier. Distinct
+    /// from `call_sites`, which *are* attempted and either resolve or
+    /// land in a symbol's `unresolved_calls`; a call site belongs to
+    /// exactly one of the two lists, never both.
+    pub uncaptured_call_sites: Vec<RawCallSite>,
     /// The file's declared namespace, PHP's `namespace App\Orders;`
     /// (ADR-0012) — `None` for a file with no namespace declaration
     /// (PHP's global namespace) and always `None` for Rust/Python, which

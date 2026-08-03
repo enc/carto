@@ -8,7 +8,16 @@ pub const BIN_NAME: &str = "carto";
 
 /// Bumped whenever the on-disk graph.json / manifest.json shape changes in a
 /// way ingest/tooling needs to know about. Spec §4.4, §8.3.
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// 1 -> 2 (ADR-0020): `SymbolNode` gained `uncaptured_inbound_calls`.
+/// That field carries `#[serde(default)]` so a v1 `graph.json` still
+/// *parses* cleanly (rather than a raw missing-field error), but this
+/// bump ensures `graph::load`'s schema-version check still rejects it
+/// with a "re-run `carto index`" message before any query code can ever
+/// see a fabricated `0` for a repo that was never actually scanned for
+/// this — the version check runs immediately after parsing, so the
+/// `#[serde(default)]` value never escapes `load`.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Opening fence marker wrapping tainted content in rendered output.
 /// Spec §8.4. The bracket characters here (`⟦`/`⟧`, U+27E6/U+27E7) are

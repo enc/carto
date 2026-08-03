@@ -286,6 +286,22 @@ pub fn resolve(extractions: Vec<FileExtraction>) -> ResolvedExtraction {
         }
     }
 
+    // §1.1's honest-absence signal (ADR-0020): repo-wide count of call
+    // sites whose bare callee name matches, keyed by `(origin, name)` —
+    // the same per-language keying `fqn_to_file`/`known_namespace_roots`
+    // use, so a Rust `graph::load()` call site never inflates a Python
+    // symbol also named `load`. Every extractor except Rust's leaves
+    // `uncaptured_call_sites` empty today, so this map is empty for them
+    // and every symbol's count stays 0 — unchanged behavior.
+    let mut uncaptured_by_name: BTreeMap<(&'static str, &str), u32> = BTreeMap::new();
+    for fe in &extractions {
+        for call in &fe.extract.uncaptured_call_sites {
+            *uncaptured_by_name
+                .entry((fe.origin, call.callee_name.as_str()))
+                .or_insert(0) += 1;
+        }
+    }
+
     let mut nodes = Vec::new();
     let mut edges = Vec::new();
     let mut external_modules: BTreeMap<&str, NodeId> = BTreeMap::new();
@@ -332,6 +348,11 @@ pub fn resolve(extractions: Vec<FileExtraction>) -> ResolvedExtraction {
                 Some(TaintedString::new(&sym.signature, Provenance::Syntactic))
             };
 
+            let uncaptured_inbound_calls = uncaptured_by_name
+                .get(&(fe.origin, sym.name.as_str()))
+                .copied()
+                .unwrap_or(0);
+
             nodes.push(Node::symbol(
                 id.clone(),
                 Provenance::Syntactic,
@@ -344,6 +365,7 @@ pub fn resolve(extractions: Vec<FileExtraction>) -> ResolvedExtraction {
                     end_line: sym.end_line,
                     signature,
                     unresolved_calls,
+                    uncaptured_inbound_calls,
                 },
             ));
 

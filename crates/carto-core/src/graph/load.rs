@@ -163,6 +163,7 @@ mod tests {
                     Provenance::Syntactic,
                 )),
                 unresolved_calls: vec![],
+                uncaptured_inbound_calls: 0,
             },
         ));
         graph.insert_node(Node::module(

@@ -54,6 +54,9 @@ impl LangExtractor for PhpExtractor {
             symbols: extract_symbols(root, src),
             imports: extract_imports(root, src),
             call_sites: extract_call_sites(root, src),
+            // PHP's path-qualified calls are captured, not excluded
+            // (ADR-0012) — nothing to count here.
+            uncaptured_call_sites: Vec::new(),
             declared_namespace: extract_namespace(root, src),
         }
     }

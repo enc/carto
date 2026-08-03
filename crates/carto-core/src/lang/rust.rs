@@ -51,10 +51,12 @@ impl LangExtractor for RustExtractor {
         };
         let root = tree.root_node();
 
+        let (call_sites, uncaptured_call_sites) = extract_call_sites(root, src);
         ExtractOut {
             symbols: extract_symbols(root, src),
             imports: extract_imports(root, src),
-            call_sites: extract_call_sites(root, src),
+            call_sites,
+            uncaptured_call_sites,
             declared_namespace: None,
         }
     }
@@ -251,25 +253,34 @@ fn leftmost_text(node: Node, src: &[u8]) -> String {
     text(src, node)
 }
 
-fn extract_call_sites(root: Node, src: &[u8]) -> Vec<RawCallSite> {
+/// Returns `(call_sites, uncaptured_call_sites)` — the plain-identifier/
+/// method calls this extractor attempts to resolve, and the
+/// path-qualified calls (`Type::method()`, `module::func()`) it counts
+/// but never attempts to resolve (see `calls.scm`'s `call.uncaptured`
+/// pattern; ADR-0020).
+fn extract_call_sites(root: Node, src: &[u8]) -> (Vec<RawCallSite>, Vec<RawCallSite>) {
     let language = carto_grammars::rust_language();
     let query = Query::new(&language, CALLS_QUERY).expect("calls.scm must compile");
     let names = query.capture_names();
     let mut cursor = QueryCursor::new();
 
     let mut out = Vec::new();
+    let mut uncaptured = Vec::new();
     let mut matches = cursor.matches(&query, root, src);
     while let Some(m) = matches.next() {
         for cap in m.captures {
-            if names[cap.index as usize] == "call.name" {
-                out.push(RawCallSite {
-                    callee_name: text(src, cap.node),
-                    line: cap.node.start_position().row as u32 + 1,
-                });
+            let site = || RawCallSite {
+                callee_name: text(src, cap.node),
+                line: cap.node.start_position().row as u32 + 1,
+            };
+            match names[cap.index as usize] {
+                "call.name" => out.push(site()),
+                "call.uncaptured" => uncaptured.push(site()),
+                _ => {}
             }
         }
     }
-    out
+    (out, uncaptured)
 }
 
 fn text(src: &[u8], node: Node) -> String {
@@ -422,8 +433,29 @@ mod tests {
     }
 
     #[test]
-    fn does_not_capture_path_qualified_calls() {
-        let out = extract("fn handle() {\n    Order::new();\n}\n");
+    fn path_qualified_calls_are_uncaptured_not_resolved() {
+        // Still never attempted for resolution (ADR-0008) — but now
+        // counted separately (ADR-0020, §1.1) rather than vanishing
+        // entirely.
+        let out = extract("fn handle() {\n    Order::new();\n    orders::save();\n}\n");
         assert!(out.call_sites.is_empty());
+        let names: Vec<&str> = out
+            .uncaptured_call_sites
+            .iter()
+            .map(|c| c.callee_name.as_str())
+            .collect();
+        assert!(names.contains(&"new"));
+        assert!(names.contains(&"save"));
+    }
+
+    #[test]
+    fn plain_and_uncaptured_calls_are_mutually_exclusive() {
+        // A regression the query-level double-match gotcha (CLAUDE.md's
+        // documented tree-sitter pitfall) would produce: the same call
+        // site landing in both lists.
+        let out =
+            extract("fn handle() {\n    validate();\n    order.summary();\n    Order::new();\n}\n");
+        assert_eq!(out.call_sites.len(), 2);
+        assert_eq!(out.uncaptured_call_sites.len(), 1);
     }
 }

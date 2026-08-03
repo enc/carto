@@ -56,6 +56,10 @@ impl LangExtractor for PythonExtractor {
             symbols: extract_symbols(root, src),
             imports: extract_imports(root, src),
             call_sites: extract_call_sites(root, src),
+            // Python's grammar has no node distinguishing a
+            // module-qualified call from an instance call (ADR-0011) —
+            // there's no separate shape to exclude, so nothing to count.
+            uncaptured_call_sites: Vec::new(),
             declared_namespace: None,
         }
     }

@@ -214,6 +214,19 @@ pub struct SymbolNode {
     /// separate truncation is needed here.
     pub signature: Option<TaintedString>,
     pub unresolved_calls: Vec<UnresolvedCall>,
+    /// How many call sites elsewhere in this repo spell this symbol's
+    /// bare `name` in a shape its language's extractor deliberately
+    /// never attempts to resolve (Rust's `Type::method()`/
+    /// `module::func()`, ADR-0008) — repo-wide, not scoped to any
+    /// particular caller. This is a *count of unattempted syntax*, not
+    /// evidence any of those sites actually call *this* symbol, and
+    /// never implies an edge (INV-8 extended to absence — ADR-0020):
+    /// `deps --dir in` returning few/no `calls` edges for a symbol with
+    /// a nonzero count here means "carto didn't look here", not "this
+    /// symbol has few callers". Zero for every language without such an
+    /// exclusion.
+    #[serde(default)]
+    pub uncaptured_inbound_calls: u32,
 }
 
 /// `Module` node (spec §4.1): "logical module/package path". `external`

@@ -80,7 +80,9 @@ fn run(cli: &Cli) -> carto_core::Result<u8> {
         }
         Command::Deps(args) => {
             let result = deps_cmd::run(args)?;
-            emit(cli.json, &result, || deps_cmd::print_human(&result))?;
+            emit(cli.json, &result, || {
+                deps_cmd::print_human(&result, args.dir.into())
+            })?;
         }
         Command::Map(args) => {
             let result = map_cmd::run(args)?;

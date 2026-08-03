@@ -60,6 +60,11 @@ impl LangExtractor for GoExtractor {
             symbols: extract_symbols(root, src),
             imports: extract_imports(root, src),
             call_sites: extract_call_sites(root, src),
+            // Go's selector calls (`pkg.Func()`) are captured, with only
+            // the package qualifier discarded (ADR-0015) — the call site
+            // itself isn't excluded from resolution, so nothing to
+            // count here.
+            uncaptured_call_sites: Vec::new(),
             // Go has no namespace/FQN model (PHP-only, ADR-0012) — package
             // membership is directory-based, handled entirely by
             // `package_scope_is_directory` + `resolve`'s tier (a′), not
