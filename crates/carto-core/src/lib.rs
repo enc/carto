@@ -6,6 +6,7 @@ pub mod consts;
 pub mod error;
 pub mod gitinfo;
 pub mod graph;
+pub mod indexer;
 pub mod lang;
 pub mod outdir;
 pub mod pathguard;

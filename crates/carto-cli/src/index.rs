@@ -1,14 +1,12 @@
 //! `carto index` — spec §7.1: "repo path, infra flags" -> "manifest
-//! summary". `File` nodes via `walk`; `Symbol`/`Module` nodes and
-//! `contains`/`imports`/`calls` edges via `lang::extract_and_resolve`
-//! for every walked file whose language has a registered extractor
-//! (Rust only as of M1.b.2a). No infra flags yet (M2).
+//! summary". Thin CLI wrapper (args, target resolution, print) over
+//! `carto_core::indexer::build_and_persist`, which carto-mcp's `index`
+//! tool calls too — no indexing logic lives here.
 
 use carto_core::error::Result;
-use carto_core::graph::Graph;
-use carto_core::{gitinfo, graph, lang, pathguard, target, walk};
+use carto_core::indexer::{self, IndexReport};
+use carto_core::{pathguard, target};
 use clap::Args;
-use serde::Serialize;
 use std::path::PathBuf;
 
 #[derive(Args)]
@@ -32,22 +30,8 @@ pub struct IndexArgs {
     no_gitignore: bool,
 }
 
-/// The manifest summary spec §7.1 names as `index`'s output — human by
-/// default, this same struct under `--json`.
-#[derive(Serialize)]
-pub struct IndexSummary {
-    pub out_dir: PathBuf,
-    pub file_count: usize,
-    pub node_count: usize,
-    pub edge_count: usize,
-    pub commit_sha: Option<String>,
-    pub redaction_count: u64,
-}
-
-pub fn run(args: &IndexArgs) -> Result<IndexSummary> {
+pub fn run(args: &IndexArgs) -> Result<IndexReport> {
     let target = target::resolve(&args.path, &args.out)?;
-    let repo_root = target.repo_root;
-    let out_root = target.out_root;
 
     // Whether this --out counts as the spec §7.4 "explicit" in-repo
     // override: only when the user actually passed --out (never the
@@ -55,47 +39,18 @@ pub fn run(args: &IndexArgs) -> Result<IndexSummary> {
     // Resolved via pathguard's own not-yet-created-path canonicalization,
     // since out_root may not exist yet and a naive canonicalize() would
     // fail.
-    let prospective_out = pathguard::resolve_prospective(&out_root)?;
-    let allow_writes_in_repo = args.out.is_some() && prospective_out.starts_with(&repo_root);
+    let prospective_out = pathguard::resolve_prospective(&target.out_root)?;
+    let allow_writes_in_repo = args.out.is_some() && prospective_out.starts_with(&target.repo_root);
 
-    let guard = pathguard::PathGuard::new(&repo_root, &out_root, allow_writes_in_repo)?;
-
-    let walked = walk::walk(&repo_root, !args.no_gitignore)?;
-    let file_count = walked.nodes.len();
-
-    let resolved = lang::extract_and_resolve(&repo_root, &walked.nodes);
-
-    let mut g = Graph::new();
-    for node in walked.nodes {
-        g.insert_node(node);
-    }
-    for node in resolved.nodes {
-        g.insert_node(node);
-    }
-    for edge in resolved.edges {
-        g.insert_edge(edge);
-    }
-
-    let commit_sha = gitinfo::head_sha(&repo_root);
-    let meta = graph::PersistMeta {
-        commit_sha: commit_sha.clone(),
-        ignore_rule_digest: walked.ignore_rule_digest,
-        file_sha256: walked.file_sha256,
-    };
-
-    let manifest = graph::persist(g, meta, &guard)?;
-
-    Ok(IndexSummary {
-        out_dir: guard.out_root().to_path_buf(),
-        file_count,
-        node_count: manifest.node_count,
-        edge_count: manifest.edge_count,
-        commit_sha,
-        redaction_count: manifest.redaction.total(),
-    })
+    indexer::build_and_persist(
+        &target.repo_root,
+        &target.out_root,
+        !args.no_gitignore,
+        allow_writes_in_repo,
+    )
 }
 
-pub fn print_human(summary: &IndexSummary) {
+pub fn print_human(summary: &IndexReport) {
     println!("indexed {} files", summary.file_count);
     println!("  out dir: {}", summary.out_dir.display());
     println!("  nodes:   {}", summary.node_count);
