@@ -120,11 +120,115 @@ Prompt: call `selfcheck`, then `index` this repo, then `where redact
   15.3s wall.
 
 One methodology note worth recording: this check ran *without* `--bare`
-(normal OAuth session auth), not the `--bare` + `ANTHROPIC_API_KEY` mode
-`bench/run.sh` (still to come) will use for the actual S-1 measurement —
-`--bare` refuses OAuth/keychain auth by design, and no API key is set in
-this environment. This check answers "does a real client work against
-the server," not "what does a clean token count look like" — the cache-
-heavy usage numbers above (bare session start, no prior conversation)
-aren't the controlled baseline the benchmark needs, and shouldn't be
-read as one.
+(normal OAuth session auth) — `--bare` refuses OAuth/keychain auth by
+design, and no `ANTHROPIC_API_KEY` is set in this environment. This
+check answers "does a real client work against the server," not "what
+does a clean token count look like" — the cache-heavy usage numbers
+above (bare session start, no prior conversation) aren't the controlled
+baseline the benchmark needs, and shouldn't be read as one. (Update
+below: `--bare`'s unavailability turned out to matter for the real S-1
+measurement too, not just this one check.)
+
+## 2026-08-03 — Part B: building bench/tasks.md, and a real Rust extractor gap found writing it
+
+Drafting the 8-task S-1 set (spec §11.4), every task was designed with a
+*hand-reasoned prediction* of carto's answer before running carto at
+all, then checked against real `carto where`/`deps`/`map` output before
+locking the task in. That check caught three wrong predictions — see
+`bench/tasks.md`'s own "A methodology correction, kept visible rather
+than quietly fixed" section for the full accounting. The most
+significant: an L3 task about which files import `carto_core::query`
+led to discovering, via a minimal one-file reproduction
+(`use carto_core::query::{self, MapQuery, QueryGraph};` alone, indexed
+in isolation), that carto's Rust extractor produces **zero** import
+edges for any grouped `use path::{a, b};` statement — confirmed by
+reading `lang/rust.rs`'s own comment and its
+`use_list_and_wildcard_are_not_extracted` test: this is
+`docs/STATUS.md`'s already-documented "deliberately absent" `use_list`
+exclusion (ADR-0008), not a new bug — but a consequence of it hadn't
+been traced through before: a file whose *only* import from some
+external crate is grouped contributes **nothing** to that crate's fan-in
+count, and whether carto's answer includes a file at all becomes a
+coincidence of that file's *other*, unrelated single-path imports.
+Verified precisely on carto's own repo: 18 files really import from
+`carto_core`; carto's `map`/`deps` machinery surfaces 11; the missing 7
+are exactly the 7 whose sole `carto_core` import is grouped.
+
+Digging one step further (does an MCP-only agent even have a path to
+the 11-file answer, not just the true 18): **no** — `carto deps
+carto_core --dir in` fails outright (`no node ID or symbol named
+'carto_core' found`), since `where` only searches `Symbol` nodes and no
+tool exposes `Module`-node IDs. The only thing an agent can actually
+reach is `map`'s aggregate line, `carto_core in=11` — a count with no
+way to enumerate members. Reading `graph.json` directly (as this
+investigation did) isn't something a real MCP client can do.
+
+**This is exactly the kind of finding the whole exercise exists to
+surface** — a real, previously-unconnected consequence of a documented
+design decision, found by trying to use the product for something a
+user plausibly would ask, not by inventing a synthetic edge case.
+
+## 2026-08-03 — Part B: the deterministic replay arm, run for real
+
+`bench/replay/replay.sh` (free, no LLM) ran successfully against both
+corpora. Index-build cost: carto's own repo 1s wall / 237-byte summary;
+zed 12s wall / 239-byte summary (both consistent with Part 0's numbers).
+Per-task byte counts, carto vs. grep-authored command sequences:
+
+| task | grep bytes | carto bytes | carto vs grep |
+|---|---:|---:|---:|
+| L1 | 228 | 1,071 | −370% (carto larger) |
+| L2 | 905 | 291 | +68% (carto smaller) |
+| L3 | 2,357 | 6,901 | −193% |
+| L4 | 227 | 6,901 | −2,940% |
+| T5 | 1,235 | 2,385 | −93% |
+| T6 | 579 | 1,882 | −225% |
+| T7 | 3,157 | 2,419 | +23% |
+| T8 | 2,731 | 1,238 | +55% |
+| **total** | **11,419** | **23,088** | **−102%** |
+
+**Carto uses roughly 2x more bytes than grep overall in this run** — the
+opposite direction from S-1's hypothesis. Reported plainly rather than
+softened, but with an important caveat spelled out before drawing any
+conclusion from it: **I authored both arms' command sequences already
+knowing the ground truth**, and the grep sequences in particular
+(L1 especially — three quick commands totaling 228 bytes for
+"orientation of an unfamiliar 236-crate codebase") are almost certainly
+far cheaper than what a real agent would actually explore blind. L1,
+L3, and L4's large negative deltas share one real, non-authorial-bias
+cause too: `map --json` always returns the *entire* rendered overview
+(counts, top modules, external packages, entry points) — there's no way
+to request just one section, so even a narrowly-scoped question pays
+the full payload. This is a genuine API-shape cost, not just a fair-
+baseline artifact, and worth carrying into the real-run arm's
+interpretation rather than assuming the replay numbers are simply
+"unfair to carto" and dismissing them.
+
+## 2026-08-03 — Part B: the real-run arm's auth path, decided empirically, twice
+
+First attempt: `claude --bare --mcp-config ...` — fails outright
+(`Not logged in`), confirming `--bare` needs `ANTHROPIC_API_KEY`
+specifically, unavailable here. Second attempt, trying to keep
+`--bare`-level isolation some other way: `--safe-mode` (keeps normal
+OAuth auth, disables CLAUDE.md/hooks/plugins) combined with
+`--mcp-config`/`--strict-mcp-config` — **`--safe-mode` disables MCP
+servers too**, `--strict-mcp-config` doesn't override that. The agent
+inside that session, finding no `carto__*` tools available, tried
+running the locally-built `carto serve` binary itself via Bash as a
+workaround, got denied by permissions, and gave up after two attempts —
+a real, if minor, illustration of an agent improvising around a missing
+tool rather than reporting the gap. **Cost: $0.68, 211s, for a session
+that answered nothing** — a concrete, unpleasant data point directly
+informing the decision (surfaced to the user) to proceed carefully with
+the paid 16-session batch rather than assume the setup was right.
+
+Working setup, confirmed by the earlier successful connectivity check
+above (before this session's methodology firmed up): plain `claude -p`
+(no `--bare`, no `--safe-mode`) with `--mcp-config`/`--strict-mcp-config`
+for real isolation of *which MCP servers* are exposed, invoked from a
+neutral temp-directory cwd (not inside either target repo) to avoid
+triggering carto's own elaborate `CLAUDE.md` via directory walk-up. Not
+as clean as `--bare` would have been — CLAUDE.md/hook auto-discovery
+isn't as provably absent as it would be under `--bare`, an accepted,
+user-confirmed caveat on every real-run number that follows, not a
+silent substitution.

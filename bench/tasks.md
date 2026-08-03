@@ -25,7 +25,13 @@ from extraction entirely, by design. This predicts carto should win
 clearly on **lookup/orientation** (Category L: `where`, `map`, `imports`
 edges — none of these depend on the sparse `calls` edge kind) and should
 struggle on **transitive/blast-radius** questions that lean on `calls`
-(Category T).
+(Category T). Both categories turned out to have at least one
+counter-example on closer inspection (T5's method-call resolution works
+better than the `calls`-sparsity story predicts; L3's `Module`-node
+discovery gap makes it a clean loss despite not touching `calls` at
+all) — the category split is a prior about *where the risk concentrates*,
+not a guarantee every task in a bucket lands the same way, and the task
+set is designed so a reader can see exactly which predictions held.
 
 ## A methodology correction, kept visible rather than quietly fixed
 
@@ -215,6 +221,28 @@ an answer surfaces this — that carto's "11" is systematically biased
 toward files with heterogeneous import styles, not a random or
 representative sample of true importers — versus reporting 11 as if it
 were exhaustive.
+
+**A further correction, caught checking the tool surface an agent
+actually has** (not just the graph.json I can read directly but a real
+MCP client can't): `carto deps carto_core --dir in` — the call that
+produces the 11-file list above — **fails**: `no node ID or symbol
+named 'carto_core' found in this index`. `deps`'s `target` argument only
+resolves via `where`'s search (Symbol nodes only, confirmed above) or a
+literal raw node ID; there is no tool that lists `Module` nodes or
+returns their IDs. **An agent restricted to the actual MCP tool surface
+cannot reach the 11-file list at all** — the only thing genuinely
+reachable is `map`'s aggregate line, `carto_core in=11`, a count with no
+way to enumerate its members. The "11 vs. 18, partial credit" framing
+above describes what's true of the *graph*; what's true of the *tools an
+agent can actually call* is starker: this task is a clean loss for carto
+as an MCP-only interaction — the correct answer (18 files, or even the
+biased 11) is unreachable, and `map`'s count is the only signal
+available, unlabeled as partial and with no path to the underlying list.
+Kept in the task set anyway, specifically *because* it's a clean loss:
+Category T already covers the `calls`-edge sparsity story; this is a
+different, real gap (`where`/`deps` have no `Module`-node discovery
+path) worth measuring on its own terms rather than folding into the same
+narrative.
 
 ### L4 — real entry points vs. carto's heuristic (carto's own repo)
 
