@@ -21,7 +21,7 @@ pub fn tool_list() -> Vec<Value> {
     vec![
         json!({
             "name": "index",
-            "description": "Build the deterministic structural graph of a repository (symbols, files, modules, imports, calls-best-effort) and persist it to an out-dir. Run this once per session, or after a large change, before where/deps/map.",
+            "description": "Build the deterministic structural graph of a repository (symbols, files, modules, imports, calls-best-effort) and persist it to an out-dir. Run this once per repo+out-dir, or after a large change, before where/deps/map — a repo already indexed into a given out-dir keeps that graph available for every later call; re-indexing it again before every question in the same session repeats a real cost for no new information.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
