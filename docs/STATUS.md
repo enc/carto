@@ -1,6 +1,6 @@
 # carto — status / handoff
 
-**Milestone:** M1.b.2b done (Rust, Python, PHP, TS/TSX/JS, Go — spec §5.2's full v1 language set), plus C# added post-v1 on user request (ADR-0016). M2's first slice — real redaction (ADR-0017) — is also done. An MCP server slice (normally M4 scope) was pulled ahead on user request, to measure spec §11.4's S-1 benchmark before further capability work — see below and [`bench/`](../bench/).
+**Milestone:** M1.b.2b done (Rust, Python, PHP, TS/TSX/JS, Go — spec §5.2's full v1 language set), plus C# added post-v1 on user request (ADR-0016). M2's first slice — real redaction (ADR-0017) — is also done. An MCP server slice (normally M4 scope) was pulled ahead on user request, to measure spec §11.4's S-1 benchmark before further capability work (ADR-0018). **The S-1 benchmark has now been run (ADR-0019): neither threshold is met on a one-trial measurement** (combined input tokens: carto uses 18.0% more, not ≥30% fewer; accuracy: carto is 6.2 points lower, not ≥20 higher) — full per-task result in [`bench/`](../bench/) and ADR-0019; **M3 does not proceed automatically on this result — spec §11.4 requires the user's decision, and that decision is pending.**
 
 Where the implementation is in the milestone sequence, what's deliberately
 absent, and what's next. Everything else lives elsewhere on purpose:
@@ -76,11 +76,31 @@ so they've been subdivided. Current state:
   full scope (no semantic-layer/`plan --semantic` section, since that
   isn't built). Verified against a real `claude --mcp-config` client
   session, not just this crate's own unit tests — see
-  `bench/field-log.md`. `bench/` (spec §11.4's benchmark harness) is
-  in progress next, to actually answer S-1 before M2's infra graph or M3
-  gets built on an unvalidated value hypothesis.
-- **M2+ remaining** — infra graph, join, ingest. Per spec §10. **Current
-  head**, pending the S-1 benchmark result above.
+  `bench/field-log.md`.
+- **S-1 benchmark, run** (2026-08-03, ADR-0019) — 8 tasks (`bench/
+  tasks.md`) over carto's own repo and `~/playground/zed`, real and
+  deterministic-replay measurement arms (`bench/run.sh`, `bench/
+  replay/`), scored and graded (`bench/score.py`, `bench/results/
+  20260803T112447/`). **Result: neither S-1 threshold is met** on this
+  one-trial measurement — combined input tokens 18.0% *higher* for
+  carto (threshold: ≥30% lower), accuracy 6.2 points *lower*
+  (threshold: ≥20 points higher). Two real harness bugs were found and
+  fixed before this result could be trusted (a neutral-cwd setup that
+  silently invalidated 5 of 8 tasks on the first attempt, and one
+  isolated MCP-connection flake) — see ADR-0019 and `bench/field-log.md`
+  for the full accounting, including real dollar cost of the mistakes.
+  The per-task pattern is more informative than the aggregate: 3 of 8
+  tasks are clean carto wins on tokens (one, whole-repo orientation, by
+  74%); the sole accuracy loss traces to the agent misreading carto's
+  own verified-correct tool output, not bad data; and the three hardest
+  transitive-call tasks are all correct for carto specifically because
+  the agent recognized carto's documented ADR-0008 limitation in the
+  moment and fell back to grep rather than trusting an incomplete
+  answer. **Per spec §11.4, this ADR does not decide whether M3
+  proceeds — that's the user's call, presented and pending.**
+- **M2+ remaining** — infra graph, join, ingest. Per spec §10. **Paused
+  at the S-1 gate, pending the user's M3 go/no-go decision above** —
+  not proceeding automatically.
 
 Post-M1.b.2b hardening (2026-08-01): real-world PHP field-testing
 against a TYPO3 codebase surfaced two query-layer gaps, both fixed —
@@ -269,7 +289,7 @@ Do not "fix" these without checking the linked reasoning first:
   same "no manifest parsing" precedent as every other language.
   ADR-0016.
 
-## Next: the S-1 benchmark, then M2's remaining scope (infra graph, join, ingest)
+## Next: the user's M3 go/no-go decision, then M2's remaining scope or M3
 
 M1.b.2b is done — spec §5.2's full v1 language set (TypeScript, TSX,
 JavaScript, Python, Rust, Go, PHP) is implemented, plus C# post-v1
@@ -296,20 +316,25 @@ scope needed a genuinely new resolution tier, not just a new
 
 Real redaction (ADR-0017) is M2's first slice, done. An MCP server slice
 (ADR-0018, `carto serve`) — normally M4 scope — was pulled ahead on user
-request: spec §10 gates M3 on running §11.4's S-1 benchmark first
-("agent-with-carto answers structural questions with ≥30% fewer input
-tokens and ≥20% higher accuracy than agent-with-grep-only," measured
-before M3 starts, and *"if S-1 fails ... stop and reassess product
-direction with the user rather than proceeding"*), and that benchmark
-needs carto's real agent-facing surface — an MCP server an agent
-actually calls as a tool — not the CLAUDE.md-snippet-and-Bash-tool
-stopgap the README used to document. `bench/` (spec §11.4's task set,
-ground truth, and measurement harness) is the immediate next step, not
-yet built as of this MCP slice landing. Only after S-1's result is
-presented and the user decides whether to proceed does M2's remaining
+request so spec §11.4's S-1 benchmark could be run against carto's real
+agent-facing surface (an MCP server an agent actually calls as a tool)
+rather than the README's old CLAUDE.md-snippet-and-Bash-tool stopgap.
+**The benchmark has now been built and run** (ADR-0019, `bench/`) — 8
+tasks, both a real-run and a deterministic-replay measurement arm,
+every session's answer graded against source-derived ground truth.
+**Result: neither S-1 threshold is met** on this one-trial measurement
+(combined input tokens 18.0% higher for carto, not ≥30% lower; accuracy
+6.2 points lower, not ≥20 higher) — though the per-task pattern
+underneath is more nuanced than the headline (see ADR-0019's full
+writeup: 3 clean carto wins, one accuracy loss traceable to a specific
+misread rather than bad data, and a genuinely encouraging pattern where
+the agent correctly fell back to grep on every task where it recognized
+carto's known ADR-0008 limitation). Spec §11.4 requires presenting this
+to the user and waiting for the M3 go/no-go decision, not deciding it
+here — that decision is **pending**. Until it lands, M2's remaining
 scope (the infrastructure graph, Terraform/CFN/CDK, and the code↔infra
-join) or M3 resume. Read spec §6 before planning that infra slice — it
-hasn't been sliced yet the way M1.b was.
+join — spec §6, not sliced yet the way M1.b was) and M3 are both paused,
+not proceeding by default.
 
 Also worth knowing before touching `resolve.rs` again: building
 `fixtures/php-app` surfaced a real, language-agnostic bug in call
