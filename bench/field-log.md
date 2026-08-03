@@ -91,3 +91,40 @@ No misses logged yet at this stage — Part 0 was infrastructure/measurement
 only, not yet real navigation. The next entries (Part A: building
 `carto-mcp`) will log real `where`/`deps`/`map` calls made in the course of
 navigating carto's own codebase.
+
+## 2026-08-03 — Part A: real MCP client connectivity check
+
+Built `crates/carto-mcp` (hand-rolled JSON-RPC 2.0 stdio server, no
+`rmcp` — ADR-0018) and wired `carto serve`. Beyond the 34 in-crate unit
+tests and 5 `assert_cmd` end-to-end tests (real binary, real stdin/
+stdout, no LLM involved), verified against an actual MCP client: a real
+`claude -p` session with `--mcp-config` pointed at `carto serve` and
+`--allowedTools mcp__carto__*`.
+
+Prompt: call `selfcheck`, then `index` this repo, then `where redact
+--limit 3`. Real result (`claude -p --output-format json`):
+
+- 3 tool calls made, in the requested order, tools correctly discovered
+  via `tools/list` and invoked via `tools/call` — no protocol errors, no
+  malformed-schema rejections from the client.
+- `selfcheck` → carto 0.1.0, schema v1, confinement digest reported.
+- `index` → 178 files, 1,276 nodes, 2,228 edges, 17 redactions, at the
+  real current commit — a genuinely fresh index, not a cached fixture.
+- `where redact --limit 3` → `RedactionCounts`, `redact()`,
+  `redact_tainted_string()`, all correctly attributed to
+  `crates/carto-core/src/redact/mod.rs` — matches the CLI's own answer
+  for the same query (spot-checked separately via `carto where redact`).
+- Cost/usage for the whole 3-tool-call, 5-turn session (`sonnet`,
+  real API usage block): 10 fresh input tokens, 33,760 cache-creation
+  tokens, 130,690 cache-read tokens, 786 output tokens, $0.254 total,
+  15.3s wall.
+
+One methodology note worth recording: this check ran *without* `--bare`
+(normal OAuth session auth), not the `--bare` + `ANTHROPIC_API_KEY` mode
+`bench/run.sh` (still to come) will use for the actual S-1 measurement —
+`--bare` refuses OAuth/keychain auth by design, and no API key is set in
+this environment. This check answers "does a real client work against
+the server," not "what does a clean token count look like" — the cache-
+heavy usage numbers above (bare session start, no prior conversation)
+aren't the controlled baseline the benchmark needs, and shouldn't be
+read as one.
