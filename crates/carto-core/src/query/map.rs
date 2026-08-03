@@ -24,6 +24,46 @@ use std::collections::{BTreeMap, BTreeSet};
 /// full listing; `deps`/`where` are for exhaustive traversal.
 const RANKED_ROWS: usize = 10;
 
+/// One of `map`'s rendered sections, in spec §7.1's fixed order — §2.1's
+/// `--section` filter (ADR to follow) lets a caller ask for a subset
+/// instead of always paying for the full overview, the clearest, cheapest
+/// token-efficiency win the S-1 benchmark's replay arm found: a narrowly-
+/// scoped question (e.g. "what does this repo depend on externally")
+/// only ever needed one section, but every call rendered all four.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MapSection {
+    Counts,
+    Modules,
+    EntryPoints,
+    Infra,
+}
+
+impl MapSection {
+    /// The spelling accepted by `--section` and used when composing a
+    /// `Truncation::next_call` — mirrors [`EdgeKind::as_str`]'s role for
+    /// `deps --kinds`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MapSection::Counts => "counts",
+            MapSection::Modules => "modules",
+            MapSection::EntryPoints => "entry-points",
+            MapSection::Infra => "infra",
+        }
+    }
+
+    /// Inverse of [`as_str`](Self::as_str). `None` for anything else.
+    pub fn parse(s: &str) -> Option<MapSection> {
+        match s {
+            "counts" => Some(MapSection::Counts),
+            "modules" => Some(MapSection::Modules),
+            "entry-points" => Some(MapSection::EntryPoints),
+            "infra" => Some(MapSection::Infra),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MapQuery {
     pub budget: u32,
@@ -37,6 +77,12 @@ pub struct MapQuery {
     /// section reduces to today's exact unscoped behavior in that case,
     /// not an approximation of it.
     pub subpath: Option<String>,
+    /// Restrict rendering to these sections (§2.1) — `None` (the
+    /// default) keeps today's full-overview behavior, additive rather
+    /// than a breaking change to the existing contract. `counts` (the
+    /// structured field) is always computed and returned regardless of
+    /// this filter; only which `lines` render is affected.
+    pub sections: Option<BTreeSet<MapSection>>,
 }
 
 impl MapQuery {
@@ -44,6 +90,7 @@ impl MapQuery {
         MapQuery {
             budget: consts::DEFAULT_MAP_BUDGET,
             subpath: None,
+            sections: None,
         }
     }
 }
@@ -78,12 +125,22 @@ pub fn run(qg: &QueryGraph, query: &MapQuery) -> MapResult {
     let subpath = query.subpath.as_deref();
     let counts = compute_counts(qg, subpath);
 
-    let sections: Vec<Vec<String>> = vec![
-        counts_lines(&counts),
-        top_modules_lines(qg, subpath),
-        entry_points_lines(qg, subpath),
-        infra_lines(),
+    // `counts` (the structured field) stays exact and whole regardless
+    // of `--section` (§2.2: the machine payload is never trimmed, only
+    // `--section` lets a caller ask for less of the rendered text) —
+    // this filter only decides which of these four blocks contribute to
+    // `lines`.
+    let all_sections: Vec<(MapSection, Vec<String>)> = vec![
+        (MapSection::Counts, counts_lines(&counts)),
+        (MapSection::Modules, top_modules_lines(qg, subpath)),
+        (MapSection::EntryPoints, entry_points_lines(qg, subpath)),
+        (MapSection::Infra, infra_lines()),
     ];
+    let sections: Vec<Vec<String>> = all_sections
+        .into_iter()
+        .filter(|(tag, _)| query.sections.as_ref().is_none_or(|s| s.contains(tag)))
+        .map(|(_, lines)| lines)
+        .collect();
 
     let budget = query.budget as usize;
     let mut lines: Vec<String> = Vec::new();
@@ -103,7 +160,19 @@ pub fn run(qg: &QueryGraph, query: &MapQuery) -> MapResult {
         } else {
             query.budget.saturating_mul(2)
         };
-        Truncation::more(format!("carto map --budget {next_budget}"))
+        // Carries --section forward too, if set — the same "the exact
+        // follow-up call reproduces the same scoped view" precedent
+        // `deps`'s --subpath truncation already set.
+        let section_flags = query
+            .sections
+            .as_ref()
+            .map(|s| {
+                s.iter()
+                    .map(|sec| format!(" --section {}", sec.as_str()))
+                    .collect::<String>()
+            })
+            .unwrap_or_default();
+        Truncation::more(format!("carto map --budget {next_budget}{section_flags}"))
     } else {
         Truncation::none()
     };
@@ -492,6 +561,7 @@ mod tests {
             &MapQuery {
                 budget: consts::DEFAULT_MAP_BUDGET,
                 subpath: Some("mg_site".to_string()),
+                sections: None,
             },
         );
         // handlers.rs + orders.rs, not vendor/legacy.rs.
@@ -506,6 +576,7 @@ mod tests {
             &MapQuery {
                 budget: consts::DEFAULT_MAP_BUDGET,
                 subpath: Some("mg_site".to_string()),
+                sections: None,
             },
         );
         let joined = result.lines.join("\n");
@@ -526,6 +597,7 @@ mod tests {
             &MapQuery {
                 budget: consts::DEFAULT_MAP_BUDGET,
                 subpath: Some("mg_site".to_string()),
+                sections: None,
             },
         );
         let joined = result.lines.join("\n");
@@ -546,6 +618,7 @@ mod tests {
             &MapQuery {
                 budget: consts::DEFAULT_MAP_BUDGET,
                 subpath: Some("mg_site".to_string()),
+                sections: None,
             },
         );
         let joined = result.lines.join("\n");
@@ -606,6 +679,7 @@ mod tests {
             &MapQuery {
                 budget: 3,
                 subpath: None,
+                sections: None,
             },
         );
         assert!(result.lines.len() <= 3);
@@ -627,6 +701,7 @@ mod tests {
             &MapQuery {
                 budget: 0,
                 subpath: None,
+                sections: None,
             },
         );
         assert!(result.lines.is_empty());
@@ -646,5 +721,94 @@ mod tests {
         let joined = result.lines.join("\n");
         assert!(joined.contains("(none)")); // top modules section, no files
         assert!(joined.contains("(none found)")); // entry points section
+    }
+
+    #[test]
+    fn section_filter_renders_only_the_requested_section() {
+        let qg = QueryGraph::from_document(small_repo_doc());
+        let mut sections = BTreeSet::new();
+        sections.insert(MapSection::Counts);
+        let result = run(
+            &qg,
+            &MapQuery {
+                budget: consts::DEFAULT_MAP_BUDGET,
+                subpath: None,
+                sections: Some(sections),
+            },
+        );
+        let joined = result.lines.join("\n");
+        assert!(joined.contains("files="));
+        assert!(!joined.contains("## top modules"));
+        assert!(!joined.contains("## entry points"));
+        assert!(!joined.contains("## infra"));
+    }
+
+    #[test]
+    fn section_filter_does_not_affect_the_structured_counts_field() {
+        // §2.2: the structured payload stays exact regardless of
+        // --section — only which lines render is restricted.
+        let qg = QueryGraph::from_document(small_repo_doc());
+        let mut sections = BTreeSet::new();
+        sections.insert(MapSection::Modules);
+        let scoped = run(
+            &qg,
+            &MapQuery {
+                budget: consts::DEFAULT_MAP_BUDGET,
+                subpath: None,
+                sections: Some(sections),
+            },
+        );
+        let full = run(&qg, &MapQuery::new());
+        assert_eq!(scoped.counts.files, full.counts.files);
+        assert_eq!(scoped.counts.symbols, full.counts.symbols);
+    }
+
+    #[test]
+    fn no_sections_filter_keeps_todays_full_overview_behavior() {
+        let qg = QueryGraph::from_document(small_repo_doc());
+        let with_none = run(
+            &qg,
+            &MapQuery {
+                budget: consts::DEFAULT_MAP_BUDGET,
+                subpath: None,
+                sections: None,
+            },
+        );
+        let with_default = run(&qg, &MapQuery::new());
+        assert_eq!(with_none.lines, with_default.lines);
+    }
+
+    #[test]
+    fn truncation_carries_the_section_filter_forward() {
+        let qg = QueryGraph::from_document(small_repo_doc());
+        let mut sections = BTreeSet::new();
+        sections.insert(MapSection::Counts);
+        sections.insert(MapSection::Modules);
+        let result = run(
+            &qg,
+            &MapQuery {
+                budget: 1,
+                subpath: None,
+                sections: Some(sections),
+            },
+        );
+        assert!(result.truncation.truncated);
+        let next = result.truncation.next_call.unwrap();
+        assert!(next.contains("--section counts"));
+        assert!(next.contains("--section modules"));
+        assert!(!next.contains("entry-points"));
+    }
+
+    #[test]
+    fn map_section_parse_is_the_exact_inverse_of_as_str_for_every_variant() {
+        for section in [
+            MapSection::Counts,
+            MapSection::Modules,
+            MapSection::EntryPoints,
+            MapSection::Infra,
+        ] {
+            assert_eq!(MapSection::parse(section.as_str()), Some(section));
+        }
+        assert_eq!(MapSection::parse("not-a-section"), None);
     }
 }

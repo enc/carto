@@ -7,13 +7,14 @@
 //! the CLI's own `map_cmd.rs::print_human`.
 
 use crate::render;
-use carto_core::query::{self, MapQuery, QueryGraph};
+use carto_core::query::{self, MapQuery, MapSection, QueryGraph};
 use carto_core::{consts, graph, target};
 use serde_json::Value;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 #[cfg(test)]
-pub(crate) const PARAM_NAMES: &[&str] = &["repo_path", "out", "budget", "subpath"];
+pub(crate) const PARAM_NAMES: &[&str] = &["repo_path", "out", "budget", "subpath", "sections"];
 
 pub fn call(args: &Value) -> Result<Value, String> {
     let repo_path = args
@@ -30,15 +31,43 @@ pub fn call(args: &Value) -> Result<Value, String> {
         .get("subpath")
         .and_then(Value::as_str)
         .map(str::to_string);
+    let sections = match args.get("sections").and_then(Value::as_str) {
+        None => None,
+        Some(s) => Some(parse_sections(s)?),
+    };
 
     let t = target::resolve(Path::new(repo_path), &out).map_err(|e| e.to_string())?;
     let doc = graph::load(&t.out_root).map_err(|e| e.to_string())?;
     let qg = QueryGraph::from_document(doc);
-    let result = query::map(&qg, &MapQuery { budget, subpath });
+    let result = query::map(
+        &qg,
+        &MapQuery {
+            budget,
+            subpath,
+            sections,
+        },
+    );
 
     let text = render_text(&result);
     let structured = serde_json::to_value(&result).map_err(|e| e.to_string())?;
     Ok(render::envelope(structured, &text))
+}
+
+fn parse_sections(s: &str) -> Result<BTreeSet<MapSection>, String> {
+    let mut sections = BTreeSet::new();
+    for part in s.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        match MapSection::parse(part) {
+            Some(section) => {
+                sections.insert(section);
+            }
+            None => return Err(format!("unknown section `{part}` in `sections`")),
+        }
+    }
+    Ok(sections)
 }
 
 fn render_text(result: &query::MapResult) -> String {
@@ -62,5 +91,14 @@ mod tests {
     fn missing_repo_path_is_a_tool_error() {
         let err = call(&serde_json::json!({})).unwrap_err();
         assert!(err.contains("repo_path"));
+    }
+
+    #[test]
+    fn invalid_section_is_a_tool_error() {
+        let err = call(&serde_json::json!({
+            "repo_path": ".", "sections": "not-a-section"
+        }))
+        .unwrap_err();
+        assert!(err.contains("section"));
     }
 }

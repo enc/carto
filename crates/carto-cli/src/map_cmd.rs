@@ -6,10 +6,31 @@
 use carto_core::consts;
 use carto_core::error::Result;
 use carto_core::graph;
-use carto_core::query::{self, MapQuery, QueryGraph};
+use carto_core::query::{self, MapQuery, MapSection, QueryGraph};
 use carto_core::target;
 use clap::Args;
+use std::collections::BTreeSet;
 use std::path::PathBuf;
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum SectionArg {
+    Counts,
+    Modules,
+    #[value(name = "entry-points")]
+    EntryPoints,
+    Infra,
+}
+
+impl From<SectionArg> for MapSection {
+    fn from(s: SectionArg) -> Self {
+        match s {
+            SectionArg::Counts => MapSection::Counts,
+            SectionArg::Modules => MapSection::Modules,
+            SectionArg::EntryPoints => MapSection::EntryPoints,
+            SectionArg::Infra => MapSection::Infra,
+        }
+    }
+}
 
 #[derive(Args)]
 pub struct MapArgs {
@@ -34,15 +55,35 @@ pub struct MapArgs {
     /// index by itself.
     #[arg(long)]
     subpath: Option<String>,
+
+    /// Restrict rendering to these sections (repeatable, e.g.
+    /// `--section counts --section modules`). Defaults to every
+    /// section (today's full-overview behavior). `counts` (the
+    /// structured field) is always exact and returned regardless of
+    /// this filter.
+    #[arg(long, value_enum)]
+    section: Vec<SectionArg>,
 }
 
 pub fn run(args: &MapArgs) -> Result<query::MapResult> {
     let target = target::resolve(&args.path, &args.out)?;
     let doc = graph::load(&target.out_root)?;
     let qg = QueryGraph::from_document(doc);
+    let sections = if args.section.is_empty() {
+        None
+    } else {
+        Some(
+            args.section
+                .iter()
+                .copied()
+                .map(MapSection::from)
+                .collect::<BTreeSet<_>>(),
+        )
+    };
     let map_query = MapQuery {
         budget: args.budget,
         subpath: args.subpath.clone(),
+        sections,
     };
     Ok(query::map(&qg, &map_query))
 }

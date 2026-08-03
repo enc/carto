@@ -75,6 +75,7 @@ pub fn tool_list() -> Vec<Value> {
                     "out": { "type": "string", "description": "Output directory carto previously indexed into." },
                     "budget": { "type": "integer", "description": "Max lines in the rendered overview.", "default": 200 },
                     "subpath": { "type": "string", "description": "Restrict the overview to this repo-relative directory." },
+                    "sections": { "type": "string", "description": "Comma-separated sections to render (counts,modules,entry-points,infra). Defaults to every section. The structured `counts` field is always exact regardless of this filter." },
                 },
                 "required": ["repo_path"],
             },

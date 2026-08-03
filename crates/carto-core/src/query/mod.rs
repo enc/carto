@@ -27,7 +27,7 @@ use std::collections::BTreeMap;
 
 pub use deps::{DepEdge, DepsQuery, DepsResult, Hop, NodeSummary, run as deps};
 pub use find::{FindQuery, FindResult, SymbolMatch, run as find};
-pub use map::{MapCounts, MapQuery, MapResult, run as map};
+pub use map::{MapCounts, MapQuery, MapResult, MapSection, run as map};
 
 /// The spec §7.2 truncation contract every query result ends with:
 /// "Every response ends with `truncated: bool` and, if true, the exact
