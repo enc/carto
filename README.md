@@ -40,7 +40,12 @@ Implementation in progress, milestone by milestone (spec §10). Currently:
 **M1.b.2b done** — `carto index`/`where`/`deps`/`map` work
 end-to-end against Rust, Python, PHP, Go, C#, and
 TypeScript/TSX/JavaScript repos: spec §5.2's full v1 language set,
-plus C# added post-v1 (ADR-0016). See
+plus C# added post-v1 (ADR-0016). **M2's first slice, real redaction,
+is done** (ADR-0017). **An MCP server slice** (normally M4, pulled ahead
+to measure spec §11.4's S-1 benchmark before more capability gets built —
+see [`bench/`](bench/)) also exists: `carto serve` exposes
+`index`/`where`/`deps`/`map`/`selfcheck` over MCP stdio
+([ADR-0018](docs/adr/0018-mcp-transport-hand-rolled-jsonrpc.md)). See
 [`docs/STATUS.md`](docs/STATUS.md) for the detailed handoff.
 
 ## Building
@@ -56,37 +61,44 @@ Build a `carto` binary you can actually run against a project:
 ```
 cargo build --release -p carto-cli
 # binary at target/release/carto — put it on PATH, or reference the
-# full path in the CLAUDE.md snippet below.
+# full path in the MCP config below.
 ```
 
 ## Using with Claude Code
 
-There's no MCP server yet (that's M4) — for now, point Claude Code at
-the CLI by adding a short note to the *target* repo's own `CLAUDE.md`
-(the repo you want indexed, not this one):
+carto runs as a real MCP server (spec §7.3), not a CLI wrapped in a
+prompt note. Point Claude Code at the built binary:
 
-```markdown
-## Code navigation
-
-This repo is indexed with `carto` (github.com/enc/carto). Prefer it
-over grep/rg for symbol lookups and call-graph questions:
-
-    carto index . --out /tmp/carto-out           # once per session, or after a large change
-    carto where <symbol> . --out /tmp/carto-out   # find a symbol by name (substring or --exact)
-    carto deps <symbol> . --out /tmp/carto-out --dir in --depth 2   # what calls this
-    carto map . --out /tmp/carto-out --budget 50  # layered overview: top modules, entry points
-
-Every edge carries a confidence (`certain`/`inferred`); `inferred` means
-verify before acting on it. Symbol IDs change when code moves — re-run
-`where` after edits rather than reusing an old one.
+```bash
+claude mcp add carto -- /path/to/carto serve
 ```
 
-Claude Code picks this up automatically and runs the commands itself via
-its Bash tool when the note tells it to. This is a stopgap: spec §9.3's
-real integration point is a single `skill/carto.skill.md` file the user
-copies in themselves (M4), and §7.3's MCP server exposes the same core
-functions as the CLI — the manual `CLAUDE.md` pointer above works today
-because `where`/`deps`/`map` already *are* those same functions.
+or add it directly to an MCP config file:
+
+```json
+{
+  "mcpServers": {
+    "carto": { "command": "/path/to/carto", "args": ["serve"] }
+  }
+}
+```
+
+This exposes `index`/`where`/`deps`/`map`/`selfcheck` as tools — the
+same core functions the CLI's own subcommands call
+(`crates/carto-core/src/query/`, `crates/carto-core/src/indexer.rs`), so
+answers are identical either way. Copy
+[`skill/carto.skill.md`](skill/carto.skill.md) into your agent's skills
+directory (spec §9.3's "the one integration file") for a description of
+what carto answers well and its honesty contract (confidence per edge,
+symbol IDs that change when code moves); the file has no imperative
+pressure language by design — it describes capabilities and lets the
+agent decide when to use them.
+
+The MCP transport is a hand-rolled newline-delimited JSON-RPC 2.0 stdio
+loop, not `rmcp` — [ADR-0018](docs/adr/0018-mcp-transport-hand-rolled-jsonrpc.md)
+records why (in short: `rmcp`'s dependency tree pulls an async runtime
+into an otherwise fully synchronous, dependency-minimal codebase for a
+transport simple enough to hand-roll with zero new dependencies).
 
 ## License
 

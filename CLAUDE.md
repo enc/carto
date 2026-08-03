@@ -39,6 +39,7 @@ cargo run -p carto-cli -- where <name> <repo> --out /tmp/carto-out
 cargo run -p carto-cli -- deps <name|id> <repo> --out /tmp/carto-out --dir out --depth 2
 cargo run -p carto-cli -- map <repo> --out /tmp/carto-out --budget 50
 cargo run -p carto-cli -- selfcheck
+cargo run -p carto-cli -- serve   # MCP stdio server (spec §7.3); see docs/adr/0018
 
 # Regenerate a golden file after an intentional change (walk-only, or
 # where/deps/map against fixtures/rust-crate):
@@ -94,25 +95,40 @@ walk ──► lang::extract_and_resolve ──► Graph ──► graph::persis
                                                 → size caps → atomic write
                                                 through PathGuard)
 
-<out>/graph.json ──► graph::load ──► QueryGraph ──► query::{find,deps,map} ──► CLI renderer
-                     (size-checked                  (adjacency index,          (--json: plain
-                      before parse,                  BFS/scans,                 serde; human:
-                      schema-checked)                 BTreeMap, not             render_fenced()
-                                                       petgraph — ADR-0009)      once per section,
-                                                                                 ADR-0010)
+<out>/graph.json ──► graph::load ──► QueryGraph ──► query::{find,deps,map} ──┬──► CLI renderer
+                     (size-checked                  (adjacency index,       │    (--json: plain
+                      before parse,                  BFS/scans,             │     serde; human:
+                      schema-checked)                 BTreeMap, not         │     render_fenced()
+                                                       petgraph — ADR-0009)  │     once per section,
+                                                                             │     ADR-0010)
+                                                                             └──► carto-mcp tools/*
+                                                                                  (structuredContent:
+                                                                                  same struct; content:
+                                                                                  same render_fenced(),
+                                                                                  capped at 8 KiB —
+                                                                                  ADR-0018)
 ```
 
 `query`'s result structs (`FindResult`, `DepsResult`, …) are plain
 serde types over `&QueryGraph` — spec §7.1's "commands = MCP tools, same
-core functions" means these are also M4's MCP payloads, so their serde
-shape is a compatibility surface the CLI only renders, not an internal
-detail to reshape freely.
+core functions" means these are also the MCP server's payloads, so their
+serde shape is a compatibility surface both front ends only render, not
+an internal detail either reshapes freely.
 
 - **`crates/carto-core`** — everything above; no clap, no rmcp, no I/O
   besides fs.
 - **`crates/carto-cli`** — bin target `carto`. `main.rs` is a thin dispatch:
   one `run(cli) -> Result<u8>`, with `Error::exit_code()` → process exit
   mapped in exactly one place (0 ok / 1 user / 2 data / 3 invariant refusal).
+  Mounts `carto-mcp` behind the `serve` subcommand.
+- **`crates/carto-mcp`** — the MCP stdio server (spec §7.3). Hand-rolled
+  newline-delimited JSON-RPC 2.0, not `rmcp` — ADR-0018 records why (in
+  short: `rmcp`'s dependency tree pulls an async runtime into an
+  otherwise fully synchronous codebase for a transport simple enough to
+  hand-roll in ~300 LOC with zero new dependencies). Depends on
+  `carto-core` only; every tool handler in `tools/` calls the same core
+  function the CLI subcommand of the same name calls — no query logic
+  lives here.
 - **`crates/carto-grammars`** — tree-sitter grammar loading. The workspace's
   **one** `unsafe_code` exception (spec §3.1): it cannot use
   `[lints] workspace = true` (inheritance is all-or-nothing and `forbid`

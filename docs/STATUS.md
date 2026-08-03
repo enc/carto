@@ -1,6 +1,6 @@
 # carto — status / handoff
 
-**Milestone:** M1.b.2b done (Rust, Python, PHP, TS/TSX/JS, Go — spec §5.2's full v1 language set), plus C# added post-v1 on user request (ADR-0016). M2's first slice — real redaction (ADR-0017) — is also done.
+**Milestone:** M1.b.2b done (Rust, Python, PHP, TS/TSX/JS, Go — spec §5.2's full v1 language set), plus C# added post-v1 on user request (ADR-0016). M2's first slice — real redaction (ADR-0017) — is also done. An MCP server slice (normally M4 scope) was pulled ahead on user request, to measure spec §11.4's S-1 benchmark before further capability work — see below and [`bench/`](../bench/).
 
 Where the implementation is in the milestone sequence, what's deliberately
 absent, and what's next. Everything else lives elsewhere on purpose:
@@ -57,7 +57,30 @@ so they've been subdivided. Current state:
   shipping: long, descriptive `snake_case` test names crossing the
   entropy threshold purely from underscore-joined lexical diversity —
   see ADR-0017's own section on it.
-- **M2+ remaining** — infra graph, join, MCP, ingest. Per spec §10. **Current head.**
+- **MCP server slice** (2026-08-03, ADR-0018) — normally M4 scope
+  (`carto-mcp`, spec §7.3), pulled ahead of M2's remaining work and M3
+  on user request: spec §10/§11.4 gate M3 on running the S-1 benchmark
+  ("agent-with-carto answers structural questions with ≥30% fewer input
+  tokens and ≥20% higher accuracy than agent-with-grep-only") before
+  starting it, and that benchmark needs a real agent-facing surface, not
+  the README's old CLAUDE.md-snippet-and-Bash-tool stopgap, to measure
+  honestly. `carto serve` exposes `index`/`where`/`deps`/`map`/
+  `selfcheck` — exactly M1's tool set, nothing from M2+ — over a
+  hand-rolled JSON-RPC 2.0 stdio transport (not `rmcp`; ADR-0018 has the
+  dependency-tree evidence). Every tool handler calls the same
+  `carto_core::query::{find,deps,map}` / `carto_core::indexer::
+  build_and_persist` function its CLI counterpart calls — no query logic
+  duplicated. First real enforcement of `consts::MCP_TEXT_CAP` anywhere
+  in the codebase. `skill/carto.skill.md` (spec §9.3) written against
+  what's actually implemented today, not aspirationally against M4's
+  full scope (no semantic-layer/`plan --semantic` section, since that
+  isn't built). Verified against a real `claude --mcp-config` client
+  session, not just this crate's own unit tests — see
+  `bench/field-log.md`. `bench/` (spec §11.4's benchmark harness) is
+  in progress next, to actually answer S-1 before M2's infra graph or M3
+  gets built on an unvalidated value hypothesis.
+- **M2+ remaining** — infra graph, join, ingest. Per spec §10. **Current
+  head**, pending the S-1 benchmark result above.
 
 Post-M1.b.2b hardening (2026-08-01): real-world PHP field-testing
 against a TYPO3 codebase surfaced two query-layer gaps, both fixed —
@@ -124,9 +147,13 @@ Do not "fix" these without checking the linked reasoning first:
 - **No stale-index detection** — `manifest.json` carries `commit_sha`/
   `file_sha256` but nothing compares them against the working tree.
   M5 incrementality territory.
-- **`MCP_TEXT_CAP`'s 8 KiB byte cap isn't enforced anywhere yet** — no
-  MCP text renderer exists until M4. Today's output is bounded by each
-  command's own `--limit`/`--depth`/`--budget`.
+- ~~`MCP_TEXT_CAP`'s 8 KiB byte cap isn't enforced anywhere yet~~ —
+  **enforced** as of the MCP server slice below (`carto-mcp/src/
+  render.rs::cap_text`, on a line boundary, with `structuredContent`
+  staying uncapped). Each CLI command's own `--limit`/`--depth`/`--budget`
+  remains the *only* bound on CLI output — the MCP cap is a second,
+  independent dimension that only applies to `carto serve`'s text
+  responses.
 - **Redaction only scans `TaintedString` fields, not literally every
   `String` field** (spec §7.5's wording) — `FileNode.path`,
   `ModuleNode.path`, `SymbolNode.name`, and `UnresolvedCall.name` are
@@ -242,7 +269,7 @@ Do not "fix" these without checking the linked reasoning first:
   same "no manifest parsing" precedent as every other language.
   ADR-0016.
 
-## Next: M2 (infra graph, join, MCP, ingest, real redaction)
+## Next: the S-1 benchmark, then M2's remaining scope (infra graph, join, ingest)
 
 M1.b.2b is done — spec §5.2's full v1 language set (TypeScript, TSX,
 JavaScript, Python, Rust, Go, PHP) is implemented, plus C# post-v1
@@ -267,9 +294,21 @@ PHP, same *directory* for Go — the one language so far where package
 scope needed a genuinely new resolution tier, not just a new
 `RawImport` variant).
 
-Real redaction (ADR-0017) is M2's first slice, done. What's left of M2
-per spec §10: the infrastructure graph (Terraform/CFN/CDK) and the
-code↔infra join. Read spec §6 before planning that next slice — it
+Real redaction (ADR-0017) is M2's first slice, done. An MCP server slice
+(ADR-0018, `carto serve`) — normally M4 scope — was pulled ahead on user
+request: spec §10 gates M3 on running §11.4's S-1 benchmark first
+("agent-with-carto answers structural questions with ≥30% fewer input
+tokens and ≥20% higher accuracy than agent-with-grep-only," measured
+before M3 starts, and *"if S-1 fails ... stop and reassess product
+direction with the user rather than proceeding"*), and that benchmark
+needs carto's real agent-facing surface — an MCP server an agent
+actually calls as a tool — not the CLAUDE.md-snippet-and-Bash-tool
+stopgap the README used to document. `bench/` (spec §11.4's task set,
+ground truth, and measurement harness) is the immediate next step, not
+yet built as of this MCP slice landing. Only after S-1's result is
+presented and the user decides whether to proceed does M2's remaining
+scope (the infrastructure graph, Terraform/CFN/CDK, and the code↔infra
+join) or M3 resume. Read spec §6 before planning that infra slice — it
 hasn't been sliced yet the way M1.b was.
 
 Also worth knowing before touching `resolve.rs` again: building
