@@ -198,18 +198,24 @@ fn extract_imports(root: Node, src: &[u8]) -> Vec<RawImport> {
                 }
                 "use.decl" => {
                     if let Some(arg) = cap.node.child_by_field_name("argument") {
-                        if let Some((root_seg, imported_name)) = walk_use_tree(arg, src) {
+                        // One `use` declaration can name more than one
+                        // root when it's a bare, path-less group (`use
+                        // {crate::a, std::b};`, rare) — group the
+                        // resulting pairs by root so the common case
+                        // (`use a::{b, c};`, one shared root) still
+                        // produces exactly one `RawImport`, same as a
+                        // single-path `use` always has (§1.3, ADR-0022).
+                        let mut by_root: BTreeMap<String, Vec<ImportedName>> = BTreeMap::new();
+                        for (root_seg, imported_name) in walk_use_clause(arg, src) {
+                            by_root.entry(root_seg).or_default().push(ImportedName {
+                                declared_name: imported_name.clone(),
+                                bound_name: imported_name,
+                            });
+                        }
+                        for (root_seg, imported_names) in by_root {
                             out.push(RawImport::Absolute {
                                 root: root_seg,
-                                // `use_as_clause` isn't walked (see
-                                // `walk_use_tree`'s doc comment), so a
-                                // `use` this extractor recognizes never
-                                // aliases — bound and declared name are
-                                // always the same string.
-                                imported_names: vec![ImportedName {
-                                    declared_name: imported_name.clone(),
-                                    bound_name: imported_name,
-                                }],
+                                imported_names,
                             });
                         }
                     }
@@ -221,16 +227,152 @@ fn extract_imports(root: Node, src: &[u8]) -> Vec<RawImport> {
     out
 }
 
-/// Walks a `use` argument tree, returning `(root_segment, imported_name)`
-/// — both always present when this returns `Some` at all (a `use`
-/// declaration this function recognizes always names exactly one item).
-/// Handles plain paths (`use crate::orders::parse_order;`,
-/// `use serde;`) at arbitrary depth by following the `scoped_identifier`
-/// chain's `path` field to its leftmost leaf. Deliberately does not
-/// handle `use_list` (`use a::{b, c};`), `use_wildcard` (`use a::*;`), or
-/// `use_as_clause` (`use a::b as c;`) — returns `None`, extracting
-/// nothing for that declaration rather than guessing (spec §5.3
-/// "deliberately modest"; ADR-0008).
+/// Expands a `use` argument tree into zero or more `(root_segment,
+/// imported_name)` pairs — the same shape a single-path `use` has
+/// always produced, generalized to the two grouped shapes
+/// tree-sitter-rust's grammar can nest under a `use` (§1.3, ADR-0022,
+/// amending ADR-0008's original blanket `use_list` exclusion):
+///
+/// - `scoped_use_list` (`use a::{b, c};`, or nested `use a::{b::{c,
+///   d}, e};`) — the group's own leftmost segment (`leftmost_text`)
+///   becomes every member's `root_segment`; each member is walked via
+///   [`walk_use_list_member`], threading that root through unchanged
+///   at any nesting depth (a nested group's *own* path, e.g. `b` above,
+///   only ever matters for resolving a `self` member inside it — see
+///   that function).
+/// - a bare `use_list` with no enclosing path at all (`use {a::b,
+///   c::d};`, rare — only reachable when the whole `use` has no shared
+///   prefix) — each member is independent, so this just delegates to
+///   [`walk_use_list_member`] with no inherited root.
+/// - anything else (a plain path, `use_as_clause`, `use_wildcard`) is
+///   the pre-existing base case, [`walk_use_tree`].
+fn walk_use_clause(node: Node, src: &[u8]) -> Vec<(String, String)> {
+    match node.kind() {
+        "scoped_use_list" => {
+            let Some(list) = node.child_by_field_name("list") else {
+                return Vec::new();
+            };
+            let root = node
+                .child_by_field_name("path")
+                .map(|p| leftmost_text(p, src));
+            let group_last_segment = node
+                .child_by_field_name("path")
+                .map(|p| last_path_segment(p, src));
+            let mut out = Vec::new();
+            let mut list_cursor = list.walk();
+            for member in list.named_children(&mut list_cursor) {
+                out.extend(walk_use_list_member(
+                    member,
+                    src,
+                    root.as_deref(),
+                    group_last_segment.as_deref(),
+                ));
+            }
+            out
+        }
+        "use_list" => {
+            let mut out = Vec::new();
+            let mut list_cursor = node.walk();
+            for member in node.named_children(&mut list_cursor) {
+                out.extend(walk_use_list_member(member, src, None, None));
+            }
+            out
+        }
+        _ => walk_use_tree(node, src).into_iter().collect(),
+    }
+}
+
+/// One member of a `use_list` — reached only from [`walk_use_clause`].
+/// `inherited_root` is the enclosing group's classification root
+/// (`None` only for a bare path-less top-level `use_list`, in which
+/// case a plain-path member resolves its own root via
+/// [`walk_use_tree`] instead). `group_last_segment` is the *immediately
+/// enclosing* group's own last path segment — used only to resolve a
+/// `self` member (`use std::io::{self, Write};` imports `io` itself
+/// alongside `Write`; a nested `use a::{b::{self, c}};` imports `b`
+/// itself, not `a`, so this is deliberately the nearest enclosing
+/// group's segment, not the outermost one, even though `inherited_root`
+/// itself always stays the outermost).
+fn walk_use_list_member(
+    node: Node,
+    src: &[u8],
+    inherited_root: Option<&str>,
+    group_last_segment: Option<&str>,
+) -> Vec<(String, String)> {
+    match node.kind() {
+        "self" => match (inherited_root, group_last_segment) {
+            (Some(root), Some(name)) => vec![(root.to_string(), name.to_string())],
+            // A bare top-level `self` (no enclosing group) doesn't
+            // parse as this node kind at all in valid Rust — stay
+            // non-panicking and extract nothing rather than guess.
+            _ => Vec::new(),
+        },
+        "scoped_use_list" => {
+            // A nested group (`use a::{b::{c, d}, e};`): the *outer*
+            // root threads through unchanged — recursing via
+            // `walk_use_clause` here would incorrectly recompute a
+            // deeper root from this node's own `path` (`b`), which
+            // matters only for a `self` member directly inside it.
+            let Some(list) = node.child_by_field_name("list") else {
+                return Vec::new();
+            };
+            let nested_last_segment = node
+                .child_by_field_name("path")
+                .map(|p| last_path_segment(p, src));
+            let mut out = Vec::new();
+            let mut list_cursor = list.walk();
+            for member in list.named_children(&mut list_cursor) {
+                out.extend(walk_use_list_member(
+                    member,
+                    src,
+                    inherited_root,
+                    nested_last_segment.as_deref(),
+                ));
+            }
+            out
+        }
+        // Still excluded, individually rather than dropping the whole
+        // statement (ADR-0008/ADR-0022): no enumerable member list for
+        // a wildcard, and an aliased member's own name is a separate,
+        // smaller judgment call left out of this slice.
+        "use_as_clause" | "use_wildcard" => Vec::new(),
+        _ => match inherited_root {
+            // A member with a real inherited root only ever contributes
+            // its own *trailing* segment as the imported name (`b::c`
+            // inside `use a::{b::c, d};` binds as `c`, the same
+            // "root + leaf name only, middle segments dropped"
+            // simplification a single-path `use` already made) — the
+            // root for classification is always the group's, never
+            // recomputed from the member itself.
+            Some(root) => {
+                let name = match node.kind() {
+                    "scoped_identifier" => node
+                        .child_by_field_name("name")
+                        .map(|n| text(src, n))
+                        .unwrap_or_else(|| text(src, node)),
+                    _ => text(src, node),
+                };
+                vec![(root.to_string(), name)]
+            }
+            // No inherited root (a bare path-less `use_list` member) —
+            // this member supplies its own complete path.
+            None => walk_use_tree(node, src).into_iter().collect(),
+        },
+    }
+}
+
+/// Walks a plain `use` path (no grouping at all) to
+/// `(root_segment, imported_name)` — both always present when this
+/// returns `Some` at all. Handles plain paths (`use
+/// crate::orders::parse_order;`, `use serde;`) at arbitrary depth by
+/// following the `scoped_identifier` chain's `path` field to its
+/// leftmost leaf. This is the base case [`walk_use_clause`] falls back
+/// to for a non-grouped `use`; `use_wildcard` (`use a::*;`) and
+/// `use_as_clause` (`use a::b as c;`) still return `None` here — no
+/// enumerable member list for the former, and an aliased top-level
+/// `use` is the same smaller judgment call left out as an aliased
+/// group member (ADR-0008; grouping itself is no longer excluded,
+/// ADR-0022).
 fn walk_use_tree(node: Node, src: &[u8]) -> Option<(String, String)> {
     if node.kind() == "scoped_identifier" {
         let path = node.child_by_field_name("path")?;
@@ -242,6 +384,19 @@ fn walk_use_tree(node: Node, src: &[u8]) -> Option<(String, String)> {
     } else {
         None
     }
+}
+
+/// The last (rightmost) segment of a plain `use` path node — `io` for
+/// `std::io`, `a` for a bare `a`. Used only to resolve a `self` group
+/// member, where the *bound name* is the enclosing group's own last
+/// segment rather than the literal text `self`.
+fn last_path_segment(node: Node, src: &[u8]) -> String {
+    if node.kind() == "scoped_identifier" {
+        if let Some(name) = node.child_by_field_name("name") {
+            return text(src, name);
+        }
+    }
+    text(src, node)
 }
 
 fn leftmost_text(node: Node, src: &[u8]) -> String {
@@ -412,9 +567,172 @@ mod tests {
     }
 
     #[test]
-    fn use_list_and_wildcard_are_not_extracted() {
+    fn use_list_is_now_extracted_but_wildcard_still_is_not() {
+        // §1.3/ADR-0022: a grouped `use` used to extract nothing at
+        // all — silent, not just reduced, information loss on any
+        // fan-in/fan-out question whose only import to a crate happened
+        // to be grouped. `use_wildcard` stays excluded (no enumerable
+        // member list).
         let out = extract("use std::{fs, io};\nuse std::collections::*;\n");
-        assert!(out.imports.is_empty());
+        let uses: Vec<(&str, Vec<&str>)> = out
+            .imports
+            .iter()
+            .filter_map(|i| match i {
+                RawImport::Absolute {
+                    root,
+                    imported_names,
+                } => Some((
+                    root.as_str(),
+                    imported_names
+                        .iter()
+                        .map(|n| n.bound_name.as_str())
+                        .collect(),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(uses.len(), 1, "only the grouped use, not the wildcard");
+        assert_eq!(uses[0].0, "std");
+        assert_eq!(uses[0].1, vec!["fs", "io"]);
+    }
+
+    #[test]
+    fn nested_grouped_use_extracts_every_leaf_under_the_shared_root() {
+        // `use a::{b::{c, d}, e};` — one shared root ("a"), three
+        // imported names, the middle segment ("b") dropped the same way
+        // a single-path use already drops non-leaf segments.
+        let out = extract("use a::{b::{c, d}, e};\n");
+        let uses: Vec<(&str, Vec<&str>)> = out
+            .imports
+            .iter()
+            .filter_map(|i| match i {
+                RawImport::Absolute {
+                    root,
+                    imported_names,
+                } => Some((
+                    root.as_str(),
+                    imported_names
+                        .iter()
+                        .map(|n| n.bound_name.as_str())
+                        .collect(),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(uses.len(), 1, "one RawImport for the one shared root");
+        assert_eq!(uses[0].0, "a");
+        assert_eq!(uses[0].1, vec!["c", "d", "e"]);
+    }
+
+    #[test]
+    fn self_in_a_group_imports_the_groups_own_last_segment() {
+        // `use std::io::{self, Write};` imports `io` itself (bound as
+        // "io") alongside `Write` — real, common Rust syntax.
+        let out = extract("use std::io::{self, Write};\n");
+        let uses: Vec<(&str, Vec<&str>)> = out
+            .imports
+            .iter()
+            .filter_map(|i| match i {
+                RawImport::Absolute {
+                    root,
+                    imported_names,
+                } => Some((
+                    root.as_str(),
+                    imported_names
+                        .iter()
+                        .map(|n| n.bound_name.as_str())
+                        .collect(),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(uses.len(), 1);
+        assert_eq!(uses[0].0, "std");
+        assert_eq!(uses[0].1, vec!["io", "Write"]); // source order: self, then Write
+    }
+
+    #[test]
+    fn nested_self_imports_the_nested_groups_own_segment_not_the_outer_root() {
+        // `use a::{b::{self, c}};` imports `a::b` (bound as "b") and
+        // `a::b::c` (bound as "c") — the nested group's own last
+        // segment, not the outermost root "a".
+        let out = extract("use a::{b::{self, c}};\n");
+        let uses: Vec<(&str, Vec<&str>)> = out
+            .imports
+            .iter()
+            .filter_map(|i| match i {
+                RawImport::Absolute {
+                    root,
+                    imported_names,
+                } => Some((
+                    root.as_str(),
+                    imported_names
+                        .iter()
+                        .map(|n| n.bound_name.as_str())
+                        .collect(),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(uses.len(), 1);
+        assert_eq!(uses[0].0, "a");
+        assert_eq!(uses[0].1, vec!["b", "c"]); // source order: self, then c
+    }
+
+    #[test]
+    fn aliased_member_inside_a_group_is_skipped_individually() {
+        // `use a::{b as c, d};` — the aliased member is dropped
+        // (ADR-0008's exclusion, unchanged), but `d` still extracts —
+        // strictly more than dropping the whole statement, never a
+        // guess about what `b as c`'s bound name should be.
+        let out = extract("use a::{b as c, d};\n");
+        let uses: Vec<(&str, Vec<&str>)> = out
+            .imports
+            .iter()
+            .filter_map(|i| match i {
+                RawImport::Absolute {
+                    root,
+                    imported_names,
+                } => Some((
+                    root.as_str(),
+                    imported_names
+                        .iter()
+                        .map(|n| n.bound_name.as_str())
+                        .collect(),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(uses.len(), 1);
+        assert_eq!(uses[0].0, "a");
+        assert_eq!(uses[0].1, vec!["d"]);
+    }
+
+    #[test]
+    fn bare_path_less_group_keeps_each_members_own_independent_root() {
+        // `use {crate::a, std::b};` — no shared prefix at all; each
+        // member supplies its own complete path, so this produces two
+        // separate RawImports, not one.
+        let out = extract("use {crate::a, std::b};\n");
+        let mut uses: Vec<(&str, Vec<&str>)> = out
+            .imports
+            .iter()
+            .filter_map(|i| match i {
+                RawImport::Absolute {
+                    root,
+                    imported_names,
+                } => Some((
+                    root.as_str(),
+                    imported_names
+                        .iter()
+                        .map(|n| n.bound_name.as_str())
+                        .collect(),
+                )),
+                _ => None,
+            })
+            .collect();
+        uses.sort();
+        assert_eq!(uses, vec![("crate", vec!["a"]), ("std", vec!["b"])]);
     }
 
     #[test]

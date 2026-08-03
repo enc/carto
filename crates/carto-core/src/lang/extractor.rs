@@ -100,14 +100,21 @@ pub enum RawImport {
     /// `use serde;` (`root: "serde"`, `imported_names: [serde]`).
     /// Python's `import os` (`root: "os"`, `imported_names: [os]`)
     /// and `from pkg import a, b` (`root: "pkg"`, `imported_names: [a,
-    /// b]`). Rust's `use_list` (`use a::{b, c};`), `use_wildcard`
-    /// (`use a::*;`), and `use_as_clause` (`use a::b as c;`) are not
-    /// extracted — deliberately modest (§5.3), documented in ADR-0008;
-    /// Python's wildcard `from x import *` is excluded the same way,
-    /// documented in ADR-0011. TypeScript/JavaScript's bare package
-    /// specifiers (`import x from 'lodash'`, `root: "lodash"`; a scoped
-    /// package `@scope/pkg` roots at its first *two* `/`-separated
-    /// segments) use this too — ADR-0013.
+    /// b]`). Rust's `use_list` (`use a::{b, c};`, including nested
+    /// groups and a `self` member) is extracted the same way, each
+    /// member becoming its own `imported_names` entry (§1.3, ADR-0022 —
+    /// amends this doc's own original "not extracted" note, which
+    /// applied uniformly to all three grouped/wildcard/aliased shapes
+    /// until then). `use_wildcard` (`use a::*;`) and `use_as_clause`
+    /// (`use a::b as c;`, whether standalone or a member inside a
+    /// group) are still not extracted — no enumerable member list for
+    /// the former, an accepted smaller judgment call for the latter —
+    /// deliberately modest (§5.3), ADR-0008/ADR-0022. Python's wildcard
+    /// `from x import *` is excluded the same way, documented in
+    /// ADR-0011. TypeScript/JavaScript's bare package specifiers
+    /// (`import x from 'lodash'`, `root: "lodash"`; a scoped package
+    /// `@scope/pkg` roots at its first *two* `/`-separated segments)
+    /// use this too — ADR-0013.
     Absolute {
         root: String,
         imported_names: Vec<ImportedName>,
