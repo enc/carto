@@ -2,12 +2,15 @@
 
 Synthetic monorepo-shaped tree. Not real customer code. Deliberately
 small — just enough to independently exercise every component-discovery
-and component-scoped-resolution outcome ADR-0034/ADR-0035 can reach:
-manifest-marker auto-detection across four languages, aggregator
+and component-scoped-resolution outcome ADR-0034/ADR-0035/ADR-0037 can
+reach: manifest-marker auto-detection across four languages, aggregator
 suppression, a declared root overriding auto-detection, the exact
 same-name-across-components collision that used to make every one of
-those symbols unresolvable, and the file-scope (ADR-0031) resolution
-path under a component.
+those symbols unresolvable, the file-scope (ADR-0031) resolution path
+under a component, and terraform's own rollup (ADR-0037) — a scattered
+`infra/envs/*`/`infra/modules/*` tree with no `.tf` file directly in
+`infra/` itself collapsing to one `infra` component instead of
+fragmenting into `prod`/`dev`/`vpc`.
 
 `crates/carto-cli/tests/cli_multiroot.rs` drives this fixture through
 the real `carto` binary — semantic assertions on real CLI stdout and
@@ -28,6 +31,7 @@ exercise).
 | `web/admin/package.json` + `src/handler.ts` | `package.json` | `admin` / node | A third, unrelated `Handler` (a TS class). `registerHandler(new Handler())` is module-level code with no enclosing symbol — ADR-0031's file-scope fallback, exercised *under* a component: the resolved edge must attach to the `File` node and still carry `admin`'s own component label. |
 | `lambdas/ingest/handler.py` | *(none)* | `ingest` / python | No manifest marker anywhere in this directory — only recognized as a component because `.carto/roots.json` declares it explicitly (the declared-root override path, not auto-detection). |
 | `.carto/roots.json` | — | — | `{"detect": true, "roots": [{"name": "ingest", "path": "lambdas/ingest", "kind": "python"}]}` — `detect: true` makes the declaration *additive* to auto-detection rather than replacing it, so `shared`/`orders`/`billing`/`admin` are still auto-detected alongside the declared `ingest`. |
+| `infra/envs/{prod,dev}/main.tf` + `infra/modules/vpc/main.tf` | ≥1 HCL file per directory, none directly in `infra/` itself | `infra` / terraform | ADR-0037's T3 rollup: three separate `.tf`-bearing directories with no shared `.tf`-bearing ancestor collapse to the one directory that actually represents the infra project (`infra`), not three generically-named components (`prod`/`dev`/`vpc`). |
 
 ## Verify with
 
@@ -41,10 +45,11 @@ cargo run -p carto-cli -- deps Handler fixtures/monorepo --out /tmp/carto-monore
 
 Expected:
 
-- `map --section components` lists exactly five components (`admin`,
-  `billing`, `ingest`, `orders`, `shared`), each with its own
-  file/symbol counts, plus a `## cross-component edges` line reading
-  `orders -> shared: 1 calls`.
+- `map --section components` lists exactly six components (`admin`,
+  `billing`, `infra`, `ingest`, `orders`, `shared`), each with its own
+  file/symbol counts (`infra` shows `files=3 symbols=0`, not three
+  separate `prod`/`dev`/`vpc` rows), plus a `## cross-component edges`
+  line reading `orders -> shared: 1 calls(inferred)`.
 - `where Handler --exact` (no `--component`) returns all three
   `Handler` symbols, each labeled with its own component
   (`[billing]`/`[orders]`/`[admin]`).
@@ -57,13 +62,17 @@ Expected:
 
 ## Negative space
 
-No HCL/Terraform component in this fixture (that's
-`fixtures/sid-like`'s job) and no PHP component (no fixture currently
-exercises PHP's FQN-collision-across-components case at the CLI level
-— covered instead by `resolve.rs`'s own
+No PHP component (no fixture currently exercises PHP's
+FQN-collision-across-components case at the CLI level — covered
+instead by `resolve.rs`'s own
 `colliding_fqn_across_components_prefers_the_callers_own_component`
 unit test). No component-name collision requiring the symmetric
 extension-by-parent-segment scheme (`components::tests::
 colliding_basenames_are_disambiguated_by_parent_segment_symmetrically`
 covers that in isolation) — every directory basename here is already
-distinct.
+distinct. No terraform-under-a-strong-component (T2) or
+single-`.tf`-file-absorbing-a-nested-module-directory (T1) case at the
+CLI level either — those are exercised in isolation by
+`components::tests::terraform_directory_under_a_strong_component_
+belongs_to_that_component` and `components::tests::
+terraform_directory_with_its_own_tf_absorbs_a_nested_module_directory`.

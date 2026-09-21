@@ -81,20 +81,26 @@ fn components_are_detected_by_marker_declared_root_and_aggregator_suppressed() {
     assert_eq!(
         components,
         vec![
+            ("infra", "infra", "terraform"), // ADR-0037 rollup: envs/{prod,dev} + modules/vpc, no infra/*.tf itself
             ("ingest", "lambdas/ingest", "python"), // declared, .carto/roots.json
             ("shared", "libs/shared", "go"),
             ("billing", "services/billing", "dotnet"), // *.csproj suffix marker
             ("orders", "services/orders", "go"),
             ("admin", "web/admin", "node"),
         ],
-        "components must be exactly these five, sorted by path (INV-7)"
+        "components must be exactly these six, sorted by path (INV-7)"
     );
 
     // The root-level [workspace]-only Cargo.toml must never become a
     // component itself (ADR-0034: the walked root is never a
     // candidate) -- confirmed by the count above already being exactly
-    // 5, not 6.
+    // 6, not 7.
     assert_eq!(component_of(&graph, "Cargo.toml"), None);
+    assert_eq!(
+        component_of(&graph, "infra/envs/prod/main.tf"),
+        Some("infra"),
+        "scattered infra/envs/*, infra/modules/* directories roll up to one infra component (ADR-0037)"
+    );
     assert_eq!(
         component_of(&graph, "tools/check.py"),
         None,
@@ -297,7 +303,7 @@ fn map_components_section_lists_every_component_and_the_cross_component_edge() {
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
 
     assert!(stdout.contains("## components"), "{stdout}");
-    for name in ["admin", "billing", "ingest", "orders", "shared"] {
+    for name in ["admin", "billing", "infra", "ingest", "orders", "shared"] {
         assert!(stdout.contains(name), "{stdout}");
     }
     assert!(stdout.contains("## cross-component edges"), "{stdout}");

@@ -439,3 +439,206 @@ fn sanitizes_non_charset_characters_in_detected_names() {
     assert_eq!(set.components().len(), 1);
     assert_eq!(set.components()[0].name, "orders-v2");
 }
+
+// --- ADR-0037: terraform rollup, aggregator parsing, .carto/roots.json
+// `exclude` -----------------------------------------------------------
+
+#[test]
+fn terraform_directory_with_its_own_tf_absorbs_a_nested_module_directory() {
+    // T1: `infra` itself has a `.tf` file, so `infra/modules/vpc`
+    // (nested, also `.tf`-bearing) collapses into it rather than
+    // becoming its own "vpc" component.
+    let dir = TempDir::new("tf-t1");
+    let files = vec![
+        file_node("infra/main.tf", Lang::Hcl),
+        file_node("infra/modules/vpc/main.tf", Lang::Hcl),
+    ];
+    let set = ComponentSet::discover(dir.path(), &files).unwrap();
+    assert_eq!(set.components().len(), 1);
+    assert_eq!(set.components()[0].path, "infra");
+    assert_eq!(set.components()[0].kind, "terraform");
+}
+
+#[test]
+fn scattered_terraform_directories_with_no_tf_bearing_common_ancestor_roll_up_together() {
+    // T3: no directory anywhere under `infra` has a `.tf` file of its
+    // own (only the leaf module/env directories do) — without rollup
+    // this fragments into four separate, generically-named components
+    // (`prod`, `dev`, `vpc`, `rds`).
+    let dir = TempDir::new("tf-t3");
+    let files = vec![
+        file_node("infra/envs/prod/main.tf", Lang::Hcl),
+        file_node("infra/envs/dev/main.tf", Lang::Hcl),
+        file_node("infra/modules/vpc/main.tf", Lang::Hcl),
+        file_node("infra/modules/rds/main.tf", Lang::Hcl),
+    ];
+    let set = ComponentSet::discover(dir.path(), &files).unwrap();
+    assert_eq!(set.components().len(), 1);
+    assert_eq!(set.components()[0].path, "infra");
+    assert_eq!(set.components()[0].kind, "terraform");
+    assert_eq!(
+        set.component_of_path("infra/envs/prod/main.tf"),
+        Some("infra")
+    );
+}
+
+#[test]
+fn terraform_directory_under_a_strong_component_belongs_to_that_component() {
+    // T2: `services/orders/infra` has its own `.tf` file, but
+    // `services/orders` is already a `go.mod`-anchored component — the
+    // terraform directory must not become a second, separate one.
+    let dir = TempDir::new("tf-t2");
+    let files = vec![
+        file_node("services/orders/go.mod", Lang::Other),
+        file_node("services/orders/main.go", Lang::Go),
+        file_node("services/orders/infra/main.tf", Lang::Hcl),
+    ];
+    let set = ComponentSet::discover(dir.path(), &files).unwrap();
+    assert_eq!(set.components().len(), 1);
+    assert_eq!(set.components()[0].path, "services/orders");
+    assert_eq!(set.components()[0].kind, "go");
+    assert_eq!(
+        set.component_of_path("services/orders/infra/main.tf"),
+        Some("orders")
+    );
+}
+
+#[test]
+fn two_terraform_trees_with_no_shared_ancestor_short_of_the_repo_root_stay_separate() {
+    // Rollup must not go as far as merging genuinely unrelated
+    // terraform trees just because both ultimately sit under the
+    // walked root — that would collapse them to a "" (repo-root)
+    // ancestor, which the rollup rule explicitly refuses.
+    let dir = TempDir::new("tf-disjoint");
+    let files = vec![
+        file_node("infra-a/main.tf", Lang::Hcl),
+        file_node("infra-b/main.tf", Lang::Hcl),
+    ];
+    let set = ComponentSet::discover(dir.path(), &files).unwrap();
+    let mut paths: Vec<&str> = set.components().iter().map(|c| c.path.as_str()).collect();
+    paths.sort();
+    assert_eq!(paths, vec!["infra-a", "infra-b"]);
+}
+
+#[test]
+fn pnpm_workspace_sibling_suppresses_package_json_as_aggregator() {
+    // A pnpm workspace declares its members in pnpm-workspace.yaml, not
+    // in package.json's own "workspaces" key — content-sniffing
+    // package.json alone would miss it.
+    let dir = TempDir::new("pnpm-aggregator");
+    std::fs::create_dir_all(dir.path().join("root")).unwrap();
+    std::fs::write(dir.path().join("root/package.json"), r#"{"name": "root"}"#).unwrap();
+    std::fs::write(dir.path().join("root/pnpm-workspace.yaml"), "packages:\n").unwrap();
+    let files = vec![
+        file_node("root/package.json", Lang::Json),
+        file_node("root/pnpm-workspace.yaml", Lang::Other),
+        file_node("root/packages/app/index.ts", Lang::TypeScript),
+    ];
+    let set = ComponentSet::discover(dir.path(), &files).unwrap();
+    assert!(set.is_empty());
+}
+
+#[test]
+fn package_json_mentioning_workspaces_only_in_a_string_value_is_a_real_component() {
+    // Real JSON parsing, not a `"workspaces"` substring scan: the word
+    // appearing inside an unrelated string value must not suppress a
+    // genuine component the way the old substring check would have.
+    let dir = TempDir::new("package-json-real-parse");
+    std::fs::create_dir_all(dir.path().join("app")).unwrap();
+    std::fs::write(
+        dir.path().join("app/package.json"),
+        r#"{"name": "app", "description": "not related to npm workspaces at all"}"#,
+    )
+    .unwrap();
+    let files = vec![
+        file_node("app/package.json", Lang::Json),
+        file_node("app/index.ts", Lang::TypeScript),
+    ];
+    let set = ComponentSet::discover(dir.path(), &files).unwrap();
+    assert_eq!(set.components().len(), 1);
+    assert_eq!(set.components()[0].kind, "node");
+}
+
+#[test]
+fn cargo_toml_workspace_metadata_table_is_not_mistaken_for_a_workspace_root() {
+    // Line-anchored, not a substring scan: `[workspace.metadata.foo]`
+    // is a nested table, not a `[workspace]` header — a real
+    // `[package]` component must still be detected.
+    let dir = TempDir::new("cargo-nested-table");
+    std::fs::create_dir_all(dir.path().join("crates/a")).unwrap();
+    std::fs::write(
+        dir.path().join("crates/a/Cargo.toml"),
+        "[package]\nname = \"a\"\n\n[workspace.metadata.foo]\nbar = 1\n",
+    )
+    .unwrap();
+    let files = vec![
+        file_node("crates/a/Cargo.toml", Lang::Other),
+        file_node("crates/a/src/lib.rs", Lang::Rust),
+    ];
+    let set = ComponentSet::discover(dir.path(), &files).unwrap();
+    assert_eq!(set.components().len(), 1);
+    assert_eq!(set.components()[0].kind, "rust");
+}
+
+#[test]
+fn exclude_drops_a_detected_component() {
+    let dir = TempDir::new("exclude-basic");
+    std::fs::create_dir_all(dir.path().join(".carto")).unwrap();
+    std::fs::write(
+        dir.path().join(".carto/roots.json"),
+        r#"{"exclude": ["infra"]}"#,
+    )
+    .unwrap();
+    let files = vec![file_node("infra/main.tf", Lang::Hcl)];
+    let set = ComponentSet::discover(dir.path(), &files).unwrap();
+    assert!(set.is_empty());
+}
+
+#[test]
+fn exclude_matching_nothing_is_not_an_error() {
+    let dir = TempDir::new("exclude-no-match");
+    std::fs::create_dir_all(dir.path().join(".carto")).unwrap();
+    std::fs::write(
+        dir.path().join(".carto/roots.json"),
+        r#"{"exclude": ["nowhere/at/all"]}"#,
+    )
+    .unwrap();
+    let files = vec![
+        file_node("services/orders/go.mod", Lang::Other),
+        file_node("services/orders/main.go", Lang::Go),
+    ];
+    let set = ComponentSet::discover(dir.path(), &files).unwrap();
+    assert_eq!(set.components().len(), 1);
+}
+
+#[test]
+fn exclude_invalid_path_is_a_user_error() {
+    let dir = TempDir::new("exclude-bad-path");
+    std::fs::create_dir_all(dir.path().join(".carto")).unwrap();
+    std::fs::write(
+        dir.path().join(".carto/roots.json"),
+        r#"{"exclude": ["../outside"]}"#,
+    )
+    .unwrap();
+    let files = vec![file_node("src/main.rs", Lang::Rust)];
+    let err = ComponentSet::discover(dir.path(), &files).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::UserError);
+}
+
+#[test]
+fn declared_root_can_re_add_a_path_the_same_config_excludes() {
+    // exclude runs before roots, so a declared root at the same path
+    // as an exclude entry still ends up present — exclude only
+    // suppresses *auto-detection*, roots is unconditional intent.
+    let dir = TempDir::new("exclude-then-readd");
+    std::fs::create_dir_all(dir.path().join(".carto")).unwrap();
+    std::fs::write(
+        dir.path().join(".carto/roots.json"),
+        r#"{"detect": true, "exclude": ["infra"], "roots": [{"name": "infra", "path": "infra", "kind": "terraform"}]}"#,
+    )
+    .unwrap();
+    let files = vec![file_node("infra/main.tf", Lang::Hcl)];
+    let set = ComponentSet::discover(dir.path(), &files).unwrap();
+    assert_eq!(set.components().len(), 1);
+    assert_eq!(set.components()[0].name, "infra");
+}

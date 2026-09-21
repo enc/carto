@@ -365,6 +365,22 @@ repo root with multiple `cmd/*` binaries, say) still gets zero
 auto-detected components (that detection gap itself is unchanged), but
 is no longer silent about it.
 
+**Follow-up (ADR-0037):** the terraform marker's plain "≥1 HCL file in
+a directory" rule over-fragmented a normal `infra/modules/*`/
+`infra/envs/*` tree into one component per subdirectory instead of one
+`infra`. `detect_components` now drops a terraform-only directory at or
+under an exact-marker component's own directory (belongs to that
+component instead), then repeatedly merges surviving terraform
+directories to their lowest common ancestor — unless that ancestor is
+the repo root or itself under a strong component — until no further
+merge applies; two genuinely unrelated terraform trees stay separate.
+`is_aggregator` real-parses `Cargo.toml` (line-anchored exact-header
+scan) and `package.json` (real JSON, a top-level `"workspaces"` key)
+instead of substring-matching, and also recognizes a sibling
+`pnpm-workspace.yaml`/`lerna.json`/`turbo.json`/`nx.json`/`rush.json`.
+`.carto/roots.json` gains `exclude: Vec<String>`, applied before
+`roots` so a declared root can still re-add an excluded path.
+
 ## Conventions
 
 - **ADRs for every deviation and judgment call.** `docs/adr/NNNN-*.md`.
