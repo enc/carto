@@ -34,10 +34,13 @@ cargo run -p carto-cli -- index fixtures/ts-app --out /tmp/carto-out
 cargo run -p carto-cli -- index fixtures/go-svc --out /tmp/carto-out
 cargo run -p carto-cli -- index fixtures/csharp-app --out /tmp/carto-out
 cargo run -p carto-cli -- index fixtures/secrets-corpus --out /tmp/carto-out
+cargo run -p carto-cli -- index fixtures/sid-like --out /tmp/carto-out
 cargo run -p carto-cli -- index <repo> --json 2>/dev/null | python3 -m json.tool
 cargo run -p carto-cli -- where <name> <repo> --out /tmp/carto-out
 cargo run -p carto-cli -- deps <name|id> <repo> --out /tmp/carto-out --dir out --depth 2
 cargo run -p carto-cli -- map <repo> --out /tmp/carto-out --budget 50
+cargo run -p carto-cli -- contract <value> <repo> --out /tmp/carto-out
+cargo run -p carto-cli -- orphans <repo> --out /tmp/carto-out --category metric_name
 cargo run -p carto-cli -- selfcheck
 cargo run -p carto-cli -- serve   # MCP stdio server (spec §7.3); see docs/adr/0018
 
@@ -91,8 +94,8 @@ Single static Rust binary. Write path, then read path:
 ```
 walk ──► lang::extract_and_resolve ──► Graph ──► graph::persist ──► <out>/graph.json
 (File nodes)  (Symbol/Module nodes,            (the ONE writer:      <out>/manifest.json
-               contains/imports/calls edges)    sort → redact → validate
-                                                → size caps → atomic write
+               contains/imports/calls/          sort → redact → validate
+               references edges)               → size caps → atomic write
                                                 through PathGuard)
 
 <out>/graph.json ──► graph::load ──► QueryGraph ──► query::{find,deps,map} ──┬──► CLI renderer
@@ -153,8 +156,9 @@ each file to its extractor by `Lang` (a small registry,
 `lang/mod.rs::extractors()`), not a hard-coded single language:
 
 1. **Extract** parses one file into `RawSymbol`/`RawImport`/`RawCallSite`
-   using tree-sitter queries kept as reviewable `.scm` files under
-   `lang/queries/<lang>/`, embedded via `include_str!`.
+   (plus the optional `RawLiteral`/`RawTypeRef` channels described
+   below) using tree-sitter queries kept as reviewable `.scm` files
+   under `lang/queries/<lang>/`, embedded via `include_str!`.
 2. **Resolve** runs whole-repo — a call can't be judged unambiguous until
    every other file's exported symbols are known. Spec §5.3's policy is
    deliberately modest: first-match-wins across tiers, `calls` edges
@@ -180,10 +184,10 @@ each file to its extractor by `Lang` (a small registry,
    extractor's tiers are exactly spec §5.3's original three. A second
    small per-extractor knob, `namespace_separator()` (default `\`,
    PHP's), lets PHP's `App\Orders` and C#'s `Acme.Orders` share one
-   FQN index without cross-matching (ADR-0016). A call is
-   attributed to the *innermost* symbol containing it
-   (`assign_calls_to_innermost_symbol`), not every symbol whose range
-   contains it — matters for any language whose class-like symbol's
+   FQN index without cross-matching (ADR-0016). A call (or, since
+   ADR-0029, a type reference) is attributed to the *innermost* symbol
+   containing it (`assign_to_innermost_symbol`), not every symbol whose
+   range contains it — matters for any language whose class-like symbol's
    own range spans its methods' bodies (PHP, Python; not Rust, where
    an `impl` block is never itself a symbol). Tier (b) is alias-aware
    (`ImportedName { bound_name, declared_name }`, `alias_to_declared`)
@@ -228,6 +232,76 @@ the existing `RawImport::Relative` shape with no new variant, while
 Go's directory-shaped, module-qualified import paths and C#'s
 many-files-at-once namespace `using`s each didn't fit any existing
 variant and needed their own).
+
+### Cross-language string-literal contracts
+
+A capability outside spec §4/§5/§6 entirely, added on user request
+(ADR-0025/0026/0027): a `Contract` node kind plus `produces`/`consumes`
+edges represent a bare string literal — a CloudWatch metric name, and
+(per the ranked follow-up list in ADR-0026) eventually an env var, a
+DynamoDB attribute, a Kafka topic — spelled identically in two or more
+files of *different* languages, where nothing in either language's own
+grammar connects them. `ExtractOut::literals` (`RawLiteral`) is a
+fourth, optional thing a `LangExtractor` can emit alongside
+symbols/imports/calls; today only `CSharpExtractor` and the new
+`HclExtractor` (`lang/hcl.rs`, the first extractor with no `.scm` query
+file — `tree-sitter-hcl`'s grammar carries no named fields, ADR-0025)
+populate it. What a literal's `position` string *means* (category,
+producer/consumer role, confidence) is decided declaratively by
+`crate::contracts::ContractRules` — built-in rules plus an optional
+repo-local `.carto/contracts.json` (ADR-0027) — not by the extractor,
+keeping per-language code mechanical. `carto contract`/`carto orphans`
+(neither in spec §7.1) are the query surface;
+`orphans --category metric_name` is the concrete acceptance test this
+capability was scoped against — see ADR-0026's Context for the real
+finding that motivated it (five CloudWatch alarms referencing metric
+names no service emits, permanently unable to fire). `SCHEMA_VERSION`
+bumped 3 → 4 for the new node/edge kinds.
+
+### Type references (`EdgeKind::References`)
+
+`EdgeKind::References` existed in the enum from the start with no
+producer until real C# field feedback (`bench/field-log.md`) traced a
+"who uses this interface" answer's imprecision to a genuine capture
+gap, not (as first suspected) an `imports`-granularity problem —
+ADR-0029's Context has the full root-cause trace. `ExtractOut::
+type_refs` (`RawTypeRef`) is a fifth optional extraction channel,
+alongside `literals`; all six typed extractors
+(Rust/Go/TS+TSX+JS/PHP/Python/C#) populate it via the same two-step
+shape every other query-driven extraction already uses: a
+`queries/<lang>/types.scm` file captures only the type-position
+*container* node (anchored on a field, never a literal supertype
+name — most languages' own `type` grammar rule is a hidden supertype,
+so a query naming it directly wouldn't reliably match), and a
+`collect_type_names()` function in the extractor's own `.rs` file
+walks that subtree down to head identifiers. `resolve` pushes each
+resolved type ref through the *identical* tier ladder `calls` edges
+use (`resolve_call`, generalized to take a bare `name: &str` instead
+of a `&RawCallSite`) — same-file/same-directory/imported/same-package,
+first-match-wins, ambiguous-or-zero produces nothing — and emits
+`Confidence::Inferred` with `type-reference:<tier>` evidence, never
+`Certain`. A resolved self-reference (a field naming its own enclosing
+type) is suppressed; an *unresolved* type ref is silently dropped,
+deliberately unlike `unresolved_calls` — user-confirmed: overwhelmingly
+stdlib/BCL/framework noise, not a signal worth a list or counter (see
+ADR-0029). The pre-existing `imports` edge's own namespace/module
+fan-out is unchanged — `references` adds precision alongside it, it
+doesn't replace or narrow it. `SCHEMA_VERSION` bumped 4 → 5.
+ADR-0030 is the six-language survey of exactly which grammar shapes
+feed `type_refs` and which are deliberately excluded per language;
+three wrong assumptions were caught only by inspecting a real parse
+tree, not by the query failing to compile — see that ADR before adding
+a seventh language's own `types.scm`. A call or type ref with **no
+enclosing symbol at all** (C#'s top-level statements — a `Program.cs`
+with no `Main` method, valid since C# 9 and the modern ASP.NET Core
+minimal-API style; TS/JS/Python module-level setup code has the same
+shape) resolves at *file* scope instead of being silently dropped —
+`assign_to_innermost_symbol` returns its unattached leftovers
+alongside the usual per-symbol assignment, and a per-file pass resolves
+each through the same tier ladder, pushing a `Calls`/`References` edge
+from the `File` node on success (resolved case only — an unattached
+miss still has no `unresolved_calls`-equivalent; ADR-0031, a same-day
+retest fix to ADR-0029/0030).
 
 ## Conventions
 

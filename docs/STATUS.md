@@ -1,6 +1,6 @@
 # carto — status / handoff
 
-**Milestone:** M1.b.2b done (Rust, Python, PHP, TS/TSX/JS, Go — spec §5.2's full v1 language set), plus C# added post-v1 on user request (ADR-0016). M2's first slice — real redaction (ADR-0017) — is also done. An MCP server slice (normally M4 scope) was pulled ahead on user request, to measure spec §11.4's S-1 benchmark before further capability work (ADR-0018). **The S-1 benchmark has now been run (ADR-0019): neither threshold is met on a one-trial measurement** (combined input tokens: carto uses 18.0% more, not ≥30% fewer; accuracy: carto is 6.2 points lower, not ≥20 higher) — full per-task result in [`bench/`](../bench/) and ADR-0019. **The post-S-1 improvement plan's slices 1–4 are now implemented** (`docs/post-s1-improvement-plan.md`, ADRs 0020–0022: the honest-absence signal, `map --section`, `Module`/`File` discovery plus the same-file caller flag, and Rust grouped-`use` extraction) — see the milestone entry below. **M3 still does not proceed automatically — spec §11.4 requires the user's decision, presented and pending; re-running S-1 against this slice (plan step 5) is a separate, not-yet-run step.**
+**Milestone:** M1.b.2b done (Rust, Python, PHP, TS/TSX/JS, Go — spec §5.2's full v1 language set), plus C# added post-v1 on user request (ADR-0016). M2's first slice — real redaction (ADR-0017) — is also done. An MCP server slice (normally M4 scope) was pulled ahead on user request, to measure spec §11.4's S-1 benchmark before further capability work (ADR-0018). **The S-1 benchmark has now been run (ADR-0019): neither threshold is met on a one-trial measurement** (combined input tokens: carto uses 18.0% more, not ≥30% fewer; accuracy: carto is 6.2 points lower, not ≥20 higher) — full per-task result in [`bench/`](../bench/) and ADR-0019. **The post-S-1 improvement plan's slices 1–4 are now implemented** (`docs/post-s1-improvement-plan.md`, ADRs 0020–0022: the honest-absence signal, `map --section`, `Module`/`File` discovery plus the same-file caller flag, and Rust grouped-`use` extraction) — see the milestone entry below. **M3 still does not proceed automatically — spec §11.4 requires the user's decision, presented and pending; re-running S-1 against this slice (plan step 5) is a separate, not-yet-run step.** **Since then, a genuinely new capability — cross-language string-literal contracts (ADRs 0025–0027) — was pulled ahead on user request, independent of the M3 gate**, the same "pulled ahead on request" precedent MCP/C# already set; see the milestone entry below. **Most recently, real C# field feedback (`bench/field-log.md`) drove a fix (ADRs 0029–0030): type positions (fields, parameters, base clauses, generic arguments) were never captured by any extractor, so `deps --dir in` on a type/interface could only ever answer from the coarser `imports` edge — a new `EdgeKind::References` producer, across all six typed languages, closes that gap. A same-day retest then caught a real follow-on miss — top-level-statement code (modern ASP.NET Core `Program.cs`) has no enclosing symbol, so calls/type-refs inside it were silently dropped — fixed by ADR-0031's file-scope fallback; see the milestone entry below.** **Most recently (ADRs 0032–0033), a direct follow-up narrowed same-name ambiguity using the same `type_refs` channel (owner-type disambiguation) and added a third honesty signal, `unresolved_inbound_calls`, for call sites that were attempted and still produced no edge — see the milestone entry below.**
 
 Where the implementation is in the milestone sequence, what's deliberately
 absent, and what's next. Everything else lives elsewhere on purpose:
@@ -110,6 +110,15 @@ so they've been subdivided. Current state:
     rendered as a text note only on `--dir in`/`both`. `SCHEMA_VERSION`
     bumped 1 → 2 so a stale v1 `graph.json` is rejected with "re-run
     `carto index`" rather than silently reporting a fabricated `0`.
+    **Extended 2026-08-03 (ADR-0023) with the outbound half**,
+    `uncaptured_outbound_calls`/`root_uncaptured_outbound_calls` — a
+    symbol's own uncaptured calls (by line-range containment, reusing
+    `assign_calls_to_innermost_symbol`) rather than uncaptured calls
+    elsewhere that name it (by bare name, repo-wide). Rendered only on
+    `--dir out`/`both`. `SCHEMA_VERSION` bumped again, 2 → 3. Motivated
+    by T8 grading `partial` in a real batch: `deps build_and_persist
+    --dir out` gave no signal that 6 real path-qualified calls (the
+    entire substance of what the function does) were invisible.
   - **§2.1 `map --section`** (`counts`/`modules`/`entry-points`/`infra`,
     repeatable): lets a caller render only the sections a question
     needs instead of paying for the full overview every time; `None`
@@ -130,6 +139,23 @@ so they've been subdivided. Current state:
     remain excluded, per the plan's scope. Checked (not deferred)
     whether Python/TS-JS/PHP/C# share this gap — they don't; it was
     Rust-specific.
+  - **Bare fully-qualified-path import detection, Rust** (ADR-0024,
+    2026-08-03, amends ADR-0008): `carto_core::Result<u8>` needs no
+    `use carto_core;` at all (valid since Rust 2018) — previously
+    structurally invisible to the import graph, since `imports.scm`
+    only captured `use_declaration`/`mod_item` nodes. New
+    `RawImport::BareReference` captures this shape, gated by two
+    filters (excludes a `call_expression`'s own callee position;
+    root must start lowercase, the snake_case-crate/PascalCase-type
+    convention) to avoid fabricating an external `Module` node for
+    every local `Type::method()` call site. Honestly labeled
+    heuristic: distinct evidence string
+    `"external-package-bare-reference"`, not `"external-package"`.
+    Motivated by L3 grading `partial` twice: `deps carto_core --dir
+    in` was 18/19, permanently missing `crates/carto-cli/src/main.rs`
+    (whose only references to `carto_core` are a bare path in an
+    attribute argument and a bare-path return type). Now
+    deterministically 19/19.
   - **§3.1/§3.2/§2.3 skill-file wording** (no code): `skill/
     carto.skill.md` names these specific known gaps as actions rather
     than describing them generically, and frames carto+grep as
@@ -141,9 +167,192 @@ so they've been subdivided. Current state:
     commits landing this work. **Not yet done: re-running S-1
     (the plan's step 5) against these changes** — that's the
     measurement round the user approves separately, per spec §11.4.
-- **M2+ remaining** — infra graph, join, ingest. Per spec §10. **Paused
-  at the S-1 gate, pending the user's M3 go/no-go decision above** —
-  not proceeding automatically.
+- **Cross-language string-literal contracts, slice 1** (2026-08-04,
+  ADRs 0025–0027) — a capability the design spec doesn't name at all,
+  scoped against a real large monorepo (services in C#/TS/Go/Rust,
+  infra in Terraform) whose costliest dependency edges are
+  string-keyed contracts no compiler checks: a CloudWatch alarm's
+  `metric_name` referencing a name no service emits, an env var whose
+  Terraform-set and C#-read spellings differ by compute-type
+  convention, a DynamoDB attribute name duplicated as literals across
+  services with no shared type. Pulled ahead on user request,
+  independent of the M3 go/no-go gate above — the same "pulled ahead"
+  precedent MCP (ADR-0018) and C# (ADR-0016) already set.
+  - **New `Contract` node kind, `produces`/`consumes` edges** —
+    ADR-0026, a spec §4.1/§4.2 amendment. `value`/`qualifier` are
+    `TaintedString` (a string literal is captured source text, INV-6
+    must scan it); node IDs are built from the raw pre-redaction value
+    so a `produces`/`consumes` join survives redaction. `qualifier` is
+    part of node identity (not display-only) — guards exactly the
+    "two same-spelled values in different scopes must not
+    cross-match" failure mode the motivating repo's own env-var
+    naming-convention difference warns about.
+  - **New `HclExtractor`** (ADR-0025) — `Lang::Hcl` existed in the
+    enum with no extractor registered; filled in by parsing `.tf`
+    source directly (spec §6.2 assumes `terraform show -json`, which
+    this slice's own use cases — unused locals, undefined `local.X` —
+    can't be answered from a resolved plan). New dependency
+    `tree-sitter-hcl = "1.1.0"` (verified via the crates.io sparse
+    index: no second `tree-sitter` version, `deny.toml`'s
+    `multiple-versions = "deny"` needs no `[[bans.skip]]`). Also fixes
+    a real, general `walk` gap: `Path::extension()` alone never sees a
+    two-part extension (`locals.tf.simu`), which a real Terraform
+    per-environment-file pattern in the motivating repo relies on.
+  - **`.carto/contracts.json`** (ADR-0027) — built-in classification
+    rules (position → category/role/confidence) plus an optional
+    repo-local override file extending the category vocabulary. `role`/
+    `lang` are validated against a closed set (hard error on an unknown
+    spelling); `category` is intentionally open.
+  - **Two new commands, `carto contract <value>` / `carto orphans`**
+    (neither in spec §7.1) — `orphans --category metric_name` is the
+    literal acceptance-test command: against `fixtures/sid-like` (new,
+    synthetic) it returns exactly the fixture's one dead alarm and one
+    unwatched emission, the fixture-scale reproduction of the
+    motivating repo's real finding. Both got MCP tools
+    (`contract_tool.rs`/`orphans_tool.rs`) calling the identical core
+    function, per spec §7.1's "commands = MCP tools, same core
+    functions" even though these two commands are themselves outside
+    §7.1's named list.
+  - `SCHEMA_VERSION` bumped 3 → 4 — a v3 `graph.json` has no `Contract`
+    nodes; `orphans`/`contract` against one is rejected with "re-run
+    `carto index`," same reasoning ADR-0020/0023 used for their bumps.
+  - **Scoped to one category (`metric_name`) end-to-end**, deliberately
+    — the motivating repo's spec ranks nine more (env vars, DynamoDB
+    attributes, Kafka topics, WS wire-protocol fields, Parquet/Glue
+    columns, subtype IDs, doc-mention edges, Terraform reachability,
+    the `.csproj`/`implements` graph), none built this slice; the
+    node/edge vocabulary is designed to need no new node or edge kind
+    for any of them, only new `ContractRule`s and per-language literal
+    capture. See ADR-0026's own "deliberately absent" list below for
+    what's cut even within the one category built.
+  - `bash scripts/gates.sh` green (fmt, clippy -D warnings, `cargo deny
+    check bans licenses sources`, full workspace test suite).
+- **Skill file made discoverable and current** (2026-08-04, ADR-0028) —
+  moving from the S-1 benchmark harness (which pastes the skill file's
+  text directly into a system prompt, `bench/run.sh:145`) toward real-
+  world use surfaced that `skill/carto.skill.md`'s flat-file shape,
+  named literally by spec §9.3, is never actually discovered by Claude
+  Code's own skill loading (`<skills-dir>/<name>/SKILL.md`, a directory
+  per skill) — confirmed empirically against a pre-existing, unrelated
+  flat skill file on the test machine that was silently absent from a
+  live session's available-skills list. Repackaged as `skill/carto/
+  SKILL.md` (`git mv`, ADR-0028 records the spec deviation and why the
+  spec's underlying intent is still met). Separately, the file's
+  *content* had also drifted: it documented five tools while
+  `schema.rs::tool_list()` had advertised seven since the contract slice
+  above (`contract`/`orphans` landed with no matching skill-file
+  update) — rewritten to cover both, plus `subpath`/`sections`/
+  `module_matches`/`same_file_as_root` and the contract-specific known
+  gaps (interpolated/computed literals aren't extracted; `qualifier` is
+  part of contract identity). Added a new non-imperative section asking
+  the agent to surface a carto answer that looks wrong to the user
+  rather than silently routing around it — carto is still under active
+  development and a surprising result is data, not just an obstacle.
+  New mechanical guard against the content drift recurring:
+  `crates/carto-mcp/src/schema.rs::skill_file_names_every_advertised_tool`
+  `include_str!`s the skill file and asserts every advertised tool name
+  appears in it, the same drift-prevention idea `tools/mod.rs`'s
+  existing schema/handler test already uses. `target/release/carto`
+  rebuilt (the pre-existing binary predated `SCHEMA_VERSION` 4 and the
+  contract/orphans commands entirely).
+- **Type references as `references` edges** (2026-08-05, ADRs
+  0029–0030) — field feedback from a real C# repo (`bench/field-log.md`):
+  `deps IQueryJobStore --dir in` was worse than `grep -rl` for "who
+  uses this interface" — ~41 files at depth 2, ~26 false positives,
+  when only 15 files actually used it. The reported diagnosis
+  (`imports`'s file→namespace granularity) was accurate as a
+  description but not the root cause: **no extractor captured a type
+  position at all** — only invocations and `object_creation_expression`
+  — so a field/parameter/base-clause reference produced zero edges of
+  any kind, forcing every `--dir in` query through the file node's
+  coarse `imports` fan-in. `EdgeKind::References` (declared in the
+  vocabulary since the start, never produced) now has a first
+  producer: a new `ExtractOut::type_refs` channel, populated by all six
+  typed extractors (Rust/Go/TS+TSX+JS/PHP/Python/C#), resolved through
+  the exact same tier ladder `calls` edges already use
+  (`resolve_call` generalized to take a bare name). `deps <type> --dir
+  in --depth 1 --kinds references` now gives the precise answer the
+  field report needed; `imports`'s own fan-out is unchanged and still
+  available for "what genuinely imports this module" — see ADR-0029
+  for why weakening it would have been the wrong fix. `SCHEMA_VERSION`
+  bumped 4 → 5. `fixtures/csharp-app/Ports/`+`Services/` reproduces the
+  reported bug directly as this feature's acceptance test, at both the
+  extractor-unit and CLI/JSON levels. ADR-0030 is the six-language
+  capture-position survey (which grammar shapes feed `type_refs`, three
+  wrong assumptions caught empirically along the way — Rust's turbofish
+  is two different parse shapes, TS/JS's `class_heritage` needed a
+  third query file, Python's subscripted generics parse to
+  `generic_type` in annotation position, not `subscript`). Skill doc
+  gained the `kinds="references"` recipe and a new known-gap entry
+  (unresolved type refs are silently dropped, unlike unresolved calls —
+  user-confirmed: overwhelmingly stdlib/BCL noise, not a signal worth a
+  counter).
+  - **Follow-up fix, same day (ADR-0031)**: retest feedback on the slice
+    above found one real miss — `Program.cs`'s own
+    `services.AddSingleton<IQueryJobStore, X>()` DI registration wasn't
+    found, exactly the shape the feature's own comments call out as
+    motivating and, per the reporter, the dominant modern ASP.NET Core
+    style (`Program.cs` with no `Main` method — C# 9's top-level
+    statements). Root cause: `resolve.rs`'s `assign_to_innermost_symbol`
+    silently dropped any call/type-ref whose line fell outside every
+    symbol's range — top-level statements have no enclosing method/class
+    for `symbols.scm` to capture. Not a new bug this feature introduced,
+    a pre-existing, language-agnostic gap (would equally affect TS/JS's
+    module-level setup calls, Python's module-level pattern) this
+    feature made newly consequential. Fixed by reusing the file-level
+    fallback the contract-literal pass already had (ADR-0026): an
+    unattached call/type-ref now resolves through the same tier ladder
+    and gets a `Calls`/`References` edge from the **File** node instead
+    of being dropped — resolved case only, user-confirmed scope; an
+    unattached miss still stays invisible (no `FileNode.unresolved_calls`
+    equivalent exists, a separate decision left for later). No
+    `SCHEMA_VERSION` bump (`Edge`'s shape is unchanged — `imports`
+    already proves File is a valid endpoint). New fixture,
+    `TopLevelRegistration.cs`, reproduces the exact retest scenario.
+- **Owner-type disambiguation and a third inbound honesty signal**
+  (2026-08-05, ADRs 0032–0033) — a direct follow-up to the
+  references-edges slice above, building `fixtures/csharp-app`'s own
+  interface/implementation pair (`Ports/IQueryJobStore.cs`'s `Save`,
+  `Services/InMemoryQueryJobStore.cs`'s own `Save`) surfaced the
+  next-door case spec §5.3 already flags as a known trade-off: a
+  bare-name call through an interface-typed field is genuinely
+  ambiguous by name alone, but the calling file's own `type_refs`
+  (ADR-0029) already states which candidate it means.
+  - **ADR-0032**: `CallResolver` gains an owner-type narrowing step,
+    applied only when same-file/imported/same-package would otherwise
+    be ambiguous — never changes which candidate an already-
+    unambiguous tier picks, can only turn a `None` into a `Some`.
+    `RawSymbol` gains `owner: Option<String>` (a method's enclosing/
+    receiver type; `None` for anything else); a candidate survives only
+    if its owner appears among the type names the calling file's own
+    `type_refs` names. A real negative case is committed alongside the
+    positive one (`TopLevelRegistration.cs`'s `RegisterQueryJobStore`,
+    whose parameters name *both* candidates' owners) proving the
+    mechanism doesn't overreach into "first type mentioned nearby
+    wins." No `SCHEMA_VERSION` bump — confined to which edges
+    `resolve()` produces, not the on-disk shape.
+  - **ADR-0033**: a third honesty signal, `unresolved_inbound_calls`/
+    `unresolved_inbound_call_count`, distinct from both
+    `uncaptured_inbound_calls` (ADR-0020, syntax never attempted) and
+    `uncaptured_outbound_calls` (ADR-0023, same but outbound) — this
+    one counts call sites elsewhere that spell a symbol's bare name,
+    *were* attempted through the full tier ladder including ADR-0032's
+    new step, and still produced no edge (most often bare-name
+    ambiguity). Capped at `UNRESOLVED_INBOUND_SITES_CAP` (25) with an
+    uncapped count alongside, surfaced on `deps --dir in`/`both` as
+    `root_unresolved_inbound_calls`. `SCHEMA_VERSION` bumped 5 → 6.
+    `RegisterQueryJobStore` doubles as this ADR's acceptance case too:
+    both `Save` symbols must record the ambiguous call site honestly
+    rather than reporting a false all-clear.
+  - Every golden file touched by the schema bump regenerated
+    (`fixtures/mixed.graph.golden.json`,
+    `fixtures/rust-crate.{deps,map}.golden.json`); `bash scripts/
+    gates.sh` green.
+- **M2+ remaining (infra graph proper, join, ingest)** — spec §10. The
+  contract slice above is adjacent to, not a substitute for, this: no
+  `IacResource`/`depends_on`/IAM extraction/§6.6 attribute allowlist
+  exists yet. **Still paused at the S-1 gate, pending the user's M3
+  go/no-go decision above** — not proceeding automatically.
 
 Post-M1.b.2b hardening (2026-08-01): real-world PHP field-testing
 against a TYPO3 codebase surfaced two query-layer gaps, both fixed —
@@ -158,6 +367,35 @@ at all). See [ADR-0014](adr/0014-subpath-scoping.md).
 
 Do not "fix" these without checking the linked reasoning first:
 
+- **`Contract` categories beyond `metric_name`** — env vars, DynamoDB
+  attributes, Kafka topics, WS wire-protocol fields, Parquet/Glue
+  columns, SID-style subtype IDs, doc-mention edges, Terraform
+  reachability (unused locals, undefined `local.X`), the `.csproj`/
+  `implements` graph. Named as follow-up work in
+  [ADR-0026](adr/0026-contract-node-and-produces-consumes-edges.md)'s
+  Consequences and the motivating repo's own ranked list; none built
+  yet. The node/edge vocabulary needs no new kind for any of them —
+  only new `ContractRule`s (ADR-0027) and per-language literal capture.
+- **`uncaptured_contract_sites` (a per-category count of interpolated/
+  computed literals a `Contract`-producing extractor recognized but
+  couldn't reduce to a plain value)** — not surfaced anywhere yet,
+  unlike calls' own `uncaptured_inbound_calls`/`uncaptured_outbound_calls`
+  (ADR-0020/0023). An interpolated HCL `metric_name` or a computed C#
+  `Name` value is currently silently dropped, indistinguishable from
+  "this position was never looked at" — ADR-0026's own "slice 1
+  narrowing" note explains why (no clean home in `graph.json`'s
+  current shape was found within this slice's scope; `Manifest` is
+  never read back by any query command today).
+- **`.carto/contracts.json`'s digest is not joined into
+  `manifest.json`'s provenance tracking** the way `walk`'s
+  `ignore_rule_digest` is — two indexes built under different
+  classification rules aren't distinguishable from `manifest.json`
+  alone yet. ADR-0027.
+- **No `IacResource`/`depends_on`/IAM-extraction/§6.6 attribute
+  allowlist** — the contract slice (ADR-0025/0026/0027) is adjacent to
+  spec §6's infra graph, not a substitute for it. HCL literals attach
+  directly to the `File` node, not to any infra-graph node, because
+  that node doesn't exist yet.
 - **Rust path-qualified call resolution** (`Type::method()`, `module::func()`).
   Call matching is bare-name-only; those call sites aren't captured at all.
   Spec §5.3's "deliberately modest" policy — [ADR-0008](adr/0008-rust-resolution-policy-mapping.md).
@@ -171,7 +409,11 @@ Do not "fix" these without checking the linked reasoning first:
   `SymbolNode::uncaptured_inbound_calls`, surfaced on `deps --dir in`
   as `root_uncaptured_inbound_calls` — a nonzero count is a direct
   signal that a small/empty `--dir in` answer may be incomplete, not
-  evidence the symbol has few callers.
+  evidence the symbol has few callers. **Same day, ADR-0023 added the
+  outbound counterpart**: `SymbolNode::uncaptured_outbound_calls`/
+  `deps --dir out`'s `root_uncaptured_outbound_calls` — a symbol's own
+  path-qualified calls, counted by which symbol's body they're inside,
+  not by name.
 - **`use_wildcard` / `use_as_clause`** Rust import shapes — extracted
   as nothing rather than partially interpreted (an aliased member
   *inside* a group is skipped individually, not the whole statement).
@@ -184,6 +426,14 @@ Do not "fix" these without checking the linked reasoning first:
   consequence of the old exclusion was silent, not just reduced,
   under-reporting on any Rust fan-in/fan-out question whose only
   relevant import happened to be grouped — see ADR-0022's Context.
+  **Rust import detection is no longer `use`-declaration-only**:
+  since 2026-08-03 ([ADR-0024](adr/0024-bare-reference-import-detection.md)),
+  a bare fully-qualified-path reference with no `use`/`mod` at all
+  (`carto_core::Result<u8>`, valid since Rust 2018) is also captured,
+  heuristically (lowercase-root convention, excludes a call's own
+  callee), with its own evidence string
+  (`"external-package-bare-reference"`) distinguishing it from a
+  verified `use` declaration.
 - **Python has no visibility keyword; a leading underscore is the
   is_pub proxy** for call-resolution tiers (b)/(c), applied uniformly to
   functions/classes/methods (including dunder methods, e.g. `__init__`,

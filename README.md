@@ -83,16 +83,23 @@ or add it directly to an MCP config file:
 }
 ```
 
-This exposes `index`/`where`/`deps`/`map`/`selfcheck` as tools — the
-same core functions the CLI's own subcommands call
-(`crates/carto-core/src/query/`, `crates/carto-core/src/indexer.rs`), so
-answers are identical either way. Copy
-[`skill/carto.skill.md`](skill/carto.skill.md) into your agent's skills
-directory (spec §9.3's "the one integration file") for a description of
-what carto answers well and its honesty contract (confidence per edge,
-symbol IDs that change when code moves); the file has no imperative
-pressure language by design — it describes capabilities and lets the
-agent decide when to use them.
+This exposes `index`/`where`/`deps`/`map`/`contract`/`orphans`/
+`selfcheck` as tools — the same core functions the CLI's own subcommands
+call (`crates/carto-core/src/query/`, `crates/carto-core/src/indexer.rs`),
+so answers are identical either way. Copy the `skill/carto/` directory
+into your agent's skills directory (spec §9.3's "the one integration
+file," packaged as a directory per [ADR-0028](docs/adr/0028-skill-file-packaging.md)
+since Claude Code discovers skills at `<skills-dir>/<name>/SKILL.md`, not
+a bare file):
+
+```bash
+cp -r skill/carto ~/.claude/skills/
+```
+
+for a description of what carto answers well and its honesty contract
+(confidence per edge, symbol IDs that change when code moves); the file
+has no imperative pressure language by design — it describes
+capabilities and lets the agent decide when to use them.
 
 The MCP transport is a hand-rolled newline-delimited JSON-RPC 2.0 stdio
 loop, not `rmcp` — [ADR-0018](docs/adr/0018-mcp-transport-hand-rolled-jsonrpc.md)
