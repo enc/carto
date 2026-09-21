@@ -74,6 +74,12 @@ pub struct ResolvedExtraction {
     pub edges: Vec<Edge>,
 }
 
+/// Every file declaring a given FQN, paired with that file's component
+/// (`(declaring-file-id, component)`) — `resolve_fqn`'s candidate list.
+/// A type alias purely to keep clippy's `type_complexity` lint quiet;
+/// see the `fqn_to_file` binding in [`resolve`] for what it's for.
+type FqnCandidates<'a> = BTreeMap<(&'static str, String), Vec<(&'a NodeId, Option<&'a str>)>>;
+
 pub fn resolve(
     extractions: Vec<FileExtraction>,
     contract_rules: &ContractRules,
@@ -93,19 +99,40 @@ pub fn resolve(
     // a TS `import './orders'` would make a bare npm package named
     // `orders` classify as internal and silently drop its
     // external-module edge.
-    let known_modules: BTreeSet<&str> = extractions
-        .iter()
-        .filter(|fe| fe.declares_module)
-        .flat_map(|fe| &fe.extract.imports)
-        .filter_map(|imp| match imp {
-            RawImport::Relative {
+    // ADR-0035: partitioned per component (`Option<&str>`, so every file
+    // with no component shares the one `None` bucket — exactly today's
+    // single repo-wide set, when no component exists anywhere).
+    // Deliberately a *strict* partition, not component-first-with-
+    // fallback the way the call/type-ref tier ladder below is: a `mod
+    // orders;` declared inside one crate is never visible to a *different*
+    // crate's `use orders::x` under Rust's own module system, so falling
+    // back to a repo-wide check here would resurrect exactly the false
+    // suppression this ADR exists to fix (component A's `mod orders;`
+    // wrongly marking component B's external `orders` crate as internal,
+    // silently dropping the real external-module edge).
+    let mut known_modules: BTreeMap<Option<&str>, BTreeSet<&str>> = BTreeMap::new();
+    for fe in extractions.iter().filter(|fe| fe.declares_module) {
+        for imp in &fe.extract.imports {
+            if let RawImport::Relative {
                 module_path,
                 imported_names,
                 ..
-            } if imported_names.is_empty() => Some(module_path.as_str()),
-            _ => None,
-        })
-        .collect();
+            } = imp
+            {
+                if imported_names.is_empty() {
+                    known_modules
+                        .entry(fe.component.as_deref())
+                        .or_default()
+                        .insert(module_path.as_str());
+                }
+            }
+        }
+    }
+    let is_known_module = |fe: &FileExtraction, root: &str| -> bool {
+        known_modules
+            .get(&fe.component.as_deref())
+            .is_some_and(|s| s.contains(root))
+    };
 
     let relpath_to_file_id: BTreeMap<&str, &NodeId> = extractions
         .iter()
@@ -136,6 +163,18 @@ pub fn resolve(
     // schemes). So every index below is additionally keyed by
     // `fe.origin` — the actual per-language discriminant already on
     // every `FileExtraction` — not just the namespace string.
+    //
+    // ADR-0035: deliberately *not* made component-aware, unlike
+    // `fqn_to_file`/`namespace_to_files` below — this index's only job
+    // is "internal but unresolvable, so stay silent instead of guessing
+    // external" (outcome 2 of `Qualified`/`NamespaceImport` below), and
+    // a namespace root declared *anywhere* in the repo is still good
+    // evidence the root is the repo's own, not a third-party package,
+    // regardless of which component declared it. Narrowing this to the
+    // caller's own component would risk the opposite failure mode this
+    // ADR is trying to avoid: misclassifying a genuinely-internal-but-
+    // cross-component import as external and fabricating a spurious
+    // `Module` node for it.
     let known_namespace_roots: BTreeSet<(&str, &str)> = extractions
         .iter()
         .filter_map(|fe| {
@@ -146,7 +185,20 @@ pub fn resolve(
         .filter(|(_, root)| !root.is_empty())
         .collect();
 
-    let mut fqn_to_file: BTreeMap<(&'static str, String), &NodeId> = BTreeMap::new();
+    // ADR-0035: every declaring file per FQN, not just the first —
+    // `resolve_fqn` below picks a same-component one when the caller has
+    // a component and one exists, falling back to the *first* overall
+    // (index order, i.e. `extractions`' own order) otherwise — exactly
+    // preserving the pre-ADR-0035 `.or_insert` "first file wins"
+    // behavior for every case component-scoping doesn't help. Two
+    // components each illegally-from-carto's-view declaring the same FQN
+    // (a real, not-illegal occurrence in a monorepo — two services each
+    // scoped under one shared namespace root) previously resolved to
+    // whichever file `extractions` happened to list first, an arbitrary
+    // choice with no relationship to which file a given `use` actually
+    // meant; preferring the caller's own component first is almost
+    // always the intended target.
+    let mut fqn_to_file: FqnCandidates = BTreeMap::new();
     for fe in &extractions {
         let ns = fe.extract.declared_namespace.as_deref().unwrap_or("");
         for sym in &fe.extract.symbols {
@@ -158,9 +210,21 @@ pub fn resolve(
             } else {
                 format!("{ns}{}{}", fe.ns_separator, sym.name)
             };
-            fqn_to_file.entry((fe.origin, fqn)).or_insert(&fe.file_id);
+            fqn_to_file
+                .entry((fe.origin, fqn))
+                .or_default()
+                .push((&fe.file_id, fe.component.as_deref()));
         }
     }
+    let resolve_fqn = |origin: &'static str, fqn: &str, caller_component: Option<&str>| {
+        let candidates = fqn_to_file.get(&(origin, fqn.to_string()))?;
+        if let Some(component) = caller_component {
+            if let Some((id, _)) = candidates.iter().find(|(_, c)| *c == Some(component)) {
+                return Some(*id);
+            }
+        }
+        candidates.first().map(|(id, _)| *id)
+    };
 
     // C#'s `using Acme.Orders;` (ADR-0016, `RawImport::NamespaceImport`)
     // resolves against declared namespaces *as wholes*, fanning out one
@@ -228,6 +292,33 @@ pub fn resolve(
             if sym.is_pub {
                 pub_by_name
                     .entry(sym.name.as_str())
+                    .or_default()
+                    .push((fi, si));
+            }
+        }
+    }
+
+    // ADR-0035: each file's own component label, in the same `[fi]`
+    // lockstep every other per-file vector here uses, plus
+    // `pub_by_name`'s exact shape further split by `(component, name)` —
+    // backs tiers (b1)/(c1) in `CallResolver::resolve`. A file with no
+    // component contributes nothing here (it's still in `pub_by_name`);
+    // a repo with no components anywhere leaves this map empty, so tiers
+    // (b1)/(c1) never fire and every evidence string below stays
+    // byte-identical to before this ADR.
+    let file_component: Vec<Option<&str>> = extractions
+        .iter()
+        .map(|fe| fe.component.as_deref())
+        .collect();
+    let mut pub_by_component: BTreeMap<(&str, &str), Vec<(usize, usize)>> = BTreeMap::new();
+    for (fi, fe) in extractions.iter().enumerate() {
+        let Some(component) = fe.component.as_deref() else {
+            continue;
+        };
+        for (si, sym) in fe.extract.symbols.iter().enumerate() {
+            if sym.is_pub {
+                pub_by_component
+                    .entry((component, sym.name.as_str()))
                     .or_default()
                     .push((fi, si));
             }
@@ -366,6 +457,8 @@ pub fn resolve(
         dir_scoped: &dir_scoped,
         file_dir: &file_dir,
         same_dir_by_name: &same_dir_by_name,
+        file_component: &file_component,
+        pub_by_component: &pub_by_component,
     };
 
     // ADR-0033's inbound honesty pre-pass: every *attempted* call site
@@ -658,7 +751,7 @@ pub fn resolve(
                     let is_internal = root == "crate"
                         || root == "self"
                         || root == "super"
-                        || known_modules.contains(root.as_str());
+                        || is_known_module(fe, root);
                     if is_internal {
                         continue;
                     }
@@ -700,7 +793,7 @@ pub fn resolve(
                     let is_internal = root == "crate"
                         || root == "self"
                         || root == "super"
-                        || known_modules.contains(root.as_str());
+                        || is_known_module(fe, root);
                     if is_internal {
                         continue;
                     }
@@ -734,7 +827,7 @@ pub fn resolve(
                     // the repo-wide FQN index built above, not a
                     // directory walk. Three outcomes, in order:
                     let fqn = fqn.trim_start_matches(fe.ns_separator);
-                    if let Some(&target) = fqn_to_file.get(&(fe.origin, fqn.to_string())) {
+                    if let Some(target) = resolve_fqn(fe.origin, fqn, fe.component.as_deref()) {
                         // 1. Exact FQN match: certain edge to the
                         //    declaring file.
                         edges.push(Edge::new(
@@ -802,8 +895,34 @@ pub fn resolve(
                     // files the way a Go package spans a directory):
                     if let Some(target_fis) = namespace_to_files.get(&(fe.origin, path.as_str())) {
                         // 1. Some walked file declares exactly this
-                        //    namespace: one certain edge per such file.
-                        for &target_fi in target_fis {
+                        //    namespace: one certain edge per such file —
+                        //    ADR-0035: narrowed to the caller's own
+                        //    component's declaring files when at least
+                        //    one exists, so `using Acme.Orders;` in
+                        //    service "orders" fans out only within
+                        //    "orders", not also into every other
+                        //    service that happens to declare the same
+                        //    namespace (the exact over-broad-fan-out
+                        //    shape ADR-0029's field report traced
+                        //    `imports` itself to). Falls back to the
+                        //    full repo-wide fan-out — today's unchanged
+                        //    behavior — when the caller has no
+                        //    component, or no same-component file
+                        //    declares it.
+                        let same_component: Vec<usize> = target_fis
+                            .iter()
+                            .copied()
+                            .filter(|&tfi| {
+                                extractions[tfi].component.as_deref() == fe.component.as_deref()
+                            })
+                            .collect();
+                        let chosen: &[usize] =
+                            if fe.component.is_some() && !same_component.is_empty() {
+                                &same_component
+                            } else {
+                                target_fis
+                            };
+                        for &target_fi in chosen {
                             if target_fi == fi {
                                 continue; // no self-edge
                             }
@@ -1077,6 +1196,16 @@ struct CallResolver<'a> {
     /// names in a type position — what `disambiguate_by_owner` checks a
     /// candidate's owner against.
     type_ref_names: &'a [BTreeSet<&'a str>],
+    /// ADR-0035: each file's own `FileExtraction::component`, in the
+    /// same `[fi]` lockstep as `file_dir`/`dir_scoped`. `None` for a
+    /// file under no recognized project root.
+    file_component: &'a [Option<&'a str>],
+    /// ADR-0035: `pub_by_name`'s exact shape, further split by
+    /// component — `(component, name) -> [(fi, si)]`, built only from
+    /// files that have a component (a file with none contributes
+    /// nothing here; it still shows up in `pub_by_name`). Backs tiers
+    /// (b1)/(c1) below.
+    pub_by_component: &'a BTreeMap<(&'a str, &'a str), Vec<(usize, usize)>>,
 }
 
 impl<'a> CallResolver<'a> {
@@ -1119,6 +1248,46 @@ impl<'a> CallResolver<'a> {
             }
         }
 
+        // Tier (b1), ADR-0035: imported, narrowed to the caller's own
+        // component — tried before the repo-wide tier (b2) below, not
+        // instead of it. Only eligible when the caller *has* a component;
+        // a file in the `None` bucket has no scope narrower than the
+        // repo, so it goes straight to (b2), unchanged. Falls through
+        // (not `return None`) on 0 or ambiguous candidates, exactly like
+        // every other tier here — `pub_by_component`'s entry for
+        // `(component, declared)` is always a *subset* of `pub_by_name`'s
+        // entry for `declared`, so an ambiguous result here is
+        // necessarily still ambiguous on the full set (b2 tries the
+        // identical `disambiguate_by_owner` call and can only agree or
+        // still fail, never contradict) — this tier can only turn an
+        // *unresolved* b2 answer into a resolved one, never a different
+        // resolved one.
+        if let Some(component) = self.file_component[caller_file_idx] {
+            if let Some(&declared) = self.alias_to_declared[caller_file_idx].get(name) {
+                if let Some(candidates) = self.pub_by_component.get(&(component, declared)) {
+                    if let Some(hit) = self.resolve_candidates(
+                        caller_file_idx,
+                        candidates,
+                        "imported",
+                        "imported+owner-type-referenced",
+                    ) {
+                        return Some(hit);
+                    }
+                }
+            }
+        }
+
+        // Tier (b2): imported, repo-wide — spec §5.3's original tier
+        // (b), unchanged in candidate set and evidence when caller and
+        // target share a component (including both in the `None`
+        // bucket, the pre-ADR-0035 case). Only the evidence label
+        // changes, to `imported-cross-component`, when they don't —
+        // `bucket_evidence` is a labeling decision made *after* the
+        // identical resolution logic runs, never a filter on which
+        // candidates are considered (ADR-0014's "restrict what's
+        // listed, not what's computed" principle, applied to resolution
+        // labeling here instead of query-time listing).
+        //
         // Alias-aware: `name` is what the call site spells; the map's
         // value (if any) is the *declared* name `pub_by_name` is keyed by
         // — the same string for an unaliased import, a different one for
@@ -1127,18 +1296,56 @@ impl<'a> CallResolver<'a> {
         if let Some(&declared) = self.alias_to_declared[caller_file_idx].get(name) {
             if let Some(candidates) = self.pub_by_name.get(declared) {
                 if let [(fi, si)] = candidates[..] {
-                    return Some((fi, si, "imported"));
+                    let evidence = self.bucket_evidence(
+                        caller_file_idx,
+                        fi,
+                        "imported",
+                        "imported-cross-component",
+                    );
+                    return Some((fi, si, evidence));
                 }
                 if candidates.len() >= 2 {
                     if let Some((fi, si)) =
                         self.disambiguate_by_owner(caller_file_idx, candidates.iter().copied())
                     {
-                        return Some((fi, si, "imported+owner-type-referenced"));
+                        let evidence = self.bucket_evidence(
+                            caller_file_idx,
+                            fi,
+                            "imported+owner-type-referenced",
+                            "imported-cross-component+owner-type-referenced",
+                        );
+                        return Some((fi, si, evidence));
                     }
                 }
             }
         }
 
+        // Tier (c1), ADR-0035: exported, narrowed to the caller's own
+        // component — same "tried before, not instead of" relationship
+        // to (c2) as (b1) has to (b2), and the same subset argument for
+        // why it can only turn an unresolved (c2) answer resolved, never
+        // a different one.
+        if let Some(component) = self.file_component[caller_file_idx] {
+            if let Some(candidates) = self.pub_by_component.get(&(component, name)) {
+                let others: Vec<(usize, usize)> = candidates
+                    .iter()
+                    .filter(|(fi, _)| *fi != caller_file_idx)
+                    .copied()
+                    .collect();
+                if let Some(hit) = self.resolve_candidates(
+                    caller_file_idx,
+                    &others,
+                    "same-component",
+                    "same-component+owner-type-referenced",
+                ) {
+                    return Some(hit);
+                }
+            }
+        }
+
+        // Tier (c2): exported, repo-wide — spec §5.3's original tier
+        // (c), same "unchanged when same bucket, `cross-component` label
+        // when not" relationship (b2) has to (b).
         if let Some(candidates) = self.pub_by_name.get(name) {
             let others: Vec<(usize, usize)> = candidates
                 .iter()
@@ -1146,12 +1353,26 @@ impl<'a> CallResolver<'a> {
                 .copied()
                 .collect();
             match others.as_slice() {
-                [(fi, si)] => return Some((*fi, *si, "same-package")),
+                [(fi, si)] => {
+                    let evidence = self.bucket_evidence(
+                        caller_file_idx,
+                        *fi,
+                        "same-package",
+                        "cross-component",
+                    );
+                    return Some((*fi, *si, evidence));
+                }
                 many if many.len() >= 2 => {
                     if let Some((fi, si)) =
                         self.disambiguate_by_owner(caller_file_idx, many.iter().copied())
                     {
-                        return Some((fi, si, "same-package+owner-type-referenced"));
+                        let evidence = self.bucket_evidence(
+                            caller_file_idx,
+                            fi,
+                            "same-package+owner-type-referenced",
+                            "cross-component+owner-type-referenced",
+                        );
+                        return Some((fi, si, evidence));
                     }
                 }
                 _ => {}
@@ -1159,6 +1380,49 @@ impl<'a> CallResolver<'a> {
         }
 
         None
+    }
+
+    /// Shared shape for tiers (b1)/(c1): a single candidate resolves with
+    /// `plain` evidence; ambiguity falls through to
+    /// [`Self::disambiguate_by_owner`], resolving with `disambig`
+    /// evidence on exactly one survivor or producing nothing (letting the
+    /// caller fall through to the next tier) otherwise.
+    fn resolve_candidates(
+        &self,
+        caller_file_idx: usize,
+        candidates: &[(usize, usize)],
+        plain: &'static str,
+        disambig: &'static str,
+    ) -> Option<(usize, usize, &'static str)> {
+        match candidates {
+            [(fi, si)] => Some((*fi, *si, plain)),
+            many if many.len() >= 2 => self
+                .disambiguate_by_owner(caller_file_idx, many.iter().copied())
+                .map(|(fi, si)| (fi, si, disambig)),
+            _ => None,
+        }
+    }
+
+    /// `same` if `caller_file_idx` and `target_file_idx` share a
+    /// component (including both being in the `None` bucket — every
+    /// repo with no components at all compares `None == None` here,
+    /// keeping every evidence string byte-identical to before ADR-0035),
+    /// `cross` otherwise. A pure labeling decision over an
+    /// already-resolved candidate — never changes *which* candidate a
+    /// tier picks, only what the resulting edge's evidence says about
+    /// it.
+    fn bucket_evidence(
+        &self,
+        caller_file_idx: usize,
+        target_file_idx: usize,
+        same: &'static str,
+        cross: &'static str,
+    ) -> &'static str {
+        if self.file_component[caller_file_idx] == self.file_component[target_file_idx] {
+            same
+        } else {
+            cross
+        }
     }
 
     /// ADR-0032: narrows an otherwise-ambiguous candidate list to the
@@ -1856,6 +2120,209 @@ mod tests {
         );
     }
 
+    // --- ADR-0034/0035: component-scoped resolution -----------------
+
+    #[test]
+    fn component_scoping_fixes_the_exact_ambiguity_the_previous_test_leaves_unresolved() {
+        // Identical shape to `ambiguous_same_package_candidates_produce_no_edge`
+        // above, except `b` (the intended target) and the caller now
+        // share a component while `c` (the unrelated same-named symbol)
+        // sits in a different one — this is the motivating scenario for
+        // the whole feature: two services each defining `Handler`
+        // shouldn't make either one unresolvable.
+        let mut caller = file("services/orders/a.rs");
+        caller.component = Some("orders".to_string());
+        caller.extract.symbols = vec![sym("run", SymKind::Function, 1, 5, true)];
+        caller.extract.call_sites = vec![call("helper", 3)];
+
+        let mut b = file("services/orders/b.rs");
+        b.component = Some("orders".to_string());
+        b.extract.symbols = vec![sym("helper", SymKind::Function, 1, 2, true)];
+
+        let mut c = file("services/billing/c.rs");
+        c.component = Some("billing".to_string());
+        c.extract.symbols = vec![sym("helper", SymKind::Function, 1, 2, true)];
+
+        let out = resolve(vec![caller, b, c], &ContractRules::builtin());
+
+        let edges = calls_edges(&out.edges);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(
+            edges[0].to,
+            graph::sym_id("services/orders/b.rs", "function", "helper", 1)
+        );
+        assert_eq!(edges[0].evidence, vec!["same-component".to_string()]);
+        assert!(find_symbol(&out.nodes, "run").unresolved_calls.is_empty());
+    }
+
+    #[test]
+    fn component_scoped_import_tier_resolves_within_component_over_a_cross_component_namesake() {
+        let mut caller = file("services/orders/a.rs");
+        caller.component = Some("orders".to_string());
+        caller.extract.imports = vec![RawImport::Absolute {
+            root: "helpers".to_string(),
+            imported_names: vec![name("helper")],
+        }];
+        caller.extract.call_sites = vec![call("helper", 3)];
+
+        let mut b = file("services/orders/b.rs");
+        b.component = Some("orders".to_string());
+        b.extract.symbols = vec![sym("helper", SymKind::Function, 1, 2, true)];
+
+        let mut c = file("services/billing/c.rs");
+        c.component = Some("billing".to_string());
+        c.extract.symbols = vec![sym("helper", SymKind::Function, 1, 2, true)];
+
+        let out = resolve(vec![caller, b, c], &ContractRules::builtin());
+
+        let edges = calls_edges(&out.edges);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(
+            edges[0].to,
+            graph::sym_id("services/orders/b.rs", "function", "helper", 1)
+        );
+        assert_eq!(edges[0].evidence, vec!["imported".to_string()]);
+    }
+
+    #[test]
+    fn unique_repo_wide_candidate_in_a_different_component_gets_cross_component_evidence() {
+        let mut caller = file("services/orders/a.rs");
+        caller.component = Some("orders".to_string());
+        caller.extract.symbols = vec![sym("run", SymKind::Function, 1, 5, true)];
+        caller.extract.call_sites = vec![call("shared_helper", 3)];
+
+        let mut shared = file("libs/shared/s.rs");
+        shared.component = Some("shared".to_string());
+        shared.extract.symbols = vec![sym("shared_helper", SymKind::Function, 1, 2, true)];
+
+        let out = resolve(vec![caller, shared], &ContractRules::builtin());
+
+        let edges = calls_edges(&out.edges);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(
+            edges[0].to,
+            graph::sym_id("libs/shared/s.rs", "function", "shared_helper", 1)
+        );
+        assert_eq!(edges[0].evidence, vec!["cross-component".to_string()]);
+    }
+
+    #[test]
+    fn ambiguity_within_one_component_still_falls_through_to_repo_wide_and_stays_unresolved() {
+        // Both same-named candidates are in the caller's own component
+        // (so (c1) is ambiguous too, not merely absent) — falling
+        // through to (c2) must not somehow "resolve" this by widening
+        // the search; the candidate set only grows, so it stays
+        // ambiguous there too. Proves (b1)/(c1)'s fallthrough on
+        // ambiguity doesn't paper over a genuine in-component collision.
+        let mut caller = file("services/orders/a.rs");
+        caller.component = Some("orders".to_string());
+        caller.extract.symbols = vec![sym("run", SymKind::Function, 1, 5, true)];
+        caller.extract.call_sites = vec![call("helper", 3)];
+
+        let mut b = file("services/orders/b.rs");
+        b.component = Some("orders".to_string());
+        b.extract.symbols = vec![sym("helper", SymKind::Function, 1, 2, true)];
+
+        let mut c = file("services/orders/c.rs");
+        c.component = Some("orders".to_string());
+        c.extract.symbols = vec![sym("helper", SymKind::Function, 1, 2, true)];
+
+        let out = resolve(vec![caller, b, c], &ContractRules::builtin());
+        assert!(calls_edges(&out.edges).is_empty());
+        assert_eq!(find_symbol(&out.nodes, "run").unresolved_calls.len(), 1);
+    }
+
+    #[test]
+    fn a_repo_with_no_components_anywhere_resolves_exactly_as_before_this_adr() {
+        // The real backward-compatibility guarantee: when *no* file has
+        // a component, every `bucket_evidence` comparison is `None ==
+        // None`, so (b1)/(c1) never fire (nothing narrower than the
+        // repo to scope to) and (b2)/(c2) always report the same-bucket
+        // evidence string, byte-identical to every pre-ADR-0035 test in
+        // this module.
+        let mut caller = file("scripts/a.rs");
+        caller.extract.symbols = vec![sym("run", SymKind::Function, 1, 5, true)];
+        caller.extract.call_sites = vec![call("helper", 3)];
+
+        let mut b = file("scripts/b.rs");
+        b.extract.symbols = vec![sym("helper", SymKind::Function, 1, 2, true)];
+
+        let out = resolve(vec![caller, b], &ContractRules::builtin());
+        let edges = calls_edges(&out.edges);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].evidence, vec!["same-package".to_string()]);
+    }
+
+    #[test]
+    fn a_caller_with_no_component_calling_into_a_component_is_flagged_cross_component() {
+        // Not a backward-compatibility case (the pre-ADR-0035 resolver
+        // never had a "component" concept at all) — a deliberate
+        // labeling choice, checked explicitly: `None` and `Some(_)` are
+        // different buckets, so a root-level script calling into a real
+        // component's code is a genuine boundary crossing worth
+        // flagging, the same as the reverse direction.
+        let mut caller = file("scripts/a.rs");
+        caller.extract.symbols = vec![sym("run", SymKind::Function, 1, 5, true)];
+        caller.extract.call_sites = vec![call("helper", 3)];
+
+        let mut b = file("services/orders/b.rs");
+        b.component = Some("orders".to_string());
+        b.extract.symbols = vec![sym("helper", SymKind::Function, 1, 2, true)];
+
+        let out = resolve(vec![caller, b], &ContractRules::builtin());
+        let edges = calls_edges(&out.edges);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].evidence, vec!["cross-component".to_string()]);
+    }
+
+    #[test]
+    fn component_scoping_can_retarget_an_owner_disambiguated_call_to_the_same_component_candidate()
+    {
+        // A disclosed, deliberate behavior change (ADR-0035), not a
+        // regression: before component scoping, this call's only path
+        // to resolution was tier (c)'s owner-type disambiguation over
+        // the full repo-wide candidate set, which would have picked
+        // `legacy.rs::Save` (the only owner the caller's own type_refs
+        // happens to name). With components, (c1) finds a *single*
+        // same-component candidate (`store.rs::Save`) before disambig
+        // over the wider set is ever consulted — the more precise
+        // answer, but a different one than the pre-ADR-0035 resolver
+        // would have produced for this exact input.
+        let mut caller = file("services/orders/caller.rs");
+        caller.component = Some("orders".to_string());
+        caller.extract.symbols = vec![sym("run", SymKind::Method, 1, 6, true)];
+        caller.extract.call_sites = vec![call("Save", 4)];
+        // Only references `LegacyStore` — not `Store` — which is what
+        // makes the OLD repo-wide owner-disambig tier pick
+        // `legacy.rs::Save` specifically, were it ever reached.
+        caller.extract.type_refs = vec![type_ref("LegacyStore", 2)];
+
+        let mut store = file("services/orders/store.rs");
+        store.component = Some("orders".to_string());
+        store.extract.symbols = vec![sym_with_owner("Save", SymKind::Method, 1, 3, true, "Store")];
+
+        let mut legacy = file("misc/legacy.rs");
+        legacy.extract.symbols = vec![sym_with_owner(
+            "Save",
+            SymKind::Method,
+            1,
+            3,
+            true,
+            "LegacyStore",
+        )];
+
+        let out = resolve(vec![caller, store, legacy], &ContractRules::builtin());
+        let edges = calls_edges(&out.edges);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(
+            edges[0].to,
+            graph::sym_id("services/orders/store.rs", "method", "Save", 1),
+            "component scoping must prefer the same-component candidate \
+             over a coincidental cross-component owner-type match"
+        );
+        assert_eq!(edges[0].evidence, vec!["same-component".to_string()]);
+    }
+
     #[test]
     fn unresolved_inbound_calls_is_capped_but_the_count_stays_uncapped() {
         // One more unresolved site than the cap, each from its own file
@@ -2034,6 +2501,49 @@ mod tests {
         assert_eq!(imports[0].evidence, vec!["namespace-import".to_string()]);
     }
 
+    /// ADR-0035: two services each illegally-from-carto's-view declaring
+    /// `namespace App\Shared; class Constants { .. }` — a real,
+    /// non-illegal occurrence across independently-compiled components,
+    /// not the single-repo PHP autoload violation the pre-ADR-0035
+    /// "first file wins" comment described. A `use App\Shared\Constants;`
+    /// from *within* one of those services' own component must resolve
+    /// to that service's own declaration, not whichever file
+    /// `extractions` happened to list first.
+    #[test]
+    fn colliding_fqn_across_components_prefers_the_callers_own_component() {
+        let mut orders_shared = file("services/orders/Shared.php");
+        orders_shared.origin = "lang-php@1";
+        orders_shared.component = Some("orders".to_string());
+        orders_shared.extract.declared_namespace = Some("App\\Shared".into());
+        orders_shared.extract.symbols = vec![sym("Constants", SymKind::Class, 1, 5, true)];
+
+        let mut billing_shared = file("services/billing/Shared.php");
+        billing_shared.origin = "lang-php@1";
+        billing_shared.component = Some("billing".to_string());
+        billing_shared.extract.declared_namespace = Some("App\\Shared".into());
+        billing_shared.extract.symbols = vec![sym("Constants", SymKind::Class, 1, 5, true)];
+
+        let mut billing_handlers = file("services/billing/Handlers.php");
+        billing_handlers.origin = "lang-php@1";
+        billing_handlers.component = Some("billing".to_string());
+        billing_handlers.extract.imports = vec![RawImport::Qualified {
+            fqn: "App\\Shared\\Constants".into(),
+            bound_name: "Constants".into(),
+        }];
+
+        let out = resolve(
+            vec![orders_shared, billing_shared, billing_handlers],
+            &ContractRules::builtin(),
+        );
+        let imports = imports_edges(&out.edges);
+        assert_eq!(imports.len(), 1);
+        assert_eq!(
+            imports[0].to,
+            graph::file_id("services/billing/Shared.php"),
+            "must resolve to billing's own Shared.php, not orders' same-named one"
+        );
+    }
+
     #[test]
     fn php_qualified_import_with_known_root_but_no_fqn_match_produces_no_edge() {
         // `App` is a known namespace root (some file declares `namespace
@@ -2151,6 +2661,43 @@ mod tests {
             assert_eq!(e.confidence, Confidence::Certain);
             assert_eq!(e.evidence, vec!["namespace-import".to_string()]);
         }
+    }
+
+    /// ADR-0035: the fan-out narrows to the caller's own component when
+    /// at least one same-component file declares the namespace — a
+    /// `using Acme.Orders;` inside the "orders" service must not also
+    /// fan out into a *different* service's own, unrelated `Acme.Orders`
+    /// namespace (the same over-broad-fan-out shape ADR-0029's field
+    /// report traced the coarser `imports` edge to in the first place).
+    #[test]
+    fn csharp_namespace_import_fan_out_narrows_to_the_callers_own_component() {
+        let mut orders_order = cs_file("services/orders/Order.cs");
+        orders_order.component = Some("orders".to_string());
+        orders_order.extract.declared_namespace = Some("Acme.Orders".into());
+        orders_order.extract.symbols = vec![sym("Order", SymKind::Class, 1, 5, true)];
+
+        let mut orders_program = cs_file("services/orders/Program.cs");
+        orders_program.component = Some("orders".to_string());
+        orders_program.extract.declared_namespace = Some("Acme.App".into());
+        orders_program.extract.imports = vec![RawImport::NamespaceImport {
+            path: "Acme.Orders".into(),
+        }];
+
+        // A *different* service that happens to declare a same-named
+        // namespace — must not receive a fan-out edge from orders'
+        // `Program.cs`.
+        let mut billing_order = cs_file("services/billing/Order.cs");
+        billing_order.component = Some("billing".to_string());
+        billing_order.extract.declared_namespace = Some("Acme.Orders".into());
+        billing_order.extract.symbols = vec![sym("BillingOrder", SymKind::Class, 1, 5, true)];
+
+        let out = resolve(
+            vec![orders_program, orders_order, billing_order],
+            &ContractRules::builtin(),
+        );
+        let imports = imports_edges(&out.edges);
+        assert_eq!(imports.len(), 1, "must not fan out into billing too");
+        assert_eq!(imports[0].to, graph::file_id("services/orders/Order.cs"));
     }
 
     #[test]
@@ -2443,6 +2990,94 @@ mod tests {
             out.nodes
                 .iter()
                 .all(|n| !matches!(n.data, NodeData::Module(_)))
+        );
+    }
+
+    /// ADR-0035: `known_modules` is a *strict* per-component partition,
+    /// not component-first-with-fallback — a `mod orders;` declared in
+    /// one crate/component must never make a *different* component's
+    /// `use orders::x` classify as internal (a false suppression of a
+    /// real external-module edge). Identical shape to
+    /// `known_local_module_use_does_not_produce_module_node` above,
+    /// except `lib.rs` (which declares `mod orders;`) and `handlers.rs`
+    /// (which `use`s `orders`) are now in two different components —
+    /// this time a real external `Module` node and edge must appear.
+    #[test]
+    fn a_mod_declaration_in_one_component_does_not_suppress_another_components_external_import() {
+        let mut lib = file("services/orders/lib.rs");
+        lib.component = Some("orders".to_string());
+        lib.extract.imports = vec![RawImport::Relative {
+            levels_up: 0,
+            module_path: "orders".into(),
+            imported_names: vec![],
+        }];
+        let mut handlers = file("services/billing/handlers.rs");
+        handlers.component = Some("billing".to_string());
+        handlers.extract.imports = vec![RawImport::Absolute {
+            root: "orders".into(),
+            imported_names: vec![name("parse_order")],
+        }];
+
+        let out = resolve(vec![lib, handlers], &ContractRules::builtin());
+        let module = out
+            .nodes
+            .iter()
+            .find_map(|n| match &n.data {
+                NodeData::Module(m) => Some(m),
+                _ => None,
+            })
+            .expect("`orders` must be treated as external from billing's perspective");
+        assert!(module.external);
+        assert_eq!(module.path, "orders");
+        let edges = imports_edges(&out.edges);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].evidence, vec!["external-package".to_string()]);
+    }
+
+    /// The other half of the same guarantee: two components each
+    /// declaring their own `mod orders;` must not cross-suppress each
+    /// other's real internal resolution — a bucket-keyed set, not a
+    /// single shared one that a second component's declaration could
+    /// somehow interfere with.
+    #[test]
+    fn each_components_own_mod_declaration_still_suppresses_its_own_external_import() {
+        let mut a_lib = file("services/orders/lib.rs");
+        a_lib.component = Some("orders".to_string());
+        a_lib.extract.imports = vec![RawImport::Relative {
+            levels_up: 0,
+            module_path: "shared".into(),
+            imported_names: vec![],
+        }];
+        let mut a_handlers = file("services/orders/handlers.rs");
+        a_handlers.component = Some("orders".to_string());
+        a_handlers.extract.imports = vec![RawImport::Absolute {
+            root: "shared".into(),
+            imported_names: vec![name("x")],
+        }];
+
+        let mut b_lib = file("services/billing/lib.rs");
+        b_lib.component = Some("billing".to_string());
+        b_lib.extract.imports = vec![RawImport::Relative {
+            levels_up: 0,
+            module_path: "shared".into(),
+            imported_names: vec![],
+        }];
+        let mut b_handlers = file("services/billing/handlers.rs");
+        b_handlers.component = Some("billing".to_string());
+        b_handlers.extract.imports = vec![RawImport::Absolute {
+            root: "shared".into(),
+            imported_names: vec![name("y")],
+        }];
+
+        let out = resolve(
+            vec![a_lib, a_handlers, b_lib, b_handlers],
+            &ContractRules::builtin(),
+        );
+        assert!(
+            out.nodes
+                .iter()
+                .all(|n| !matches!(n.data, NodeData::Module(_))),
+            "each component's own `shared` module must stay internal to it"
         );
     }
 
