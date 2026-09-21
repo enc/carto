@@ -1,0 +1,10 @@
+{
+  "L1": { "grep": "correct", "cli": "correct" },
+  "L2": { "grep": "correct", "cli": "correct" },
+  "L3": { "grep": "partial", "cli": "correct" },
+  "L4": { "grep": "correct", "cli": "correct" },
+  "T5": { "grep": "correct", "cli": "correct" },
+  "T6": { "grep": "correct", "cli": "correct" },
+  "T7": { "grep": "correct", "cli": "correct" },
+  "T8": { "grep": "correct", "cli": "correct" }
+}

@@ -173,12 +173,19 @@ def main() -> int:
     grep_in = totals["grep"]["combined_in"]
     carto_in = totals["carto"]["combined_in"]
     cli_in = totals["cli"]["combined_in"]
-    if grep_in:
+    # Guarded on carto_in too, not just grep_in: a batch that skipped the
+    # carto-MCP arm entirely (e.g. to save quota) leaves carto_in at 0,
+    # which would otherwise print a meaningless "carto uses +100.0%"
+    # line — a division against zero tokens, not a real S-1 result.
+    if grep_in and carto_in:
         pct = (1 - carto_in / grep_in) * 100
         print(f"\nS-1 input-token check: carto (MCP) uses {pct:+.1f}% vs. grep-only "
               f"(threshold: ≥30% fewer, i.e. pct ≥ 30).")
         print("This is ONE trial per task-arm cell — treat as directional, "
               "not a confidence interval, per bench/tasks.md's own caveat.")
+    elif grep_in and not carto_in:
+        print("\nS-1 input-token check: skipped — no carto-MCP arm sessions in "
+              "this results dir (grep/cli-only batch).")
 
     if grep_in and cli_in:
         cli_pct = (1 - cli_in / grep_in) * 100

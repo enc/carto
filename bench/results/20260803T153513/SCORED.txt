@@ -1,0 +1,37 @@
+
+Some sessions are missing or failed to parse — the totals above are computed only over the sessions that succeeded. Re-run bench/run.sh for any missing task/arm before treating this as final.
+task  arm         in  cache_wr  cache_rd     out  combined_in  cost_usd   accuracy
+L1    grep         4    33,958    32,215   1,550       33,962    0.2373    correct
+L1    cli         16    36,866   241,697   2,762       36,882    0.3358    correct
+L1    carto      n/a       n/a       n/a     n/a          n/a    0.0000   ungraded
+L2    grep         6     7,864    89,599     300        7,870    0.0792    correct
+L2    cli          6     7,864    93,106     353        7,870    0.0811    correct
+L2    carto      n/a       n/a       n/a     n/a          n/a    0.0000   ungraded
+L3    grep        10    40,597   143,219   2,767       40,607    0.3287    correct
+L3    cli          8    39,975   111,188   1,476       39,983    0.2960    correct
+L3    carto      n/a       n/a       n/a     n/a          n/a    0.0000   ungraded
+L4    grep        10    11,912   163,306   1,154       11,922    0.1384    correct
+L4    cli         22    16,662   404,513   2,067       16,684    0.2530    correct
+L4    carto      n/a       n/a       n/a     n/a          n/a    0.0000   ungraded
+T5    grep        12    15,647   216,296   1,492       15,659    0.1819    correct
+T5    cli          8    11,608   134,335     868       11,616    0.1237    correct
+T5    carto      n/a       n/a       n/a     n/a          n/a    0.0000   ungraded
+T6    grep         4    11,113    59,392     770       11,117    0.0967    correct
+T6    cli         14    13,663   250,968   1,904       13,677    0.1865    correct
+T6    carto      n/a       n/a       n/a     n/a          n/a    0.0000   ungraded
+T7    grep        24    18,108   446,230   5,025       18,132    0.3186    correct
+T7    cli         10    11,381   164,069   1,937       11,391    0.1473    correct
+T7    carto      n/a       n/a       n/a     n/a          n/a    0.0000   ungraded
+T8    grep         6    10,749    93,855     827       10,755    0.1058    correct
+T8    cli         14    12,571   243,313   1,784       12,585    0.1759    correct
+T8    carto      n/a       n/a       n/a     n/a          n/a    0.0000   ungraded
+------------------------------------------------------------------------------------------
+total grep                     1,244,112              150,024    1.4867
+total cli                      1,643,189              150,688    1.5994
+total carto                            0                    0    0.0000
+
+S-1 input-token check: skipped — no carto-MCP arm sessions in this results dir (grep/cli-only batch).
+
+[exploratory, not an S-1 metric] cli-vs-grep input tokens: carto-via-CLI uses -0.4% vs. grep-only.
+S-1 accuracy (grep): 100.0% (8/8 tasks graded)
+S-1 accuracy (cli): 100.0% (8/8 tasks graded)

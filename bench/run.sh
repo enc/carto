@@ -45,7 +45,7 @@
 # re-running the full batch.
 set -euo pipefail
 
-CARTO_REPO="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+CARTO_REPO="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 ZED_REPO="${2:-$HOME/playground/zed}"
 CARTO_BIN="$CARTO_REPO/target/release/carto"
 MODEL="${MODEL:-sonnet}"
@@ -64,6 +64,33 @@ if [ ! -d "$ZED_REPO" ]; then
   exit 1
 fi
 
+IDX_CARTO="$RUN_DIR/idx-carto"
+IDX_ZED="$RUN_DIR/idx-zed"
+
+# Pre-build each corpus's index once, here, before any claude -p session
+# launches — mirroring bench/replay/replay.sh's own established
+# convention (its IDX_CARTO/IDX_ZED, built the exact same way, lines
+# 27-56 there). This runs as a plain subprocess in this script's own
+# unrestricted shell, never inside a permission-mediated graded session
+# — which is where every real batch's `index`-related permission
+# denials traced back to (indexing zed's 3,754 files produces enough
+# output that an agent reaches for a pipe/redirect to manage it, and
+# this environment's Bash permission matching denies that regardless of
+# --allowedTools; L1.cli in bench/results/20260803T191345/ even fell
+# back to raw ls/find/grep after hitting this, never reaching carto at
+# all for that task — see bench/field-log.md). `set -euo pipefail`
+# means a failed pre-index here aborts the whole batch loudly, before
+# any paid session runs, rather than letting individual graded sessions
+# silently degrade.
+echo "== pre-indexing (once, outside any graded session) ==" >&2
+t0=$(date +%s)
+"$CARTO_BIN" index "$CARTO_REPO" --out "$IDX_CARTO" >&2
+echo "   carto repo indexed in $(($(date +%s) - t0))s -> $IDX_CARTO" >&2
+t0=$(date +%s)
+"$CARTO_BIN" index "$ZED_REPO" --out "$IDX_ZED" >&2
+echo "   zed repo indexed in $(($(date +%s) - t0))s -> $IDX_ZED" >&2
+echo >&2
+
 # Real MCP config for the carto (MCP) arm.
 cat > "$RUN_DIR/mcp-config.json" <<EOF
 {"mcpServers": {"carto": {"command": "$CARTO_BIN", "args": ["serve"]}}}
@@ -73,20 +100,52 @@ EOF
 # "nothing else happens to be configured."
 echo '{"mcpServers": {}}' > "$RUN_DIR/empty-mcp-config.json"
 
-READ_TOOLS="Read Glob Grep Bash(rg:*) Bash(grep:*) Bash(find:*) Bash(sed:*) Bash(wc:*) Bash(ls:*) Bash(cat:*)"
-CARTO_MCP_TOOLS="mcp__carto__index mcp__carto__where mcp__carto__deps mcp__carto__map mcp__carto__selfcheck"
-# The cli arm's only additional tool is Bash access to the carto binary
-# itself, at its exact absolute path — Claude Code's Bash allowedTools
-# patterns match on the command's leading word, so this has to be the
+# head/tail/python3/du added after a real batch showed denials on plain
+# single invocations of these (repo-size estimation, JSON pretty-printing)
+# — defense in depth only: a *compound* command (a pipe into one of
+# these, a `for` loop, `&&`/`;` chains) still gets denied regardless of
+# what's declared here, since this session's Bash permission matching
+# checks the whole command's shape, not just its leading word. See
+# BASH_STYLE_NOTE below for the actual fix for that case.
+READ_TOOLS="Read Glob Grep Bash(rg:*) Bash(grep:*) Bash(find:*) Bash(sed:*) Bash(wc:*) Bash(ls:*) Bash(cat:*) Bash(head:*) Bash(tail:*) Bash(python3:*) Bash(du:*)"
+# `index` deliberately excluded from both arms' tool sets below — both
+# corpora are already pre-indexed (see above) before any graded session
+# starts, so it's never needed, and excluding it makes that a structural
+# guarantee (can't be re-invoked, can't hit an index-related permission
+# denial) rather than something that relies on the agent following a
+# prompt note alone.
+CARTO_MCP_TOOLS="mcp__carto__where mcp__carto__deps mcp__carto__map mcp__carto__selfcheck"
+# The cli arm's additional tools are Bash access to the carto binary
+# itself, one pattern per subcommand (mirroring CARTO_MCP_TOOLS's own
+# per-tool allowlist shape) rather than a blanket `Bash($CARTO_BIN:*)`
+# — at its exact absolute path, since Claude Code's Bash allowedTools
+# patterns match on the command's leading words, so this has to be the
 # literal resolved path, not a bare `carto` (which wouldn't be on PATH
 # inside the spawned session anyway).
-CARTO_CLI_TOOLS="Bash($CARTO_BIN:*)"
+CARTO_CLI_TOOLS="Bash($CARTO_BIN where:*) Bash($CARTO_BIN deps:*) Bash($CARTO_BIN map:*) Bash($CARTO_BIN selfcheck:*)"
+# Two real batches refined this note. bench/results/20260803T185010/
+# showed every permission_denials entry, on BOTH the grep and cli arms,
+# was a compound/piped Bash command (`carto index x | tail -30`, a
+# `for` loop piping into `grep`). After telling both arms to avoid
+# piping and redirect large output to a file instead,
+# bench/results/20260803T191345/ showed *that* advice also gets denied
+# — a single plain command with its output redirected to a file
+# (`carto ... --json > /tmp/x.json`, retried against three different
+# target paths, all denied) is treated the same as a pipe. This
+# session's permission matching checks a command's whole shape, not
+# just its leading word, so widening READ_TOOLS/CARTO_CLI_TOOLS above
+# only helps a genuinely bare invocation of those tools — never a
+# pipe/redirect/loop/chain, no matter the target. The only reliable fix
+# is a bare command with no trailing shell operator at all.
+BASH_STYLE_NOTE="This session's tool permissions match a Bash command by its exact invocation shape: a compound command, or even a single command with output redirected to a file (pipes \`|\`, redirects \`>\`/\`>>\`, \`&&\`, \`;\`, a \`for\` loop, command substitution), can be denied even when the identical bare invocation (nothing after it) would be allowed. Prefer one simple, single-command Bash call per tool use, with no trailing shell operator — if you need to combine steps, use separate Bash calls rather than a shell pipeline, and if output is too large, bound it with the tool's own flags rather than piping or redirecting it elsewhere."
 # --append-system-prompt-file doesn't actually exist as a standalone flag
 # (checked against `claude --help`; only the inline-text
 # --append-system-prompt does) — pass file content directly for both the
 # MCP arm's skill file and the cli arm's CLI-usage guidance.
-SKILL_TEXT="$(cat "$CARTO_REPO/skill/carto.skill.md")"
-CLI_TEXT="$(sed "s|{{CARTO_BIN}}|$CARTO_BIN|g" "$CARTO_REPO/bench/cli-arm-prompt.md")"
+SKILL_TEXT="$(cat "$CARTO_REPO/skill/carto/SKILL.md")"
+CLI_TEXT="$(sed "s|{{CARTO_BIN}}|$CARTO_BIN|g" "$CARTO_REPO/bench/cli-arm-prompt.md")
+
+$BASH_STYLE_NOTE"
 
 declare -A PROMPT
 declare -A CORPUS
@@ -107,10 +166,37 @@ CORPUS[T7]="$ZED_REPO"
 PROMPT[T8]="What does \`carto_core::indexer::build_and_persist\` call or depend on directly?"
 CORPUS[T8]="$CARTO_REPO"
 
+# Maps a corpus path to its pre-built index dir (both set up above) —
+# only ever $CARTO_REPO or $ZED_REPO today, matching CORPUS[]'s own two
+# hardcoded values; extend here if a third corpus is ever added.
+idx_for_corpus() {
+  case "$1" in
+    "$CARTO_REPO") echo "$IDX_CARTO" ;;
+    "$ZED_REPO") echo "$IDX_ZED" ;;
+    *)
+      echo "idx_for_corpus: no pre-built index for corpus '$1'" >&2
+      exit 1
+      ;;
+  esac
+}
+
 run_session() {
   local task="$1" arm="$2" corpus="$3" prompt="$4"
   local out="$RESULTS_DIR/$task.$arm.json"
-  local full_prompt="Repository to answer this about: $corpus (this is also the session's current directory).
+  local idx_dir
+  idx_dir="$(idx_for_corpus "$corpus")"
+  # Corpus-specific, so it belongs in the per-task prompt (built fresh
+  # every call) rather than the static CLI_TEXT/SKILL_TEXT system
+  # prompts (loaded once for the whole script run and shared across
+  # every task, which can target either corpus). grep never touches
+  # carto, so it gets no note — keeps its prompt minimal, unchanged.
+  local idx_note=""
+  if [ "$arm" = "cli" ] || [ "$arm" = "carto" ]; then
+    idx_note="This repo has already been indexed by carto at --out $idx_dir — pass that exact path to every carto command (cli: --out $idx_dir; MCP: out=\"$idx_dir\" tool parameter) rather than omitting --out, and do not run index yourself; it isn't needed and isn't in your tool set.
+
+"
+  fi
+  local full_prompt="${idx_note}Repository to answer this about: $corpus (this is also the session's current directory).
 
 $prompt"
 
@@ -129,7 +215,9 @@ $prompt"
           --model "$MODEL" \
           --allowedTools "$READ_TOOLS $CARTO_MCP_TOOLS" \
           --permission-mode bypassPermissions \
-          --append-system-prompt "$SKILL_TEXT" \
+          --append-system-prompt "$SKILL_TEXT
+
+$BASH_STYLE_NOTE" \
           "$full_prompt"
         ;;
       cli)
@@ -151,6 +239,7 @@ $prompt"
           --model "$MODEL" \
           --allowedTools "$READ_TOOLS" \
           --permission-mode bypassPermissions \
+          --append-system-prompt "$BASH_STYLE_NOTE" \
           "$full_prompt"
         ;;
     esac
@@ -161,10 +250,18 @@ $prompt"
   echo "   cost=\$$cost -> $out" >&2
 }
 
+# Which arms to run, space-separated — defaults to all three (unchanged
+# default behavior). Override to spend less: e.g. `ARMS="grep cli"` skips
+# the carto-MCP arm entirely when a run is only meant to re-check the
+# grep/cli comparison and MCP quota isn't warranted that trip.
+# bench/score.py already tolerates a missing arm's session files (reports
+# that arm's columns as null) so a partial-arms run still scores cleanly.
+ARMS="${ARMS:-grep cli carto}"
+
 for task in L1 L2 L3 L4 T5 T6 T7 T8; do
-  run_session "$task" grep "${CORPUS[$task]}" "${PROMPT[$task]}"
-  run_session "$task" cli "${CORPUS[$task]}" "${PROMPT[$task]}"
-  run_session "$task" carto "${CORPUS[$task]}" "${PROMPT[$task]}"
+  for arm in $ARMS; do
+    run_session "$task" "$arm" "${CORPUS[$task]}" "${PROMPT[$task]}"
+  done
 done
 
 rm -rf "$RUN_DIR"

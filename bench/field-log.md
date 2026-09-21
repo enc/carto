@@ -358,3 +358,211 @@ headline itself:
   independent of which tools were available — a prompt/skill wording
   issue (or just an inherent ambiguity in "imports from a crate") more
   than a carto-specific one.
+
+## 2026-08-03 — Part C: re-run against the post-S-1 plan's slices 1–4, grep+cli only
+
+After landing ADR-0020–0022 (the honest-absence signal, `map
+--section`, `Module`/`File` discovery, Rust grouped-`use` extraction —
+`docs/post-s1-improvement-plan.md`'s slices 1–4), the user asked to
+re-run the benchmark to check the fixes actually land, but **without
+the carto-MCP arm this time**, specifically to save quota. Two real
+things surfaced doing this, neither of which required re-running the
+whole batch a third time.
+
+### A pre-existing `bench/run.sh` default-path bug, found on first attempt
+
+`CARTO_REPO="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"`
+resolves one directory too far up when no explicit `$1` is given:
+`bench/run.sh` lives at `<repo>/bench/run.sh` — one level below the repo
+root, not two — so `dirname(...)/../..` lands on the repo's *parent*
+directory. First attempt failed immediately (`carto release binary not
+found at /Users/jonatan.reiners/playground/target/release/carto` —
+missing the `/carto` path segment). This is invocation-path-independent
+(relative or absolute `bash bench/run.sh` both hit it) and would affect
+anyone running the script without passing `$1` explicitly, so it's fixed
+in the script itself (`dirname(...)/..`, one `..` not two), not worked
+around per-invocation.
+
+Also added an `ARMS` env var (`ARMS="${ARMS:-grep cli carto}"`,
+space-separated, looped) so a future run can skip arms without editing
+the script — `ARMS="grep cli" bash bench/run.sh` is what actually ran
+this batch. Default behavior (`ARMS` unset) is unchanged: all three arms.
+
+### `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB` permission friction, real but non-fatal
+
+Every one of the 16 sessions in this batch (`bench/results/
+20260803T153513/`) emitted `Permission mode forced to default —
+CLAUDE_CODE_SUBPROCESS_ENV_SCRUB is set` on stderr, despite
+`--permission-mode bypassPermissions` and explicit `--allowedTools`
+being passed for every arm (the warning's own suggested remedy).
+Checking each session's own `permission_denials` JSON field confirmed
+this had a real, measurable, **asymmetric** effect: **7 tool-call
+denials across 5 `cli`-arm sessions vs. 2 denials in 1 `grep`-arm
+session**. Every denied call was a compound/piped Bash command (e.g.
+`carto ... --json | python3 -m json.tool | head -100`) that doesn't
+match the harness's simple prefix-based `--allowedTools` patterns, or
+used a command (`python3`, `head`, `du`) never declared in `READ_TOOLS`
+at all — a harness gap (this repo's Bash allowlist doesn't cover every
+command an agent might reach for), not something inherent to a
+CLI-via-Bash integration surface. Every affected session recovered (more
+turns, more tokens/cost) and still reached a fully correct final answer
+— see `bench/results/20260803T153513/GRADES.md` for the accounting. Not
+fixed here (would need widening `READ_TOOLS`/`CARTO_CLI_TOOLS` and
+re-running to get a clean token comparison) — flagged as a real caveat
+on this batch's cli-vs-grep token numbers specifically, the same way
+the original batch's harness bugs were disclosed rather than quietly
+absorbed into the numbers.
+
+### Results
+
+8/8 tasks correct for both `grep` and `cli` (up from the original
+batch's grep 93.75% / carto-MCP 87.5%) — `bench/results/
+20260803T153513/GRADES.md` has the full per-task reasoning. The three
+tasks the post-S-1 slices specifically targeted all moved from
+loss/partial to correct: **L3** (unreachable via the MCP tool surface,
+then only 11/18 files even reading `graph.json` directly → 19/19 exact
+match, via `deps carto_core --dir in` succeeding for the first time);
+**T5** (the `Serialize`-impl same-file misread → all 4 real callers,
+correctly described); **T6** (previously correct only because the agent
+already knew about ADR-0008 from general knowledge → correct because
+`root_uncaptured_inbound_calls: 6` told it directly, matching ground
+truth exactly). This is **not** a new S-1 measurement — no carto-MCP arm
+ran, so the spec §11.4 grep-vs-carto-MCP comparison (tokens and
+accuracy) this exists to gate M3 on has no new data point here. It's
+evidence the specific fixes work on the specific tasks that motivated
+them; the full three-arm re-run (`docs/post-s1-improvement-plan.md`'s
+slice-order step 5) is still a separate, not-yet-run, user-approved
+measurement.
+
+Also fixed in `bench/score.py` while reading this batch's output: the
+"S-1 input-token check" line divided against a `carto` arm total of
+`0` when no carto sessions exist, printing a meaningless "carto uses
++100.0%" — now guarded on `carto_in` being nonzero, with an explicit
+"skipped — no carto-MCP arm sessions" message when it isn't.
+
+## 2026-08-03 — Part D: user ran it from their own terminal, twice, chasing the same denial root cause down two more layers
+
+Following the "run it yourself, out of the nested session" suggestion
+above, the user ran the batch from their own terminal directly. First
+finding: the `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB` warning appeared in
+their session too — so "nested vs. not" was the wrong framing entirely;
+that env var (and whatever forces permission mode to default because
+of it) is present regardless of nesting on this machine. The real,
+actionable fix turned out to be about Bash *invocation shape*, not
+session nesting — see the `BASH_STYLE_NOTE` addition to `bench/run.sh`
+and `bench/cli-arm-prompt.md` above.
+
+**First user-run batch (`bench/results/20260803T185010/`)**: same
+compound/piped-command denial pattern as before, on both arms (7
+denials cli, 2 grep) — `carto index x | tail -30`, `deps ... | python3
+-m json.tool | head -100`. This is what `BASH_STYLE_NOTE` was written
+to fix (told to all three arms, not just cli's own prompt, since grep
+hit it too), plus `READ_TOOLS` widened with `head`/`tail`/`python3`/`du`
+as defense-in-depth for plain (non-piped) invocations of those.
+
+**Second user-run batch (`bench/results/20260803T191345/`)**: the fix
+worked for its original target — zero denials on L1/L2/L3/T6/T7's
+`cli` sessions, down from 5+ in the same tasks previously. But it
+surfaced a *new* denial pattern the original advice itself caused: 10
+denials across L4 (5), T5 (2), T8 (3), every one a **plain command with
+output redirected to a file** (`carto ... --json > /tmp/x.json`,
+retried against three different target paths — `/tmp`, the repo's own
+directory, `$TMPDIR` — all denied). The "redirect to a file, then read
+it" fallback `cli-arm-prompt.md` suggested after the first fix turned
+out to be denied the same way a pipe is — this session's permission
+matching apparently treats *any* output redirection as needing its own
+approval, independent of which program produced it or where it's
+written. Fixed by removing that fallback entirely: the guidance now says
+there is no reliably-clean way to redirect/pipe/chain at all in this
+environment — bound output with the tool's own flags (`--limit`,
+`--budget`, `--depth`) so it's already small enough to read directly,
+full stop.
+
+**Results, this second batch — the first time cli/carto actually beats
+grep on accuracy**: grep 93.75% (7/8, one partial), cli 100% (8/8) —
+`bench/results/20260803T191345/GRADES.md` has the full reasoning. The
+deciding task is **L3**: grep repeated the *exact* false-positive
+mistake (`carto-mcp/src/lib.rs`, `tools/mod.rs` counted as importers
+when they only mention `carto_core` in doc comments) the original S-1
+batch's `GRADES.md` already named as a shared, non-carto-specific
+mistake — but this time `cli` avoided it, explicitly citing carto's
+structural import data (which can't be fooled by a doc-comment
+mention, since edges come from real syntax, not a text scan) to
+correctly exclude both files. Token/cost still favor grep in this
+batch (cli +14% tokens, +27% cost) — but a meaningful fraction of that
+premium is the 10 denial-driven retries this batch's own fix (now
+corrected) directly caused, not evidence about carto-via-CLI's
+inherent cost. Three real batches in, the pattern that's held up
+without exception: **cli's accuracy is at least as good as grep's,
+often better on tasks with a real doc-comment/text-noise trap; its
+token cost is inconsistent across batches and confounded by harness
+friction on every single trial so far.**
+
+## 2026-08-03 — Part E: pre-build the index once, outside any graded session
+
+Every real batch's `index`-related friction (L1.cli falling back to raw
+`ls`/`find`/`grep` after a denied `carto index zed | tail -30`; a
+denial in nearly every batch shaped exactly like that) traced back to
+the same root cause: `bench/run.sh` let each graded session decide for
+itself whether to call `carto index`, and indexing zed's 3,754 files
+produces enough output that an agent reaches for a pipe to manage it —
+exactly the shape this environment's permission matching denies. On
+top of the friction, each of the 8 tasks is a separate `claude -p`
+session, so letting any of them index meant up to 8× redundant
+index-build cost per corpus per batch (`docs/post-s1-improvement-plan.md`
+§2.3 named this waste independently, before the friction was traced).
+
+`bench/replay/replay.sh` (the deterministic, no-LLM arm) already had
+the right pattern — build each corpus's index once, upfront, into an
+explicit `--out` path (`IDX_CARTO`/`IDX_ZED`) it owns, before any
+per-task command runs. `bench/run.sh` never adopted it. Fixed by
+porting the same convention: `run.sh` now pre-builds both indexes as
+plain subprocess calls in its own unrestricted shell, before any
+`claude -p` session launches; `run_session()` injects a per-task,
+corpus-specific note into the `cli`/`carto` arms' prompts naming the
+exact pre-built path and stating `index` must not be called; and
+`index` was dropped from both arms' tool allowlists entirely
+(`CARTO_MCP_TOOLS`, and `CARTO_CLI_TOOLS` narrowed from a blanket
+`Bash($CARTO_BIN:*)` to one pattern per remaining subcommand) — a
+structural guarantee neither arm can reach `index` at all, not just a
+prompt suggestion. `grep` is untouched (never had carto tool access).
+
+**Verified for free, without spending on a real batch**: extracted the
+new pre-index block and ran it standalone against both real corpora —
+both indexed cleanly (carto's own repo: 1s, 340 files; zed: 15s, 3,754
+files) from a plain shell, no permission system involved at all; a
+`deps`/`where` call against each pre-built path with the CLI directly
+(no `index` step) returned correct results. Also spot-checked
+`run_session()`'s prompt-construction logic in isolation for one
+cli-arm and one carto-arm task against each corpus, confirming the
+injected note carries the right path, and confirmed `grep`'s prompt
+gets no note at all. What this can't verify without a real, paid batch:
+whether a live agent actually follows the injected instruction instead
+of trying `index` anyway and hitting the new hard denial — that's the
+next real run.
+
+**That real batch ran** (`bench/results/20260803T220826/`) and confirms
+the fix worked completely: **zero `index`-related denials, zero denials
+of any kind on the `cli` arm** across all 8 tasks (down from 5, 10, and
+5 in the three prior batches) — the only denial in the whole batch was
+a `grep`-arm `for` loop, the one residual pattern `BASH_STYLE_NOTE`
+alone has never fully suppressed since it's advisory there, not a tool
+restriction. Turn counts dropped sharply (L1.cli: 5, down from 8–10;
+L3.cli: 2, down from 4–11) and, for the first time, token/cost is
+comparable without denial-driven retries confounding either arm: cli
+uses 20.0% fewer combined input tokens than grep and costs 9.5% less —
+the actual question this arm exists to answer, finally visible.
+
+Accuracy told a different, separate story this trial: cli dropped to
+87.5% (7/8, two partial) against grep's 93.75%, a real regression from
+the immediately prior batch's 100%. Both misses trace to the agent
+skipping a verification step it did in the prior trial (T8: never read
+source for `build_and_persist`'s 6 real path-qualified calls, unlike
+the prior batch's session on the same task; L3: ran a grep-style text
+search instead of cross-checking against carto's own `imports` edges,
+picking up an extra false positive doc-comment-mention). Nothing about
+the pre-index change explains either miss — full reasoning in
+`bench/results/20260803T220826/GRADES.md`. Consistent with every batch
+so far: single-trial accuracy variance is larger than any one fix's
+effect size, exactly the caveat `bench/tasks.md` builds in from the
+start.

@@ -456,4 +456,12 @@ distinction rather than scoring recall alone. Token counts come from
 `bench/run.sh` (real `claude -p --output-format json` sessions, exact
 `usage` block) and `bench/replay/` (deterministic byte counts, calibrated
 to tokens using the real-run arm's own ratio — no external tokenizer is
-available offline in this environment).
+available offline in this environment). Both arms pre-build each
+corpus's index once, outside any per-task measurement, before their
+per-task loop starts — `bench/replay/replay.sh` always did this
+(`IDX_CARTO`/`IDX_ZED`, reported as a separate "index-build cost" line);
+`bench/run.sh` adopted the same convention after real batches showed
+graded sessions invoking `index` themselves both wasted redundant
+per-task cost and, worse, risked a permission denial on the large
+output indexing zed produces (see `bench/field-log.md`). No task's
+token/cost number below includes index-build cost as of that change.
