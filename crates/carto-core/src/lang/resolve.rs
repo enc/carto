@@ -139,6 +139,18 @@ pub fn resolve(
         .map(|fe| (fe.relpath.as_str(), &fe.file_id))
         .collect();
 
+    // ADR-0036: every file's own component, keyed by its `NodeId` rather
+    // than `[fi]` index — needed at each file->file `Imports` edge site
+    // below, several of which resolve a target only as a `&NodeId`
+    // (`resolve_relative_import`, `resolve_fqn`) with no extraction
+    // index in hand. A file with no component maps to `None`, same as
+    // `file_component`'s `[fi]`-indexed twin below (built further down,
+    // for sites that already have a `usize` index instead).
+    let file_id_to_component: BTreeMap<&NodeId, Option<&str>> = extractions
+        .iter()
+        .map(|fe| (&fe.file_id, fe.component.as_deref()))
+        .collect();
+
     // PHP's `use App\Orders\Order;` (ADR-0012, `RawImport::Qualified`) —
     // a fully-qualified name with no path semantics, resolved against a
     // repo-wide index instead of a directory walk. `known_namespace_roots`
@@ -704,13 +716,20 @@ pub fn resolve(
                             module_path,
                             &relpath_to_file_id,
                         ) {
-                            edges.push(Edge::new(
+                            let mut edge = Edge::new(
                                 EdgeKind::Imports,
                                 fe.file_id.clone(),
                                 target.clone(),
                                 Confidence::Certain,
                                 evidence.to_string(),
-                            ));
+                            );
+                            if let Some(marker) = cross_component_marker(
+                                fe.component.as_deref(),
+                                file_id_to_component.get(target).copied().flatten(),
+                            ) {
+                                edge.evidence.push(marker.to_string());
+                            }
+                            edges.push(edge);
                         }
                     } else {
                         // Python's `from . import pkg[, pkg2]` — each
@@ -728,13 +747,20 @@ pub fn resolve(
                                 &name.declared_name,
                                 &relpath_to_file_id,
                             ) {
-                                edges.push(Edge::new(
+                                let mut edge = Edge::new(
                                     EdgeKind::Imports,
                                     fe.file_id.clone(),
                                     target.clone(),
                                     Confidence::Certain,
                                     "relative-import".to_string(),
-                                ));
+                                );
+                                if let Some(marker) = cross_component_marker(
+                                    fe.component.as_deref(),
+                                    file_id_to_component.get(target).copied().flatten(),
+                                ) {
+                                    edge.evidence.push(marker.to_string());
+                                }
+                                edges.push(edge);
                             }
                         }
                     }
@@ -831,13 +857,20 @@ pub fn resolve(
                     if let Some(target) = resolve_fqn(fe.origin, fqn, fe.component.as_deref()) {
                         // 1. Exact FQN match: certain edge to the
                         //    declaring file.
-                        edges.push(Edge::new(
+                        let mut edge = Edge::new(
                             EdgeKind::Imports,
                             fe.file_id.clone(),
                             target.clone(),
                             Confidence::Certain,
                             "namespace-import".to_string(),
-                        ));
+                        );
+                        if let Some(marker) = cross_component_marker(
+                            fe.component.as_deref(),
+                            file_id_to_component.get(target).copied().flatten(),
+                        ) {
+                            edge.evidence.push(marker.to_string());
+                        }
+                        edges.push(edge);
                     } else if fqn
                         .split(fe.ns_separator)
                         .next()
@@ -927,13 +960,20 @@ pub fn resolve(
                             if target_fi == fi {
                                 continue; // no self-edge
                             }
-                            edges.push(Edge::new(
+                            let mut edge = Edge::new(
                                 EdgeKind::Imports,
                                 fe.file_id.clone(),
                                 extractions[target_fi].file_id.clone(),
                                 Confidence::Certain,
                                 "namespace-import".to_string(),
-                            ));
+                            );
+                            if let Some(marker) = cross_component_marker(
+                                fe.component.as_deref(),
+                                file_component[target_fi],
+                            ) {
+                                edge.evidence.push(marker.to_string());
+                            }
+                            edges.push(edge);
                         }
                     } else if path
                         .split(fe.ns_separator)
@@ -991,13 +1031,20 @@ pub fn resolve(
                                 if target_fi == fi {
                                     continue; // no self-edge
                                 }
-                                edges.push(Edge::new(
+                                let mut edge = Edge::new(
                                     EdgeKind::Imports,
                                     fe.file_id.clone(),
                                     extractions[target_fi].file_id.clone(),
                                     Confidence::Certain,
                                     "package-import".to_string(),
-                                ));
+                                );
+                                if let Some(marker) = cross_component_marker(
+                                    fe.component.as_deref(),
+                                    file_component[target_fi],
+                                ) {
+                                    edge.evidence.push(marker.to_string());
+                                }
+                                edges.push(edge);
                             }
                         }
                         None => {
@@ -1450,6 +1497,23 @@ impl<'a> CallResolver<'a> {
             _ => None,
         }
     }
+}
+
+/// ADR-0036: `Some("cross-component")` when a file->file edge's two
+/// endpoints belong to different components (including one `Some` and
+/// one `None` — a file under no recognized project root importing one
+/// that is, or vice versa, is still a real crossing), `None` when they
+/// match (including both `None` — a repo with no components anywhere
+/// never gets this entry, keeping every existing evidence vector
+/// byte-identical for that case). Callers push the marker as an
+/// *additional* evidence entry, never a replacement — unlike
+/// `CallResolver::bucket_evidence`'s label-substitution for
+/// `calls`/`references` (whose evidence is chosen per-tier, one string
+/// only), `Imports`' evidence here is always a single already-decided
+/// `&'static str` constant with room to spare under
+/// `MAX_EVIDENCE_ENTRIES`.
+fn cross_component_marker(caller: Option<&str>, target: Option<&str>) -> Option<&'static str> {
+    (caller != target).then_some("cross-component")
 }
 
 /// Resolves a relative import (Rust's `mod <name>;`, `levels_up` always

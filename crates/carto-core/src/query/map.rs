@@ -15,7 +15,7 @@
 
 use super::{QueryGraph, Truncation};
 use crate::consts;
-use crate::graph::{EdgeKind, NodeData, NodeId};
+use crate::graph::{Confidence, EdgeKind, NodeData, NodeId};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -559,11 +559,17 @@ fn components_lines(counts: &MapCounts, qg: &QueryGraph) -> Vec<String> {
     }
 
     // Edges whose endpoints sit in two *different* components, tallied
-    // by (from-component, to-component, kind) — restricted to pairs
-    // touching at least one in-scope component (`counts.components`'
-    // own keys), the same "restrict what's listed" principle every
-    // other section applies, not a second independent filter.
-    let mut cross: BTreeMap<(String, String), BTreeMap<&'static str, usize>> = BTreeMap::new();
+    // by (from-component, to-component, kind, confidence) — restricted
+    // to pairs touching at least one in-scope component
+    // (`counts.components`' own keys), the same "restrict what's
+    // listed" principle every other section applies, not a second
+    // independent filter. Confidence is part of the tally key, not
+    // folded away, so a `certain` crossing (PHP `use`/C# `using`,
+    // ADR-0034's own Context names these "the most damaging kind") is
+    // never lumped in with an `inferred` `calls` crossing under one
+    // count — the whole point of this section is telling those apart.
+    type CrossTally = BTreeMap<(String, String), BTreeMap<(&'static str, Confidence), usize>>;
+    let mut cross: CrossTally = BTreeMap::new();
     for edge in qg.edges() {
         let (Some(from_c), Some(to_c)) = (qg.component_of(&edge.from), qg.component_of(&edge.to))
         else {
@@ -578,13 +584,16 @@ fn components_lines(counts: &MapCounts, qg: &QueryGraph) -> Vec<String> {
         *cross
             .entry((from_c.to_string(), to_c.to_string()))
             .or_default()
-            .entry(edge.kind.as_str())
+            .entry((edge.kind.as_str(), edge.confidence))
             .or_insert(0) += 1;
     }
     if !cross.is_empty() {
         lines.push("## cross-component edges".to_string());
         for ((from_c, to_c), kinds) in &cross {
-            let parts: Vec<String> = kinds.iter().map(|(k, v)| format!("{v} {k}")).collect();
+            let parts: Vec<String> = kinds
+                .iter()
+                .map(|((k, conf), v)| format!("{v} {k}({})", conf.as_str()))
+                .collect();
             lines.push(format!("  {from_c} -> {to_c}: {}", parts.join(", ")));
         }
     }

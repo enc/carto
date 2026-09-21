@@ -62,4 +62,10 @@ pub fn print_human(summary: &IndexReport) {
     if summary.redaction_count > 0 {
         println!("  redactions: {}", summary.redaction_count);
     }
+    println!("  components: {}", summary.component_count);
+    if summary.component_count == 0 {
+        println!(
+            "    no nested project roots detected — a monorepo with only a top-level manifest gets none automatically; declare components in .carto/roots.json if this repo has several"
+        );
+    }
 }

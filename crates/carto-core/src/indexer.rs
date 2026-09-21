@@ -26,6 +26,13 @@ pub struct IndexReport {
     pub edge_count: usize,
     pub commit_sha: Option<String>,
     pub redaction_count: u64,
+    /// ADR-0036: how many components (ADR-0034/0035) this index
+    /// discovered/declared — surfaced here so a monorepo that got zero
+    /// (a single top-level manifest with no `.carto/roots.json`, the
+    /// single-manifest-monorepo gap ADR-0034 otherwise leaves silent)
+    /// is visible right at `index` time, not only discoverable via
+    /// `map --section components` after the fact.
+    pub component_count: usize,
 }
 
 /// Walks `repo_root`, extracts+resolves every registered language's
@@ -80,6 +87,7 @@ pub fn build_and_persist(
         roots_rule_digest: components.config_digest().to_string(),
     };
 
+    let component_count = components.components().len();
     let manifest = graph::persist(g, meta, components.components_sorted_by_path(), &guard)?;
 
     Ok(IndexReport {
@@ -89,5 +97,6 @@ pub fn build_and_persist(
         edge_count: manifest.edge_count,
         commit_sha,
         redaction_count: manifest.redaction.total(),
+        component_count,
     })
 }

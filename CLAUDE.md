@@ -349,6 +349,22 @@ fields, nothing else — checked by diffing goldens, not assumed — and
 all 429 pre-existing `resolve.rs` tests pass completely unchanged,
 since none of them ever sets a file's component.
 
+**Follow-up (ADR-0036):** the `Certain`-confidence `Imports` edge —
+the kind ADR-0034's own Context calls "the most damaging" when a
+component crossing is wrong — originally carried no record of the
+crossing at all (`calls`/`references` got `cross-component` evidence
+via `CallResolver::bucket_evidence`; `imports` didn't produce it
+through the same mechanism, since it isn't built on `CallResolver`).
+Fixed: all five file→file `Certain` `Imports` sites push an additional
+`"cross-component"` evidence entry (`lang::resolve::
+cross_component_marker`) when their endpoints' components differ;
+`map`'s cross-component summary now tallies by confidence too. `index`
+also reports `components: N` and, at `N == 0`, points at
+`.carto/roots.json` — a single-manifest monorepo (one `go.mod` at the
+repo root with multiple `cmd/*` binaries, say) still gets zero
+auto-detected components (that detection gap itself is unchanged), but
+is no longer silent about it.
+
 ## Conventions
 
 - **ADRs for every deviation and judgment call.** `docs/adr/NNNN-*.md`.

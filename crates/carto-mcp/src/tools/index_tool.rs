@@ -57,6 +57,12 @@ fn render_text(report: &indexer::IndexReport) -> String {
     if report.redaction_count > 0 {
         out.push_str(&format!("  redactions: {}\n", report.redaction_count));
     }
+    out.push_str(&format!("  components: {}\n", report.component_count));
+    if report.component_count == 0 {
+        out.push_str(
+            "    no nested project roots detected — a monorepo with only a top-level manifest gets none automatically; declare components in .carto/roots.json if this repo has several\n",
+        );
+    }
     out
 }
 

@@ -118,9 +118,11 @@ impl ComponentSet {
     /// match `"services/orders2/x.go"`). `components` is sorted deepest
     /// path first, so the first match is always the innermost —
     /// component paths never overlap two ways (one is always either a
-    /// strict ancestor of the other or disjoint; see
-    /// [`ComponentSet::discover`]'s dedup pass), so "innermost" and
-    /// "first match" are the same thing here.
+    /// strict ancestor of the other or disjoint — directory paths are
+    /// unique by construction, and `apply_declared_roots` explicitly
+    /// replaces any auto-detected entry at the same path rather than
+    /// duplicating it), so "innermost" and "first match" are the same
+    /// thing here.
     pub fn component_of_path(&self, file_path: &str) -> Option<&str> {
         self.components
             .iter()
@@ -139,7 +141,15 @@ impl ComponentSet {
     /// module doc for the marker table and the aggregator/collision
     /// rules below.
     pub fn discover(repo_root: &Path, files: &[Node]) -> Result<Self> {
-        let config = load_config(repo_root)?;
+        // Read the config file's bytes exactly once — both the parsed
+        // `ConfigDoc` and `config_digest` derive from this same read,
+        // rather than each independently re-reading the file (a real,
+        // if narrow, TOCTOU: the file could change between two reads).
+        let bytes = read_config_bytes(repo_root)?;
+        let config = bytes
+            .as_deref()
+            .map(|b| parse_config(repo_root, b))
+            .transpose()?;
         let should_detect = config
             .as_ref()
             .and_then(|c| c.detect)
@@ -159,7 +169,7 @@ impl ComponentSet {
 
         Ok(ComponentSet {
             components: detected,
-            config_digest: config_digest_for(read_config_bytes(repo_root)?.as_deref()),
+            config_digest: config_digest_for(bytes.as_deref()),
         })
     }
 }
@@ -366,12 +376,12 @@ struct ConfigRoot {
     kind: Option<String>,
 }
 
-fn load_config(repo_root: &Path) -> Result<Option<ConfigDoc>> {
-    let bytes = match read_config_bytes(repo_root)? {
-        Some(b) => b,
-        None => return Ok(None),
-    };
-    let doc: ConfigDoc = serde_json::from_slice(&bytes).map_err(|e| {
+/// Parses already-read `.carto/roots.json` bytes — `repo_root` is used
+/// only to name the file in an error message, not to read it again
+/// (`discover` reads the file's bytes exactly once; see its own doc
+/// comment).
+fn parse_config(repo_root: &Path, bytes: &[u8]) -> Result<ConfigDoc> {
+    serde_json::from_slice(bytes).map_err(|e| {
         Error::with_source(
             ErrorKind::UserError,
             format!(
@@ -380,8 +390,7 @@ fn load_config(repo_root: &Path) -> Result<Option<ConfigDoc>> {
             ),
             e,
         )
-    })?;
-    Ok(Some(doc))
+    })
 }
 
 fn read_config_bytes(repo_root: &Path) -> Result<Option<Vec<u8>>> {
@@ -501,11 +510,18 @@ fn valid_name_charset(name: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-')
 }
 
+/// Same segment-boundary prefix rule as
+/// [`ComponentSet::component_of_path`], applied to a plain `path`
+/// string rather than a `NodeId` — `strip_prefix` + boundary check
+/// rather than a per-file `format!("{path}/")` allocation, which this
+/// was previously doing once per walked file per declared root.
 fn any_file_under(files: &[Node], path: &str) -> bool {
     files.iter().any(|n| {
-        n.data
-            .as_file()
-            .is_some_and(|f| f.path == path || f.path.starts_with(&format!("{path}/")))
+        n.data.as_file().is_some_and(|f| {
+            f.path
+                .strip_prefix(path)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+        })
     })
 }
 
