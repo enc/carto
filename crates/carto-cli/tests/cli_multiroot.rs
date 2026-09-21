@@ -306,8 +306,17 @@ fn map_components_section_lists_every_component_and_the_cross_component_edge() {
     for name in ["admin", "billing", "infra", "ingest", "orders", "shared"] {
         assert!(stdout.contains(name), "{stdout}");
     }
+    // ADR-0039: orders' go.mod really `require`s shared.
+    assert!(
+        stdout.contains("orders  path=services/orders kind=go files=3 symbols=2 depends_on=shared"),
+        "{stdout}"
+    );
     assert!(stdout.contains("## cross-component edges"), "{stdout}");
     assert!(stdout.contains("orders -> shared"), "{stdout}");
+    assert!(
+        !stdout.contains("[undeclared]"),
+        "orders -> shared is a declared dependency, must not be flagged: {stdout}"
+    );
 }
 
 #[test]

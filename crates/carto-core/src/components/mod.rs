@@ -28,6 +28,8 @@
 //! subdirectory — see [`detect_components`]'s own comment for the
 //! rule.
 
+mod deps;
+
 use crate::error::{Error, ErrorKind, Result};
 use crate::graph::Node;
 use crate::lang::Lang;
@@ -38,13 +40,26 @@ use std::path::Path;
 /// Repo-relative path of the optional root-declaration override file.
 const CONFIG_RELPATH: &str = ".carto/roots.json";
 
+/// ADR-0039: component kinds this crate knows how to read a manifest
+/// identity for (`Component::depends_on`, `deps::resolve`) —
+/// `"terraform"`/`"custom"` have none, so a crossing *from* one of
+/// those must never be flagged `"undeclared-dependency"` by
+/// `lang::resolve` (there's no declared-dependency concept to have
+/// violated; that would misrepresent "we never looked" as "confirmed
+/// undeclared", exactly the absence-vs-zero confusion every
+/// `SCHEMA_VERSION` bump in this family exists to avoid). `pub(crate)`
+/// since both `lang::resolve` (evidence/resolution-preference) and
+/// `query::map` (the `## cross-component edges` `[undeclared]` marker)
+/// need the identical list.
+pub(crate) const DEPENDENCY_AWARE_KINDS: &[&str] = &["go", "node", "rust", "dotnet", "php"];
+
 /// One discovered or declared project root inside the walked tree.
 /// `Serialize`/`Deserialize`: persisted verbatim as `GraphDocument::
 /// components` (sorted by `path`, INV-7) — this is the on-disk shape,
 /// not an internal detail either front end reshapes freely, the same
 /// compatibility-surface status every other `graph.json`-visible type
 /// already has.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Component {
     /// Sanitized to `^[A-Za-z0-9][A-Za-z0-9_.-]*$` — a plain `String`,
     /// not `TaintedString`: like `FileNode::path`, this is an
@@ -63,6 +78,21 @@ pub struct Component {
     /// auto-detected component; whatever a declared root's own `kind`
     /// says (default `"custom"` when omitted).
     pub kind: String,
+    /// ADR-0039: other components in this tree whose manifest this
+    /// component's own manifest declares a dependency on (sorted
+    /// names, deduplicated, self-references excluded) — see
+    /// `crate::components::deps`'s own module doc for exactly what's
+    /// parsed per `kind`. Empty for a `kind` this crate has no
+    /// manifest-identity concept for (`"terraform"`, `"custom"`) — a
+    /// real scope limit, not a claim of "confirmed no dependencies".
+    /// `#[serde(default)]`: a v7-or-earlier `graph.json` never looked
+    /// for this at all, the same absence-vs-zero distinction every
+    /// prior `SCHEMA_VERSION` bump in this family protects — though
+    /// `graph::load`'s exact-version check means no live query ever
+    /// actually observes that default; it exists for direct
+    /// `GraphDocument` construction in tests.
+    #[serde(default)]
+    pub depends_on: Vec<String>,
 }
 
 /// The full set of components discovered/declared for one index build.
@@ -179,6 +209,11 @@ impl ComponentSet {
         }
 
         detected.sort_by(|a, b| b.path.len().cmp(&a.path.len()).then(a.path.cmp(&b.path)));
+
+        // ADR-0039: resolves each component's own manifest-declared
+        // dependencies against every *other* component now that the
+        // full set (auto-detected and declared) is final.
+        deps::resolve(repo_root, &mut detected);
 
         Ok(ComponentSet {
             components: detected,
@@ -495,7 +530,12 @@ fn name_candidates(mut candidates: Vec<(String, String)>) -> Vec<Component> {
             return candidates
                 .into_iter()
                 .zip(names)
-                .map(|((path, kind), name)| Component { name, path, kind })
+                .map(|((path, kind), name)| Component {
+                    name,
+                    path,
+                    kind,
+                    ..Default::default()
+                })
                 .collect();
         }
     }
@@ -697,6 +737,7 @@ fn apply_declared_roots(
             name: root.name.clone(),
             path: path.to_string(),
             kind: root.kind.clone().unwrap_or_else(|| "custom".to_string()),
+            ..Default::default()
         });
     }
     Ok(())

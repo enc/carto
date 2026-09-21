@@ -314,11 +314,13 @@ mod tests {
                     name: "infra".to_string(),
                     path: "infra".to_string(),
                     kind: "terraform".to_string(),
+                    depends_on: vec![],
                 },
                 crate::components::Component {
                     name: "prod".to_string(),
                     path: "infra/envs/prod".to_string(),
                     kind: "terraform".to_string(),
+                    depends_on: vec![],
                 },
             ],
             nodes: vec![tf, metric_node],

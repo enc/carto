@@ -53,7 +53,7 @@ pub const BIN_NAME: &str = "carto";
 /// component" (a real, meaningful value this slice introduces) versus
 /// "never looked for one," the same absence-vs-zero distinction every
 /// prior bump in this family protects.
-pub const SCHEMA_VERSION: u32 = 7;
+pub const SCHEMA_VERSION: u32 = 8;
 
 /// Max entries kept in `SymbolNode::unresolved_inbound_calls` /
 /// `DepsResult::root_unresolved_inbound_calls`; `_count` fields carry the

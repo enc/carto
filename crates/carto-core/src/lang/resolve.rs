@@ -83,7 +83,23 @@ type FqnCandidates<'a> = BTreeMap<(&'static str, String), Vec<(&'a NodeId, Optio
 pub fn resolve(
     extractions: Vec<FileExtraction>,
     contract_rules: &ContractRules,
+    components: &[crate::components::Component],
 ) -> ResolvedExtraction {
+    // ADR-0039: `caller component -> its own declared dependencies`,
+    // restricted to `crate::components::DEPENDENCY_AWARE_KINDS` — see
+    // that const's own doc comment for why a component outside that
+    // set must never produce an "undeclared-dependency" evidence
+    // entry.
+    let component_depends_on: BTreeMap<&str, BTreeSet<&str>> = components
+        .iter()
+        .filter(|c| crate::components::DEPENDENCY_AWARE_KINDS.contains(&c.kind.as_str()))
+        .map(|c| {
+            (
+                c.name.as_str(),
+                c.depends_on.iter().map(String::as_str).collect(),
+            )
+        })
+        .collect();
     // Every top-level `mod <name>;` declared anywhere — a `use` path
     // whose root matches one of these is treated as internal (spec §5.3
     // rule 1's "package imports become Module nodes" only applies to the
@@ -233,6 +249,21 @@ pub fn resolve(
         if let Some(component) = caller_component {
             if let Some((id, _)) = candidates.iter().find(|(_, c)| *c == Some(component)) {
                 return Some(*id);
+            }
+            // ADR-0039: between same-component (above) and the
+            // arbitrary first-file-wins fallback (below), prefer a
+            // candidate in one of the caller's own *declared
+            // dependencies* — still just a preference among an
+            // already-existing ambiguity, never a new filter (this can
+            // only turn one arbitrary choice into a better-justified
+            // one, never manufacture a match where none existed).
+            if let Some(deps) = component_depends_on.get(component) {
+                if let Some((id, _)) = candidates
+                    .iter()
+                    .find(|(_, c)| c.is_some_and(|c| deps.contains(c)))
+                {
+                    return Some(*id);
+                }
             }
         }
         candidates.first().map(|(id, _)| *id)
@@ -544,13 +575,21 @@ pub fn resolve(
                 match resolver.resolve(fi, call.callee_name.as_str()) {
                     Some((target_fi, target_si, evidence)) => {
                         let to_id = symbol_ids[target_fi][target_si].clone();
-                        edges.push(Edge::new(
+                        let mut edge = Edge::new(
                             EdgeKind::Calls,
                             id.clone(),
                             to_id,
                             Confidence::Inferred,
                             evidence.to_string(),
-                        ));
+                        );
+                        if is_undeclared_dependency(
+                            &component_depends_on,
+                            file_component[fi],
+                            file_component[target_fi],
+                        ) {
+                            edge.evidence.push("undeclared-dependency".to_string());
+                        }
+                        edges.push(edge);
                     }
                     None => unresolved_calls.push(UnresolvedCall {
                         name: call.callee_name.clone(),
@@ -574,13 +613,21 @@ pub fn resolve(
                 {
                     let to_id = symbol_ids[target_fi][target_si].clone();
                     if to_id != id {
-                        edges.push(Edge::new(
+                        let mut edge = Edge::new(
                             EdgeKind::References,
                             id.clone(),
                             to_id,
                             Confidence::Inferred,
                             format!("type-reference:{evidence}"),
-                        ));
+                        );
+                        if is_undeclared_dependency(
+                            &component_depends_on,
+                            file_component[fi],
+                            file_component[target_fi],
+                        ) {
+                            edge.evidence.push("undeclared-dependency".to_string());
+                        }
+                        edges.push(edge);
                     }
                 }
             }
@@ -662,26 +709,42 @@ pub fn resolve(
                 resolver.resolve(fi, call.callee_name.as_str())
             {
                 let to_id = symbol_ids[target_fi][target_si].clone();
-                edges.push(Edge::new(
+                let mut edge = Edge::new(
                     EdgeKind::Calls,
                     fe.file_id.clone(),
                     to_id,
                     Confidence::Inferred,
                     evidence.to_string(),
-                ));
+                );
+                if is_undeclared_dependency(
+                    &component_depends_on,
+                    file_component[fi],
+                    file_component[target_fi],
+                ) {
+                    edge.evidence.push("undeclared-dependency".to_string());
+                }
+                edges.push(edge);
             }
         }
         for &tref in &unattached_type_refs {
             if let Some((target_fi, target_si, evidence)) = resolver.resolve(fi, tref.name.as_str())
             {
                 let to_id = symbol_ids[target_fi][target_si].clone();
-                edges.push(Edge::new(
+                let mut edge = Edge::new(
                     EdgeKind::References,
                     fe.file_id.clone(),
                     to_id,
                     Confidence::Inferred,
                     format!("type-reference:{evidence}"),
-                ));
+                );
+                if is_undeclared_dependency(
+                    &component_depends_on,
+                    file_component[fi],
+                    file_component[target_fi],
+                ) {
+                    edge.evidence.push("undeclared-dependency".to_string());
+                }
+                edges.push(edge);
             }
         }
 
@@ -716,6 +779,8 @@ pub fn resolve(
                             module_path,
                             &relpath_to_file_id,
                         ) {
+                            let target_component =
+                                file_id_to_component.get(target).copied().flatten();
                             let mut edge = Edge::new(
                                 EdgeKind::Imports,
                                 fe.file_id.clone(),
@@ -723,11 +788,17 @@ pub fn resolve(
                                 Confidence::Certain,
                                 evidence.to_string(),
                             );
-                            if let Some(marker) = cross_component_marker(
-                                fe.component.as_deref(),
-                                file_id_to_component.get(target).copied().flatten(),
-                            ) {
+                            if let Some(marker) =
+                                cross_component_marker(fe.component.as_deref(), target_component)
+                            {
                                 edge.evidence.push(marker.to_string());
+                            }
+                            if is_undeclared_dependency(
+                                &component_depends_on,
+                                fe.component.as_deref(),
+                                target_component,
+                            ) {
+                                edge.evidence.push("undeclared-dependency".to_string());
                             }
                             edges.push(edge);
                         }
@@ -747,6 +818,8 @@ pub fn resolve(
                                 &name.declared_name,
                                 &relpath_to_file_id,
                             ) {
+                                let target_component =
+                                    file_id_to_component.get(target).copied().flatten();
                                 let mut edge = Edge::new(
                                     EdgeKind::Imports,
                                     fe.file_id.clone(),
@@ -756,9 +829,16 @@ pub fn resolve(
                                 );
                                 if let Some(marker) = cross_component_marker(
                                     fe.component.as_deref(),
-                                    file_id_to_component.get(target).copied().flatten(),
+                                    target_component,
                                 ) {
                                     edge.evidence.push(marker.to_string());
+                                }
+                                if is_undeclared_dependency(
+                                    &component_depends_on,
+                                    fe.component.as_deref(),
+                                    target_component,
+                                ) {
+                                    edge.evidence.push("undeclared-dependency".to_string());
                                 }
                                 edges.push(edge);
                             }
@@ -857,6 +937,7 @@ pub fn resolve(
                     if let Some(target) = resolve_fqn(fe.origin, fqn, fe.component.as_deref()) {
                         // 1. Exact FQN match: certain edge to the
                         //    declaring file.
+                        let target_component = file_id_to_component.get(target).copied().flatten();
                         let mut edge = Edge::new(
                             EdgeKind::Imports,
                             fe.file_id.clone(),
@@ -864,11 +945,17 @@ pub fn resolve(
                             Confidence::Certain,
                             "namespace-import".to_string(),
                         );
-                        if let Some(marker) = cross_component_marker(
-                            fe.component.as_deref(),
-                            file_id_to_component.get(target).copied().flatten(),
-                        ) {
+                        if let Some(marker) =
+                            cross_component_marker(fe.component.as_deref(), target_component)
+                        {
                             edge.evidence.push(marker.to_string());
+                        }
+                        if is_undeclared_dependency(
+                            &component_depends_on,
+                            fe.component.as_deref(),
+                            target_component,
+                        ) {
+                            edge.evidence.push("undeclared-dependency".to_string());
                         }
                         edges.push(edge);
                     } else if fqn
@@ -950,9 +1037,39 @@ pub fn resolve(
                                 extractions[tfi].component.as_deref() == fe.component.as_deref()
                             })
                             .collect();
+                        // ADR-0039: between same-component (above) and
+                        // the full repo-wide fan-out (below), prefer
+                        // narrowing to the caller's own *declared
+                        // dependencies* when at least one declaring
+                        // file's component qualifies — the same
+                        // "prefer, fall through, never a new filter"
+                        // discipline `resolve_fqn` above uses. Only
+                        // reached when `same_component` is empty, so
+                        // this never overrides the same-component
+                        // narrowing, only the arbitrary full-fan-out
+                        // default.
+                        let declared_dep: Vec<usize> = fe
+                            .component
+                            .as_deref()
+                            .and_then(|c| component_depends_on.get(c))
+                            .map(|deps| {
+                                target_fis
+                                    .iter()
+                                    .copied()
+                                    .filter(|&tfi| {
+                                        extractions[tfi]
+                                            .component
+                                            .as_deref()
+                                            .is_some_and(|c| deps.contains(c))
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
                         let chosen: &[usize] =
                             if fe.component.is_some() && !same_component.is_empty() {
                                 &same_component
+                            } else if !declared_dep.is_empty() {
+                                &declared_dep
                             } else {
                                 target_fis
                             };
@@ -972,6 +1089,13 @@ pub fn resolve(
                                 file_component[target_fi],
                             ) {
                                 edge.evidence.push(marker.to_string());
+                            }
+                            if is_undeclared_dependency(
+                                &component_depends_on,
+                                fe.component.as_deref(),
+                                file_component[target_fi],
+                            ) {
+                                edge.evidence.push("undeclared-dependency".to_string());
                             }
                             edges.push(edge);
                         }
@@ -1043,6 +1167,13 @@ pub fn resolve(
                                     file_component[target_fi],
                                 ) {
                                     edge.evidence.push(marker.to_string());
+                                }
+                                if is_undeclared_dependency(
+                                    &component_depends_on,
+                                    fe.component.as_deref(),
+                                    file_component[target_fi],
+                                ) {
+                                    edge.evidence.push("undeclared-dependency".to_string());
                                 }
                                 edges.push(edge);
                             }
@@ -1516,6 +1647,28 @@ fn cross_component_marker(caller: Option<&str>, target: Option<&str>) -> Option<
     (caller != target).then_some("cross-component")
 }
 
+/// ADR-0039: whether a cross-component edge's own crossing is
+/// *undeclared* — the caller's component is one of
+/// [`crate::components::DEPENDENCY_AWARE_KINDS`] (so it has a real declared-dependency set
+/// to check against, not merely an absent one) and the target's
+/// component isn't in it. `caller == target` (not a crossing at all)
+/// and a caller this index has no dependency data for (either kind,
+/// e.g. terraform, or a `None` component) both correctly return
+/// `false` — the former isn't a crossing, the latter has nothing to
+/// have declared.
+fn is_undeclared_dependency(
+    component_depends_on: &BTreeMap<&str, BTreeSet<&str>>,
+    caller: Option<&str>,
+    target: Option<&str>,
+) -> bool {
+    match (caller, target) {
+        (Some(c), Some(t)) if c != t => component_depends_on
+            .get(c)
+            .is_some_and(|deps| !deps.contains(t)),
+        _ => false,
+    }
+}
+
 /// Resolves a relative import (Rust's `mod <name>;`, `levels_up` always
 /// 0; Python's `from <dots><module_path> import ...`, `levels_up` = dot
 /// count; TS/JS's `import x from '<dots><module_path>'`, `levels_up` =
@@ -1717,6 +1870,25 @@ mod tests {
             .unwrap_or_else(|| panic!("no symbol node named {name}"))
     }
 
+    /// ADR-0039: a `crate::components::Component` for tests that need
+    /// `depends_on` populated — every prior test in this module passes
+    /// `&[]` for `resolve`'s `components` argument, so `component_of`
+    /// alone (`FileExtraction.component`) already covers everything
+    /// that doesn't need declared-dependency data.
+    fn component(
+        name: &str,
+        path: &str,
+        kind: &str,
+        depends_on: Vec<&str>,
+    ) -> crate::components::Component {
+        crate::components::Component {
+            name: name.to_string(),
+            path: path.to_string(),
+            kind: kind.to_string(),
+            depends_on: depends_on.into_iter().map(str::to_string).collect(),
+        }
+    }
+
     fn calls_edges(edges: &[Edge]) -> Vec<&Edge> {
         edges.iter().filter(|e| e.kind == EdgeKind::Calls).collect()
     }
@@ -1751,7 +1923,7 @@ mod tests {
         ];
         f.extract.call_sites = vec![call("validate", 3)];
 
-        let out = resolve(vec![f], &ContractRules::builtin());
+        let out = resolve(vec![f], &ContractRules::builtin(), &[]);
         assert!(
             find_symbol(&out.nodes, "parse_order")
                 .unresolved_calls
@@ -1777,7 +1949,7 @@ mod tests {
         let mut orders = file("src/orders.rs");
         orders.extract.symbols = vec![sym("parse_order", SymKind::Function, 1, 3, true)];
 
-        let out = resolve(vec![handlers, orders], &ContractRules::builtin());
+        let out = resolve(vec![handlers, orders], &ContractRules::builtin(), &[]);
         assert!(
             find_symbol(&out.nodes, "handle")
                 .unresolved_calls
@@ -1826,7 +1998,11 @@ mod tests {
         // `RawTypeRef` a constructor-injected field produces.
         service.extract.type_refs = vec![type_ref("IQueryJobStore", 2)];
 
-        let out = resolve(vec![store, in_memory, service], &ContractRules::builtin());
+        let out = resolve(
+            vec![store, in_memory, service],
+            &ContractRules::builtin(),
+            &[],
+        );
 
         let edges = calls_edges(&out.edges);
         assert_eq!(edges.len(), 1);
@@ -1887,6 +2063,7 @@ mod tests {
         let out = resolve(
             vec![store, in_memory, registration],
             &ContractRules::builtin(),
+            &[],
         );
 
         assert!(calls_edges(&out.edges).is_empty());
@@ -1918,7 +2095,7 @@ mod tests {
         let mut c = file("src/c.rs");
         c.extract.symbols = vec![sym("helper", SymKind::Function, 1, 2, true)];
 
-        let out = resolve(vec![caller, b, c], &ContractRules::builtin());
+        let out = resolve(vec![caller, b, c], &ContractRules::builtin(), &[]);
         assert!(calls_edges(&out.edges).is_empty());
         assert_eq!(find_symbol(&out.nodes, "run").unresolved_calls.len(), 1);
     }
@@ -1934,7 +2111,7 @@ mod tests {
         f.extract.call_sites = vec![call("Save", 8)];
         f.extract.type_refs = vec![type_ref("Store", 7)];
 
-        let out = resolve(vec![f], &ContractRules::builtin());
+        let out = resolve(vec![f], &ContractRules::builtin(), &[]);
         let edges = calls_edges(&out.edges);
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].to, graph::sym_id("src/a.rs", "method", "Save", 1));
@@ -1967,7 +2144,7 @@ mod tests {
             "OtherStore",
         )];
 
-        let out = resolve(vec![handlers, store, other], &ContractRules::builtin());
+        let out = resolve(vec![handlers, store, other], &ContractRules::builtin(), &[]);
         assert!(
             find_symbol(&out.nodes, "handle")
                 .unresolved_calls
@@ -2012,7 +2189,7 @@ mod tests {
         orders.origin = "lang-python@1";
         orders.extract.symbols = vec![sym("parse_order", SymKind::Function, 1, 3, true)];
 
-        let out = resolve(vec![handlers, orders], &ContractRules::builtin());
+        let out = resolve(vec![handlers, orders], &ContractRules::builtin(), &[]);
         assert!(
             find_symbol(&out.nodes, "handle")
                 .unresolved_calls
@@ -2042,7 +2219,7 @@ mod tests {
         handlers.extract.symbols = vec![sym("handle", SymKind::Function, 5, 8, true)];
         handlers.extract.call_sites = vec![call("po", 6)];
 
-        let out = resolve(vec![handlers, orders], &ContractRules::builtin());
+        let out = resolve(vec![handlers, orders], &ContractRules::builtin(), &[]);
         assert!(
             find_symbol(&out.nodes, "handle")
                 .unresolved_calls
@@ -2063,7 +2240,7 @@ mod tests {
         let mut orders = file("src/orders.rs");
         orders.extract.symbols = vec![sym("audit_order", SymKind::Function, 1, 3, true)];
 
-        let out = resolve(vec![handlers, orders], &ContractRules::builtin());
+        let out = resolve(vec![handlers, orders], &ContractRules::builtin(), &[]);
         assert!(
             find_symbol(&out.nodes, "handle")
                 .unresolved_calls
@@ -2097,7 +2274,7 @@ mod tests {
         other.origin = "lang-php@1";
         other.extract.symbols = vec![sym("summary", SymKind::Function, 1, 2, true)];
 
-        let out = resolve(vec![f, other], &ContractRules::builtin());
+        let out = resolve(vec![f, other], &ContractRules::builtin(), &[]);
         let handle = find_symbol(&out.nodes, "handle");
         assert_eq!(handle.unresolved_calls.len(), 1);
         assert_eq!(handle.unresolved_calls[0].name, "summary");
@@ -2133,7 +2310,7 @@ mod tests {
             imported_names: vec![],
         }];
 
-        let out = resolve(vec![app, orders, consumer], &ContractRules::builtin());
+        let out = resolve(vec![app, orders, consumer], &ContractRules::builtin(), &[]);
         // The side-effect import still resolves file-to-file, with
         // relative-import (not mod-declaration) evidence...
         let imports = imports_edges(&out.edges);
@@ -2162,7 +2339,7 @@ mod tests {
         let mut c = file("src/c.rs");
         c.extract.symbols = vec![sym("helper", SymKind::Function, 1, 2, true)];
 
-        let out = resolve(vec![caller, b, c], &ContractRules::builtin());
+        let out = resolve(vec![caller, b, c], &ContractRules::builtin(), &[]);
         let run = find_symbol(&out.nodes, "run");
         assert_eq!(run.unresolved_calls.len(), 1);
         assert_eq!(run.unresolved_calls[0].name, "helper");
@@ -2209,7 +2386,7 @@ mod tests {
         c.component = Some("billing".to_string());
         c.extract.symbols = vec![sym("helper", SymKind::Function, 1, 2, true)];
 
-        let out = resolve(vec![caller, b, c], &ContractRules::builtin());
+        let out = resolve(vec![caller, b, c], &ContractRules::builtin(), &[]);
 
         let edges = calls_edges(&out.edges);
         assert_eq!(edges.len(), 1);
@@ -2239,7 +2416,7 @@ mod tests {
         c.component = Some("billing".to_string());
         c.extract.symbols = vec![sym("helper", SymKind::Function, 1, 2, true)];
 
-        let out = resolve(vec![caller, b, c], &ContractRules::builtin());
+        let out = resolve(vec![caller, b, c], &ContractRules::builtin(), &[]);
 
         let edges = calls_edges(&out.edges);
         assert_eq!(edges.len(), 1);
@@ -2261,7 +2438,7 @@ mod tests {
         shared.component = Some("shared".to_string());
         shared.extract.symbols = vec![sym("shared_helper", SymKind::Function, 1, 2, true)];
 
-        let out = resolve(vec![caller, shared], &ContractRules::builtin());
+        let out = resolve(vec![caller, shared], &ContractRules::builtin(), &[]);
 
         let edges = calls_edges(&out.edges);
         assert_eq!(edges.len(), 1);
@@ -2293,7 +2470,7 @@ mod tests {
         c.component = Some("orders".to_string());
         c.extract.symbols = vec![sym("helper", SymKind::Function, 1, 2, true)];
 
-        let out = resolve(vec![caller, b, c], &ContractRules::builtin());
+        let out = resolve(vec![caller, b, c], &ContractRules::builtin(), &[]);
         assert!(calls_edges(&out.edges).is_empty());
         assert_eq!(find_symbol(&out.nodes, "run").unresolved_calls.len(), 1);
     }
@@ -2313,7 +2490,7 @@ mod tests {
         let mut b = file("scripts/b.rs");
         b.extract.symbols = vec![sym("helper", SymKind::Function, 1, 2, true)];
 
-        let out = resolve(vec![caller, b], &ContractRules::builtin());
+        let out = resolve(vec![caller, b], &ContractRules::builtin(), &[]);
         let edges = calls_edges(&out.edges);
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].evidence, vec!["same-package".to_string()]);
@@ -2335,10 +2512,139 @@ mod tests {
         b.component = Some("orders".to_string());
         b.extract.symbols = vec![sym("helper", SymKind::Function, 1, 2, true)];
 
-        let out = resolve(vec![caller, b], &ContractRules::builtin());
+        let out = resolve(vec![caller, b], &ContractRules::builtin(), &[]);
         let edges = calls_edges(&out.edges);
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].evidence, vec!["cross-component".to_string()]);
+    }
+
+    // --- ADR-0039: component dependency graph -------------------------
+
+    #[test]
+    fn undeclared_cross_component_call_gets_the_undeclared_dependency_evidence_entry() {
+        let mut caller = file("services/a/handler.go");
+        caller.component = Some("a".to_string());
+        caller.extract.symbols = vec![sym("Handler", SymKind::Function, 1, 5, true)];
+        caller.extract.call_sites = vec![call("B", 3)];
+
+        let mut target = file("services/b/b.go");
+        target.component = Some("b".to_string());
+        target.extract.symbols = vec![sym("B", SymKind::Function, 1, 2, true)];
+
+        let components = vec![
+            component("a", "services/a", "go", vec![]),
+            component("b", "services/b", "go", vec![]),
+        ];
+        let out = resolve(vec![caller, target], &ContractRules::builtin(), &components);
+        let edges = calls_edges(&out.edges);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(
+            edges[0].evidence,
+            vec![
+                "cross-component".to_string(),
+                "undeclared-dependency".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn declared_cross_component_call_does_not_get_the_undeclared_dependency_marker() {
+        let mut caller = file("services/a/handler.go");
+        caller.component = Some("a".to_string());
+        caller.extract.symbols = vec![sym("Handler", SymKind::Function, 1, 5, true)];
+        caller.extract.call_sites = vec![call("B", 3)];
+
+        let mut target = file("services/b/b.go");
+        target.component = Some("b".to_string());
+        target.extract.symbols = vec![sym("B", SymKind::Function, 1, 2, true)];
+
+        let components = vec![
+            component("a", "services/a", "go", vec!["b"]),
+            component("b", "services/b", "go", vec![]),
+        ];
+        let out = resolve(vec![caller, target], &ContractRules::builtin(), &components);
+        let edges = calls_edges(&out.edges);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].evidence, vec!["cross-component".to_string()]);
+    }
+
+    #[test]
+    fn a_caller_kind_with_no_manifest_identity_is_never_flagged_undeclared() {
+        // A terraform/custom-kind caller has no declared-dependency
+        // concept at all (see `crate::components::
+        // DEPENDENCY_AWARE_KINDS`'s own doc comment) -- flagging every
+        // one of its crossings "undeclared" would misrepresent "never
+        // looked" as "confirmed violation," pure noise for the
+        // contracts use case this data model was built for.
+        let mut caller = file("infra/main.tf");
+        caller.origin = "lang-hcl@1";
+        caller.component = Some("infra".to_string());
+        caller.extract.symbols = vec![sym("alarm", SymKind::Function, 1, 5, true)];
+        caller.extract.call_sites = vec![call("Handler", 3)];
+
+        let mut target = file("services/a/handler.go");
+        target.component = Some("a".to_string());
+        target.extract.symbols = vec![sym("Handler", SymKind::Function, 1, 2, true)];
+
+        let components = vec![
+            component("infra", "infra", "terraform", vec![]),
+            component("a", "services/a", "go", vec![]),
+        ];
+        let out = resolve(vec![caller, target], &ContractRules::builtin(), &components);
+        let edges = calls_edges(&out.edges);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].evidence, vec!["cross-component".to_string()]);
+    }
+
+    #[test]
+    fn resolve_fqn_prefers_a_declared_dependency_over_arbitrary_first_file_wins() {
+        // Two components (neither the caller's own) illegally-from-
+        // carto's-view declare the same FQN -- the shape
+        // `colliding_fqn_across_components_prefers_the_callers_own_
+        // component` covers for a *same-component* candidate. Here
+        // neither candidate is the caller's own component, so that
+        // tier can't fire; `orders` is listed before `billing` in
+        // extraction order, so a plain first-file-wins fallback would
+        // pick `orders` -- but `checkout` declares `billing` (not
+        // `orders`) as a dependency, so the preference tier must pick
+        // `billing` instead.
+        let mut orders_shared = file("services/orders/Shared.php");
+        orders_shared.origin = "lang-php@1";
+        orders_shared.component = Some("orders".to_string());
+        orders_shared.extract.declared_namespace = Some("App\\Shared".into());
+        orders_shared.extract.symbols = vec![sym("Constants", SymKind::Class, 1, 5, true)];
+
+        let mut billing_shared = file("services/billing/Shared.php");
+        billing_shared.origin = "lang-php@1";
+        billing_shared.component = Some("billing".to_string());
+        billing_shared.extract.declared_namespace = Some("App\\Shared".into());
+        billing_shared.extract.symbols = vec![sym("Constants", SymKind::Class, 1, 5, true)];
+
+        let mut checkout_handlers = file("services/checkout/Handlers.php");
+        checkout_handlers.origin = "lang-php@1";
+        checkout_handlers.component = Some("checkout".to_string());
+        checkout_handlers.extract.imports = vec![RawImport::Qualified {
+            fqn: "App\\Shared\\Constants".into(),
+            bound_name: "Constants".into(),
+        }];
+
+        let components = vec![
+            component("checkout", "services/checkout", "php", vec!["billing"]),
+            component("orders", "services/orders", "php", vec![]),
+            component("billing", "services/billing", "php", vec![]),
+        ];
+        let out = resolve(
+            vec![orders_shared, billing_shared, checkout_handlers],
+            &ContractRules::builtin(),
+            &components,
+        );
+        let imports = imports_edges(&out.edges);
+        assert_eq!(imports.len(), 1);
+        assert_eq!(
+            imports[0].to,
+            graph::file_id("services/billing/Shared.php"),
+            "must prefer billing (checkout's declared dependency) over orders (arbitrary first-file-wins)"
+        );
     }
 
     #[test]
@@ -2377,7 +2683,7 @@ mod tests {
             "LegacyStore",
         )];
 
-        let out = resolve(vec![caller, store, legacy], &ContractRules::builtin());
+        let out = resolve(vec![caller, store, legacy], &ContractRules::builtin(), &[]);
         let edges = calls_edges(&out.edges);
         assert_eq!(edges.len(), 1);
         assert_eq!(
@@ -2409,7 +2715,7 @@ mod tests {
             extractions.push(caller);
         }
 
-        let out = resolve(extractions, &ContractRules::builtin());
+        let out = resolve(extractions, &ContractRules::builtin(), &[]);
         let helper = find_symbol(&out.nodes, "helper");
         assert_eq!(helper.unresolved_inbound_call_count, total);
         assert_eq!(
@@ -2426,7 +2732,7 @@ mod tests {
         f.extract.symbols = vec![sym("run", SymKind::Function, 1, 5, true)];
         f.extract.call_sites = vec![call("mystery", 3)];
 
-        let out = resolve(vec![f], &ContractRules::builtin());
+        let out = resolve(vec![f], &ContractRules::builtin(), &[]);
         let run = find_symbol(&out.nodes, "run");
         assert_eq!(
             run.unresolved_calls,
@@ -2447,7 +2753,7 @@ mod tests {
         }];
         let orders = file("src/orders.rs");
 
-        let out = resolve(vec![lib, orders], &ContractRules::builtin());
+        let out = resolve(vec![lib, orders], &ContractRules::builtin(), &[]);
         let imports = imports_edges(&out.edges);
         assert_eq!(imports.len(), 1);
         assert_eq!(imports[0].confidence, Confidence::Certain);
@@ -2464,7 +2770,7 @@ mod tests {
         }];
         let orders = file("src/orders/mod.rs");
 
-        let out = resolve(vec![lib, orders], &ContractRules::builtin());
+        let out = resolve(vec![lib, orders], &ContractRules::builtin(), &[]);
         assert_eq!(imports_edges(&out.edges).len(), 1);
     }
 
@@ -2477,7 +2783,7 @@ mod tests {
             imported_names: vec![],
         }];
 
-        let out = resolve(vec![lib], &ContractRules::builtin());
+        let out = resolve(vec![lib], &ContractRules::builtin(), &[]);
         assert!(imports_edges(&out.edges).is_empty());
     }
 
@@ -2496,7 +2802,7 @@ mod tests {
         }];
         let orders = file("pkg/orders.py");
 
-        let out = resolve(vec![python_file, orders], &ContractRules::builtin());
+        let out = resolve(vec![python_file, orders], &ContractRules::builtin(), &[]);
         let imports = imports_edges(&out.edges);
         assert_eq!(imports.len(), 1); // one edge to the module, not one per name
         assert_eq!(imports[0].confidence, Confidence::Certain);
@@ -2517,7 +2823,7 @@ mod tests {
         }];
         let orders = file("pkg/orders.py");
 
-        let out = resolve(vec![python_file, orders], &ContractRules::builtin());
+        let out = resolve(vec![python_file, orders], &ContractRules::builtin(), &[]);
         assert_eq!(imports_edges(&out.edges).len(), 1);
     }
 
@@ -2539,6 +2845,7 @@ mod tests {
         let out = resolve(
             vec![python_file, orders, handlers],
             &ContractRules::builtin(),
+            &[],
         );
         assert_eq!(imports_edges(&out.edges).len(), 2);
     }
@@ -2560,7 +2867,7 @@ mod tests {
             bound_name: "Order".into(),
         }];
 
-        let out = resolve(vec![handlers, orders], &ContractRules::builtin());
+        let out = resolve(vec![handlers, orders], &ContractRules::builtin(), &[]);
         let imports = imports_edges(&out.edges);
         assert_eq!(imports.len(), 1);
         assert_eq!(imports[0].confidence, Confidence::Certain);
@@ -2600,6 +2907,7 @@ mod tests {
         let out = resolve(
             vec![orders_shared, billing_shared, billing_handlers],
             &ContractRules::builtin(),
+            &[],
         );
         let imports = imports_edges(&out.edges);
         assert_eq!(imports.len(), 1);
@@ -2628,7 +2936,7 @@ mod tests {
             bound_name: "Thing".into(),
         }];
 
-        let out = resolve(vec![handlers, orders], &ContractRules::builtin());
+        let out = resolve(vec![handlers, orders], &ContractRules::builtin(), &[]);
         assert!(imports_edges(&out.edges).is_empty());
         assert!(
             out.nodes
@@ -2646,7 +2954,7 @@ mod tests {
             bound_name: "LoggerInterface".into(),
         }];
 
-        let out = resolve(vec![handlers], &ContractRules::builtin());
+        let out = resolve(vec![handlers], &ContractRules::builtin(), &[]);
         let module_nodes: Vec<&ModuleNode> = out
             .nodes
             .iter()
@@ -2688,7 +2996,7 @@ mod tests {
         handlers.extract.symbols = vec![sym("handle", SymKind::Function, 5, 8, true)];
         handlers.extract.call_sites = vec![call("parseOrder", 6)];
 
-        let out = resolve(vec![handlers, orders], &ContractRules::builtin());
+        let out = resolve(vec![handlers, orders], &ContractRules::builtin(), &[]);
         assert!(
             find_symbol(&out.nodes, "handle")
                 .unresolved_calls
@@ -2720,7 +3028,7 @@ mod tests {
             path: "Acme.Orders".into(),
         }];
 
-        let out = resolve(vec![program, order, parser], &ContractRules::builtin());
+        let out = resolve(vec![program, order, parser], &ContractRules::builtin(), &[]);
         let imports = imports_edges(&out.edges);
         assert_eq!(imports.len(), 2);
         for e in &imports {
@@ -2760,6 +3068,7 @@ mod tests {
         let out = resolve(
             vec![orders_program, orders_order, billing_order],
             &ContractRules::builtin(),
+            &[],
         );
         let imports = imports_edges(&out.edges);
         assert_eq!(imports.len(), 1, "must not fan out into billing too");
@@ -2780,7 +3089,7 @@ mod tests {
             path: "Acme.Billing".into(),
         }];
 
-        let out = resolve(vec![program, order], &ContractRules::builtin());
+        let out = resolve(vec![program, order], &ContractRules::builtin(), &[]);
         assert!(imports_edges(&out.edges).is_empty());
         assert!(
             out.nodes
@@ -2805,7 +3114,7 @@ mod tests {
             },
         ];
 
-        let out = resolve(vec![program], &ContractRules::builtin());
+        let out = resolve(vec![program], &ContractRules::builtin(), &[]);
         let module_paths: Vec<&str> = out
             .nodes
             .iter()
@@ -2837,7 +3146,7 @@ mod tests {
         program.extract.symbols = vec![sym("Main", SymKind::Method, 1, 5, true)];
         program.extract.call_sites = vec![call("ParseOrder", 3)];
 
-        let out = resolve(vec![program, order], &ContractRules::builtin());
+        let out = resolve(vec![program, order], &ContractRules::builtin(), &[]);
         assert!(find_symbol(&out.nodes, "Main").unresolved_calls.is_empty());
         assert_eq!(
             calls_edges(&out.edges)[0].evidence,
@@ -2865,7 +3174,7 @@ mod tests {
         program.extract.symbols = vec![sym("Main", SymKind::Method, 1, 5, true)];
         program.extract.call_sites = vec![call("Parser", 3)];
 
-        let out = resolve(vec![program, parser], &ContractRules::builtin());
+        let out = resolve(vec![program, parser], &ContractRules::builtin(), &[]);
         let imports = imports_edges(&out.edges);
         assert_eq!(imports.len(), 1);
         assert_eq!(imports[0].evidence, vec!["namespace-import".to_string()]);
@@ -2896,7 +3205,7 @@ mod tests {
             path: "App.Orders".into(),
         }];
 
-        let out = resolve(vec![program, php, cs], &ContractRules::builtin());
+        let out = resolve(vec![program, php, cs], &ContractRules::builtin(), &[]);
         let imports = imports_edges(&out.edges);
         // Exactly one edge — to the C# file, not the PHP one.
         assert_eq!(imports.len(), 1);
@@ -2919,7 +3228,7 @@ mod tests {
         let mut program = cs_file("Program.cs");
         program.extract.imports = vec![RawImport::NamespaceImport { path: "App".into() }];
 
-        let out = resolve(vec![program, php], &ContractRules::builtin());
+        let out = resolve(vec![program, php], &ContractRules::builtin(), &[]);
         let imports = imports_edges(&out.edges);
         assert_eq!(imports.len(), 1, "must not silently match the PHP file");
         assert_eq!(imports[0].evidence, vec!["external-package".to_string()]);
@@ -2950,7 +3259,7 @@ mod tests {
             path: "System.Text".into(),
         }];
 
-        let out = resolve(vec![program, php], &ContractRules::builtin());
+        let out = resolve(vec![program, php], &ContractRules::builtin(), &[]);
         let imports = imports_edges(&out.edges);
         assert_eq!(
             imports.len(),
@@ -2977,7 +3286,7 @@ mod tests {
             bound_name: "J".into(),
         }];
 
-        let out = resolve(vec![program], &ContractRules::builtin());
+        let out = resolve(vec![program], &ContractRules::builtin(), &[]);
         let module_paths: Vec<&str> = out
             .nodes
             .iter()
@@ -3002,7 +3311,7 @@ mod tests {
             imported_names: vec![name("Serialize")],
         }];
 
-        let out = resolve(vec![a, b], &ContractRules::builtin());
+        let out = resolve(vec![a, b], &ContractRules::builtin(), &[]);
         let module_nodes: Vec<&ModuleNode> = out
             .nodes
             .iter()
@@ -3028,7 +3337,7 @@ mod tests {
             imported_names: vec![name("parse_order")],
         }];
 
-        let out = resolve(vec![f], &ContractRules::builtin());
+        let out = resolve(vec![f], &ContractRules::builtin(), &[]);
         assert!(
             out.nodes
                 .iter()
@@ -3051,7 +3360,7 @@ mod tests {
             imported_names: vec![name("parse_order")],
         }];
 
-        let out = resolve(vec![lib, handlers], &ContractRules::builtin());
+        let out = resolve(vec![lib, handlers], &ContractRules::builtin(), &[]);
         assert!(
             out.nodes
                 .iter()
@@ -3084,7 +3393,7 @@ mod tests {
             imported_names: vec![name("parse_order")],
         }];
 
-        let out = resolve(vec![lib, handlers], &ContractRules::builtin());
+        let out = resolve(vec![lib, handlers], &ContractRules::builtin(), &[]);
         let module = out
             .nodes
             .iter()
@@ -3138,6 +3447,7 @@ mod tests {
         let out = resolve(
             vec![a_lib, a_handlers, b_lib, b_handlers],
             &ContractRules::builtin(),
+            &[],
         );
         assert!(
             out.nodes
@@ -3165,7 +3475,7 @@ mod tests {
             root: "orders".into(),
         }];
 
-        let out = resolve(vec![lib, handlers], &ContractRules::builtin());
+        let out = resolve(vec![lib, handlers], &ContractRules::builtin(), &[]);
         assert!(
             out.nodes
                 .iter()
@@ -3184,7 +3494,7 @@ mod tests {
             root: "carto_core".into(),
         }];
 
-        let out = resolve(vec![f], &ContractRules::builtin());
+        let out = resolve(vec![f], &ContractRules::builtin(), &[]);
         let module = out
             .nodes
             .iter()
@@ -3209,7 +3519,7 @@ mod tests {
         let mut f = file("src/orders.rs");
         f.extract.symbols = vec![sym("parse_order", SymKind::Function, 1, 3, true)];
 
-        let out = resolve(vec![f], &ContractRules::builtin());
+        let out = resolve(vec![f], &ContractRules::builtin(), &[]);
         let contains: Vec<&Edge> = out
             .edges
             .iter()
@@ -3236,7 +3546,7 @@ mod tests {
         // build_and_persist's own range, none inside other_fn's.
         f.extract.uncaptured_call_sites = vec![call("PathGuard::new", 2), call("walk::walk", 3)];
 
-        let out = resolve(vec![f], &ContractRules::builtin());
+        let out = resolve(vec![f], &ContractRules::builtin(), &[]);
         let build_and_persist = find_symbol(&out.nodes, "build_and_persist");
         let other_fn = find_symbol(&out.nodes, "other_fn");
         assert_eq!(build_and_persist.uncaptured_outbound_calls, 2);
@@ -3258,7 +3568,11 @@ mod tests {
         helper_file.extract.symbols = vec![sym("helper", SymKind::Function, 1, 5, true)];
         helper_file.extract.uncaptured_call_sites = vec![call("Type::method", 3)];
 
-        let out = resolve(vec![caller_file, helper_file], &ContractRules::builtin());
+        let out = resolve(
+            vec![caller_file, helper_file],
+            &ContractRules::builtin(),
+            &[],
+        );
         let helper = find_symbol(&out.nodes, "helper");
         assert_eq!(helper.uncaptured_inbound_calls, 1);
         assert_eq!(helper.uncaptured_outbound_calls, 1);
@@ -3290,7 +3604,7 @@ mod tests {
         let mut helpers = go_file("internal/orders/helpers.go");
         helpers.extract.symbols = vec![sym("normalize", SymKind::Function, 1, 2, false)];
 
-        let out = resolve(vec![order, helpers], &ContractRules::builtin());
+        let out = resolve(vec![order, helpers], &ContractRules::builtin(), &[]);
         assert!(
             find_symbol(&out.nodes, "ParseOrder")
                 .unresolved_calls
@@ -3313,7 +3627,7 @@ mod tests {
         let mut c = go_file("pkg/c.go");
         c.extract.symbols = vec![sym("helper", SymKind::Function, 1, 2, false)];
 
-        let out = resolve(vec![caller, b, c], &ContractRules::builtin());
+        let out = resolve(vec![caller, b, c], &ContractRules::builtin(), &[]);
         let run = find_symbol(&out.nodes, "run");
         assert_eq!(run.unresolved_calls.len(), 1);
         assert_eq!(run.unresolved_calls[0].name, "helper");
@@ -3333,7 +3647,7 @@ mod tests {
         let mut sibling = go_file("pkg/b.go");
         sibling.extract.symbols = vec![sym("helper", SymKind::Function, 1, 2, false)];
 
-        let out = resolve(vec![caller, sibling], &ContractRules::builtin());
+        let out = resolve(vec![caller, sibling], &ContractRules::builtin(), &[]);
         let run = find_symbol(&out.nodes, "run");
         assert_eq!(run.unresolved_calls.len(), 1);
         assert_eq!(run.unresolved_calls[0].name, "helper");
@@ -3349,7 +3663,7 @@ mod tests {
         let order = go_file("internal/orders/order.go");
         let helpers = go_file("internal/orders/helpers.go");
 
-        let out = resolve(vec![main, order, helpers], &ContractRules::builtin());
+        let out = resolve(vec![main, order, helpers], &ContractRules::builtin(), &[]);
         let imports = imports_edges(&out.edges);
         assert_eq!(imports.len(), 2, "one edge per file in the target dir");
         assert!(imports.iter().all(|e| e.confidence == Confidence::Certain));
@@ -3373,7 +3687,7 @@ mod tests {
         let deep = go_file("pkg/orders/order.go");
         let shallow = go_file("orders/order.go");
 
-        let out = resolve(vec![main, deep, shallow], &ContractRules::builtin());
+        let out = resolve(vec![main, deep, shallow], &ContractRules::builtin(), &[]);
         let imports = imports_edges(&out.edges);
         assert_eq!(imports.len(), 1);
         assert_eq!(imports[0].to, graph::file_id("pkg/orders/order.go"));
@@ -3386,7 +3700,7 @@ mod tests {
             path: "github.com/lib/pq".into(),
         }];
 
-        let out = resolve(vec![main], &ContractRules::builtin());
+        let out = resolve(vec![main], &ContractRules::builtin(), &[]);
         let module_nodes: Vec<&ModuleNode> = out
             .nodes
             .iter()
@@ -3418,7 +3732,7 @@ mod tests {
         }];
         let order = go_file("internal/orders/order.go");
 
-        let out = resolve(vec![main, order], &ContractRules::builtin());
+        let out = resolve(vec![main, order], &ContractRules::builtin(), &[]);
         assert_eq!(imports_edges(&out.edges).len(), 1);
     }
 
@@ -3456,7 +3770,7 @@ mod tests {
             line: 12,
         }];
 
-        let out = resolve(vec![cs, tf], &ContractRules::builtin());
+        let out = resolve(vec![cs, tf], &ContractRules::builtin(), &[]);
         // `resolve` itself may push the same (category, qualifier,
         // value) Contract node's content more than once — real dedup
         // happens where every other producer does too, at
@@ -3502,7 +3816,7 @@ mod tests {
             line: 5,
         }];
 
-        let out = resolve(vec![tf], &ContractRules::builtin());
+        let out = resolve(vec![tf], &ContractRules::builtin(), &[]);
         let contracts = contract_nodes(&out.nodes);
         assert_eq!(contracts.len(), 1);
         assert_eq!(
@@ -3545,7 +3859,7 @@ mod tests {
             line: 1,
         }];
 
-        let out = resolve(vec![a, b], &ContractRules::builtin());
+        let out = resolve(vec![a, b], &ContractRules::builtin(), &[]);
         assert_eq!(contract_nodes(&out.nodes).len(), 2);
     }
 
@@ -3565,7 +3879,7 @@ mod tests {
             line: 1,
         }];
 
-        let out = resolve(vec![tf], &ContractRules::builtin());
+        let out = resolve(vec![tf], &ContractRules::builtin(), &[]);
         assert!(contract_nodes(&out.nodes).is_empty());
     }
 
@@ -3584,7 +3898,7 @@ mod tests {
             line: 4,
         }];
 
-        let out = resolve(vec![cs], &ContractRules::builtin());
+        let out = resolve(vec![cs], &ContractRules::builtin(), &[]);
         let produces = out
             .edges
             .iter()
@@ -3610,7 +3924,7 @@ mod tests {
         ];
         f.extract.type_refs = vec![type_ref("Order", 3)];
 
-        let out = resolve(vec![f], &ContractRules::builtin());
+        let out = resolve(vec![f], &ContractRules::builtin(), &[]);
         let refs = references_edges(&out.edges);
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].confidence, Confidence::Inferred);
@@ -3633,7 +3947,7 @@ mod tests {
         let mut orders = file("src/orders.rs");
         orders.extract.symbols = vec![sym("Order", SymKind::Struct, 1, 3, true)];
 
-        let out = resolve(vec![handlers, orders], &ContractRules::builtin());
+        let out = resolve(vec![handlers, orders], &ContractRules::builtin(), &[]);
         assert_eq!(
             references_edges(&out.edges)[0].evidence,
             vec!["type-reference:imported".to_string()]
@@ -3649,7 +3963,7 @@ mod tests {
         let mut orders = file("src/orders.rs");
         orders.extract.symbols = vec![sym("Order", SymKind::Struct, 1, 3, true)];
 
-        let out = resolve(vec![handlers, orders], &ContractRules::builtin());
+        let out = resolve(vec![handlers, orders], &ContractRules::builtin(), &[]);
         assert_eq!(
             references_edges(&out.edges)[0].evidence,
             vec!["type-reference:same-package".to_string()]
@@ -3667,7 +3981,7 @@ mod tests {
         let mut c = file("src/c.rs");
         c.extract.symbols = vec![sym("Order", SymKind::Struct, 1, 2, true)];
 
-        let out = resolve(vec![caller, b, c], &ContractRules::builtin());
+        let out = resolve(vec![caller, b, c], &ContractRules::builtin(), &[]);
         assert!(references_edges(&out.edges).is_empty());
     }
 
@@ -3680,7 +3994,7 @@ mod tests {
         f.extract.symbols = vec![sym("Handler", SymKind::Struct, 1, 5, true)];
         f.extract.type_refs = vec![type_ref("SomeExternalType", 3)];
 
-        let out = resolve(vec![f], &ContractRules::builtin());
+        let out = resolve(vec![f], &ContractRules::builtin(), &[]);
         assert!(references_edges(&out.edges).is_empty());
         assert!(
             find_symbol(&out.nodes, "Handler")
@@ -3703,7 +4017,7 @@ mod tests {
         // contains its field declarations).
         f.extract.type_refs = vec![type_ref("Node", 2)];
 
-        let out = resolve(vec![f], &ContractRules::builtin());
+        let out = resolve(vec![f], &ContractRules::builtin(), &[]);
         assert!(references_edges(&out.edges).is_empty());
     }
 
@@ -3748,6 +4062,7 @@ mod tests {
         let out = resolve(
             vec![store, url_provider, service, s3_provider],
             &ContractRules::builtin(),
+            &[],
         );
 
         // Both service files import the namespace -- the pre-existing,
@@ -3789,7 +4104,7 @@ mod tests {
         let mut helper = cs_file("Registrar.cs");
         helper.extract.symbols = vec![sym("Register", SymKind::Method, 1, 3, true)];
 
-        let out = resolve(vec![top_level, helper], &ContractRules::builtin());
+        let out = resolve(vec![top_level, helper], &ContractRules::builtin(), &[]);
         let edges = calls_edges(&out.edges);
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].from, graph::file_id("Program.cs"));
@@ -3805,7 +4120,7 @@ mod tests {
         let mut store = cs_file("IQueryJobStore.cs");
         store.extract.symbols = vec![sym("IQueryJobStore", SymKind::Interface, 1, 1, true)];
 
-        let out = resolve(vec![top_level, store], &ContractRules::builtin());
+        let out = resolve(vec![top_level, store], &ContractRules::builtin(), &[]);
         let refs = references_edges(&out.edges);
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].from, graph::file_id("Program.cs"));
@@ -3835,7 +4150,7 @@ mod tests {
             sym("inner_helper", SymKind::Function, 1, 2, true),
         ];
 
-        let out = resolve(vec![f, helpers], &ContractRules::builtin());
+        let out = resolve(vec![f, helpers], &ContractRules::builtin(), &[]);
         let edges = calls_edges(&out.edges);
         assert_eq!(edges.len(), 2);
 
@@ -3865,7 +4180,7 @@ mod tests {
         let mut top_level = file("src/program.rs");
         top_level.extract.call_sites = vec![call("mystery", 1)];
 
-        let out = resolve(vec![top_level], &ContractRules::builtin());
+        let out = resolve(vec![top_level], &ContractRules::builtin(), &[]);
         assert!(calls_edges(&out.edges).is_empty());
         // No symbol exists in this file at all, so there's nowhere an
         // `unresolved_calls` entry even could live for this miss.
@@ -3881,7 +4196,7 @@ mod tests {
         let mut top_level = file("src/program.rs");
         top_level.extract.type_refs = vec![type_ref("SomeExternalType", 1)];
 
-        let out = resolve(vec![top_level], &ContractRules::builtin());
+        let out = resolve(vec![top_level], &ContractRules::builtin(), &[]);
         assert!(references_edges(&out.edges).is_empty());
     }
 }

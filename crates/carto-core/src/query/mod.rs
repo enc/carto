@@ -646,11 +646,13 @@ mod tests {
                 name: "api".to_string(),
                 path: "services/api".to_string(),
                 kind: "go".to_string(),
+                depends_on: vec![],
             },
             crate::components::Component {
                 name: "internal".to_string(),
                 path: "services/api/internal".to_string(),
                 kind: "go".to_string(),
+                depends_on: vec![],
             },
         ];
         let qg = QueryGraph::from_document(doc_with_components(
@@ -683,11 +685,13 @@ mod tests {
                 name: "api".to_string(),
                 path: "services/api".to_string(),
                 kind: "go".to_string(),
+                depends_on: vec![],
             },
             crate::components::Component {
                 name: "internal".to_string(),
                 path: "services/api/internal".to_string(),
                 kind: "go".to_string(),
+                depends_on: vec![],
             },
         ];
         let qg = QueryGraph::from_document(doc_with_components(
@@ -734,6 +738,7 @@ mod tests {
             name: "orders".to_string(),
             path: "services/orders".to_string(),
             kind: "go".to_string(),
+            depends_on: vec![],
         }];
         let qg = QueryGraph::from_document(doc_with_components(vec![], vec![], components));
         let filter: BTreeSet<String> = ["orders".to_string(), "typo".to_string()]
@@ -750,6 +755,7 @@ mod tests {
             name: "orders".to_string(),
             path: "services/orders".to_string(),
             kind: "go".to_string(),
+            depends_on: vec![],
         }];
         let qg = QueryGraph::from_document(doc_with_components(vec![], vec![], components));
         let filter: BTreeSet<String> = ["orders".to_string()].into_iter().collect();
@@ -763,11 +769,13 @@ mod tests {
                 name: "billing".to_string(),
                 path: "services/billing".to_string(),
                 kind: "go".to_string(),
+                depends_on: vec![],
             },
             crate::components::Component {
                 name: "orders".to_string(),
                 path: "services/orders".to_string(),
                 kind: "go".to_string(),
+                depends_on: vec![],
             },
         ];
         let qg = QueryGraph::from_document(doc_with_components(vec![], vec![], components));

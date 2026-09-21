@@ -66,7 +66,7 @@ pub fn build_and_persist(
         }
     }
 
-    let resolved = lang::extract_and_resolve(repo_root, &walked.nodes)?;
+    let resolved = lang::extract_and_resolve(repo_root, &walked.nodes, components.components())?;
 
     let mut g = Graph::new();
     for node in walked.nodes {

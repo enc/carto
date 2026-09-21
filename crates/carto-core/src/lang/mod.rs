@@ -120,6 +120,7 @@ fn extractors() -> Vec<Box<dyn LangExtractor>> {
 pub fn extract_and_resolve(
     repo_root: &Path,
     file_nodes: &[Node],
+    components: &[crate::components::Component],
 ) -> crate::error::Result<ResolvedExtraction> {
     let extractors = extractors();
     let mut extractions = Vec::new();
@@ -156,7 +157,12 @@ pub fn extract_and_resolve(
     // file stops the index rather than silently classifying nothing.
     let contract_rules = crate::contracts::ContractRules::load(repo_root)?;
 
-    Ok(resolve(extractions, &contract_rules))
+    // ADR-0039: `resolve` builds its own `component -> depends_on`
+    // index from `components` (alongside `contract_rules`) — passed
+    // straight through here, not pre-indexed, since `resolve.rs`
+    // already builds every other per-file/per-component lookup it
+    // needs from raw inputs rather than having its caller do it.
+    Ok(resolve(extractions, &contract_rules, components))
 }
 
 #[cfg(test)]

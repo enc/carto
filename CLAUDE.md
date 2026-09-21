@@ -398,6 +398,29 @@ two *disjoint* subtrees) is a separate, larger, not-yet-attempted
 capability — would need `Component::path: String` to become `paths:
 Vec<String>`, a breaking schema change.
 
+**Follow-up (ADR-0039), the fourth and final slice, requested directly
+by the user:** `Component` gains `depends_on: Vec<String>`, resolved
+by `crates/carto-core/src/components/deps.rs` (called at the end of
+`ComponentSet::discover`) from each component's own manifest —
+`go.mod`'s `require`/local `replace`, `package.json`'s `file:`/
+`workspace:`/name-matched `dependencies`, `Cargo.toml`'s `path =`
+entries, a `.csproj`'s `<ProjectReference>`, `composer.json`'s path
+`repositories`/name-matched `require` — against every other component
+in the tree, no new dependency added. `terraform`/`custom`-kind
+components get no resolution at all (no manifest-identity concept for
+either); `crate::components::DEPENDENCY_AWARE_KINDS` names the five
+kinds that do, and every consumer of `depends_on` gates on it, so a
+dependency-unaware component's crossings are never misread as
+"confirmed undeclared." `SCHEMA_VERSION` bumped 7 → 8. Used three
+ways, all additive: `lang::resolve::is_undeclared_dependency` adds an
+`"undeclared-dependency"` evidence entry (alongside
+`"cross-component"`, never replacing it) to a cross-component
+`Imports`/`Calls`/`References` edge whose target isn't in the caller's
+declared deps; `resolve_fqn`/the `NamespaceImport` fan-out each gain a
+tier preferring a declared dependency between same-component and the
+pre-existing arbitrary fallback; `map --section components` renders
+`depends_on` and marks an undeclared crossing `[undeclared]`.
+
 ## Conventions
 
 - **ADRs for every deviation and judgment call.** `docs/adr/NNNN-*.md`.

@@ -139,6 +139,13 @@ pub struct ComponentCounts {
     pub kind: String,
     pub files: usize,
     pub symbols: usize,
+    /// ADR-0039: this component's own manifest-declared dependencies
+    /// (sorted names) — empty both for a component with genuinely no
+    /// declared dependency and for a `kind` carto has no manifest-
+    /// identity concept for (`"terraform"`/`"custom"`); this field
+    /// alone can't distinguish those two, the same limit
+    /// `Component::depends_on`'s own doc comment names.
+    pub depends_on: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -336,6 +343,7 @@ fn seed_component_counts(
                 kind: c.kind.clone(),
                 files: 0,
                 symbols: 0,
+                depends_on: c.depends_on.clone(),
             },
         );
     }
@@ -556,8 +564,13 @@ fn components_lines(counts: &MapCounts, qg: &QueryGraph) -> Vec<String> {
         return lines;
     }
     for (name, c) in &counts.components {
+        let depends_on = if c.depends_on.is_empty() {
+            "(none)".to_string()
+        } else {
+            c.depends_on.join(", ")
+        };
         lines.push(format!(
-            "  {name}  path={} kind={} files={} symbols={}",
+            "  {name}  path={} kind={} files={} symbols={} depends_on={depends_on}",
             c.path, c.kind, c.files, c.symbols
         ));
     }
@@ -592,13 +605,35 @@ fn components_lines(counts: &MapCounts, qg: &QueryGraph) -> Vec<String> {
             .or_insert(0) += 1;
     }
     if !cross.is_empty() {
+        // ADR-0039: `[undeclared]` when `from_c`'s own component is a
+        // dependency-aware kind (see `crate::components::
+        // DEPENDENCY_AWARE_KINDS`'s doc comment) and `to_c` isn't in
+        // its declared `depends_on` — a component-level summary of the
+        // same per-edge `"undeclared-dependency"` evidence entry
+        // `lang::resolve` adds, not a second independent computation:
+        // any edge in this pair carrying that evidence implies the
+        // pair itself qualifies, since the check is identical
+        // (component-to-component, not edge-specific).
+        let component_by_name: BTreeMap<&str, &crate::components::Component> = qg
+            .components()
+            .iter()
+            .map(|c| (c.name.as_str(), c))
+            .collect();
         lines.push("## cross-component edges".to_string());
         for ((from_c, to_c), kinds) in &cross {
             let parts: Vec<String> = kinds
                 .iter()
                 .map(|((k, conf), v)| format!("{v} {k}({})", conf.as_str()))
                 .collect();
-            lines.push(format!("  {from_c} -> {to_c}: {}", parts.join(", ")));
+            let undeclared = component_by_name.get(from_c.as_str()).is_some_and(|c| {
+                crate::components::DEPENDENCY_AWARE_KINDS.contains(&c.kind.as_str())
+                    && !c.depends_on.iter().any(|d| d == to_c)
+            });
+            let marker = if undeclared { "  [undeclared]" } else { "" };
+            lines.push(format!(
+                "  {from_c} -> {to_c}: {}{marker}",
+                parts.join(", ")
+            ));
         }
     }
 
@@ -1037,6 +1072,7 @@ mod tests {
             name: name.to_string(),
             path: path.to_string(),
             kind: kind.to_string(),
+            depends_on: vec![],
         }
     }
 
@@ -1098,6 +1134,74 @@ mod tests {
         let joined = result.lines.join("\n");
         assert!(joined.contains("## cross-component edges"));
         assert!(joined.contains("orders -> billing: 1 imports"), "{joined}");
+    }
+
+    fn component_with_deps(
+        name: &str,
+        path: &str,
+        kind: &str,
+        depends_on: Vec<&str>,
+    ) -> crate::components::Component {
+        crate::components::Component {
+            name: name.to_string(),
+            path: path.to_string(),
+            kind: kind.to_string(),
+            depends_on: depends_on.into_iter().map(str::to_string).collect(),
+        }
+    }
+
+    #[test]
+    fn a_component_row_renders_its_own_declared_dependencies() {
+        let mut d = two_component_doc();
+        d.components = vec![
+            component_with_deps("orders", "services/orders", "go", vec!["billing"]),
+            component_with_deps("billing", "services/billing", "go", vec![]),
+        ];
+        let qg = QueryGraph::from_document(d);
+        let result = run(&qg, &MapQuery::new());
+        let joined = result.lines.join("\n");
+        assert!(
+            joined.contains(
+                "orders  path=services/orders kind=go files=1 symbols=0 depends_on=billing"
+            ),
+            "{joined}"
+        );
+        assert!(
+            joined.contains(
+                "billing  path=services/billing kind=go files=1 symbols=0 depends_on=(none)"
+            ),
+            "{joined}"
+        );
+    }
+
+    #[test]
+    fn cross_component_edge_summary_marks_an_undeclared_crossing() {
+        // `two_component_doc`'s own components carry no `depends_on` at
+        // all, so `orders -> billing` (a real crossing) is undeclared.
+        let qg = QueryGraph::from_document(two_component_doc());
+        let result = run(&qg, &MapQuery::new());
+        let joined = result.lines.join("\n");
+        assert!(
+            joined.contains("orders -> billing: 1 imports(certain)  [undeclared]"),
+            "{joined}"
+        );
+    }
+
+    #[test]
+    fn cross_component_edge_summary_does_not_mark_a_declared_crossing() {
+        let mut d = two_component_doc();
+        d.components = vec![
+            component_with_deps("orders", "services/orders", "go", vec!["billing"]),
+            component_with_deps("billing", "services/billing", "go", vec![]),
+        ];
+        let qg = QueryGraph::from_document(d);
+        let result = run(&qg, &MapQuery::new());
+        let joined = result.lines.join("\n");
+        assert!(
+            joined.contains("orders -> billing: 1 imports(certain)")
+                && !joined.contains("[undeclared]"),
+            "{joined}"
+        );
     }
 
     #[test]
