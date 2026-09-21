@@ -57,13 +57,37 @@ impl RedactionCounts {
 pub fn redact(graph: &mut Graph) -> RedactionCounts {
     let mut totals = RedactionCounts::default();
     for node in graph.nodes_mut() {
-        if let NodeData::Symbol(sym) = &mut node.data {
-            if let Some(sig) = &sym.signature {
-                if let Some((redacted, counts)) = redact_tainted_string(sig) {
-                    sym.signature = Some(redacted);
-                    totals.merge(counts);
+        match &mut node.data {
+            NodeData::Symbol(sym) => {
+                if let Some(sig) = &sym.signature {
+                    if let Some((redacted, counts)) = redact_tainted_string(sig) {
+                        sym.signature = Some(redacted);
+                        totals.merge(counts);
+                    }
                 }
             }
+            // ADR-0026: a Contract's `value`/`qualifier` are captured
+            // source text (a string literal), the same "arbitrary
+            // repo-authored content" category as a symbol's signature —
+            // unlike `FileNode.path`/`SymbolNode.name`, which stay out
+            // of scope (ADR-0017) because they're extractor-computed
+            // identifiers, never free-form text. IDs were already
+            // computed from the raw (pre-redaction) value in `resolve`
+            // (`graph::contract_id`), so redacting the rendered value
+            // here doesn't break a `produces`/`consumes` edge's join.
+            NodeData::Contract(c) => {
+                if let Some((redacted, counts)) = redact_tainted_string(&c.value) {
+                    c.value = redacted;
+                    totals.merge(counts);
+                }
+                if let Some(qualifier) = &c.qualifier {
+                    if let Some((redacted, counts)) = redact_tainted_string(qualifier) {
+                        c.qualifier = Some(redacted);
+                        totals.merge(counts);
+                    }
+                }
+            }
+            NodeData::File(_) | NodeData::Module(_) => {}
         }
     }
     totals
@@ -126,6 +150,9 @@ mod tests {
                 signature: Some(TaintedString::new(signature, Provenance::Syntactic)),
                 unresolved_calls: vec![],
                 uncaptured_inbound_calls: 0,
+                uncaptured_outbound_calls: 0,
+                unresolved_inbound_calls: vec![],
+                unresolved_inbound_call_count: 0,
             },
         )
     }

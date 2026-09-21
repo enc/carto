@@ -108,6 +108,34 @@ pub fn module_id(path: &str, external: bool) -> NodeId {
     ))
 }
 
+/// Stable ID for a `Contract` node (ADR-0026, not in spec §4.3): unlike
+/// every other ID here, `category`/`qualifier`/`value` are *arbitrary
+/// captured literal text*, not a path or identifier a language's own
+/// grammar constrains — a metric name genuinely can contain `:`
+/// (StatsD-style `cache:hits`). A plain `format!("contract:{category}:
+/// {qualifier}:{value}")` would let two different `(qualifier, value)`
+/// splits produce the identical pre-hash string (e.g. `qualifier:
+/// Some("A:B"), value: "C"` vs. `qualifier: Some("A"), value: "B:C"`) —
+/// hashing doesn't prevent that collision, it only obscures it, since
+/// blake3 has no way to tell two *different* input strings apart if
+/// they happen to already be equal. Length-prefixing each field (`len
+/// ‖ ':' ‖ content`) makes every field's boundary unambiguous
+/// regardless of what characters it contains, closing that off. Built
+/// from the *raw* extracted text, not a `TaintedString`'s sanitized/
+/// capped form — this runs before `persist`'s redact step (§6.5), so a
+/// later-redacted value's ID still matches whatever other site
+/// produced/consumed the same literal.
+pub fn contract_id(category: &str, qualifier: Option<&str>, value: &str) -> NodeId {
+    let qualifier = qualifier.unwrap_or("");
+    let key = format!(
+        "contract:{}:{category}:{}:{qualifier}:{}:{value}",
+        category.len(),
+        qualifier.len(),
+        value.len(),
+    );
+    NodeId(blake3_hex_prefix(key.as_bytes()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,5 +170,51 @@ mod tests {
         assert_eq!(edge_id("contains", &a, &b), edge_id("contains", &a, &b));
         assert_ne!(edge_id("contains", &a, &b), edge_id("imports", &a, &b));
         assert_ne!(edge_id("contains", &a, &b), edge_id("contains", &b, &a));
+    }
+
+    #[test]
+    fn contract_id_is_deterministic() {
+        assert_eq!(
+            contract_id(
+                "metric_name",
+                Some("SIDCloud/Ingest"),
+                "QuoteDropsPerSecond"
+            ),
+            contract_id(
+                "metric_name",
+                Some("SIDCloud/Ingest"),
+                "QuoteDropsPerSecond"
+            ),
+        );
+    }
+
+    #[test]
+    fn contract_id_differs_by_qualifier() {
+        assert_ne!(
+            contract_id("metric_name", Some("SIDCloud/Ingest"), "Errors"),
+            contract_id("metric_name", Some("SIDCloud/Streamer"), "Errors"),
+        );
+    }
+
+    /// Regression guard: a naive `"{category}:{qualifier}:{value}"`
+    /// join would let a `:` inside a qualifier/value shift the field
+    /// boundary, making two genuinely different `(qualifier, value)`
+    /// pairs collide onto the same pre-hash string. Length-prefixing
+    /// each field must keep them apart.
+    #[test]
+    fn contract_id_does_not_collide_when_a_field_contains_the_separator() {
+        let a = contract_id("metric_name", Some("A:B"), "C");
+        let b = contract_id("metric_name", Some("A"), "B:C");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn contract_id_none_qualifier_does_not_collide_with_an_empty_string_qualifier() {
+        let none = contract_id("metric_name", None, "X");
+        let empty = contract_id("metric_name", Some(""), "X");
+        assert_eq!(
+            none, empty,
+            "None and Some(\"\") are the same qualifier by design (both length-0)"
+        );
     }
 }

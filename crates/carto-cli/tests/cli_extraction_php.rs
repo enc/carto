@@ -86,6 +86,36 @@ fn calls_edge<'a>(graph: &'a Value, from_name: &str, to_name: &str) -> &'a Value
         .unwrap_or_else(|| panic!("no calls edge {from_name} -> {to_name} in graph.json"))
 }
 
+fn references_edge<'a>(graph: &'a Value, from_name: &str, to_name: &str) -> &'a Value {
+    graph["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| {
+            e["kind"] == "references"
+                && id_to_name(graph, e["from"].as_str().unwrap()) == from_name
+                && id_to_name(graph, e["to"].as_str().unwrap()) == to_name
+        })
+        .unwrap_or_else(|| panic!("no references edge {from_name} -> {to_name} in graph.json"))
+}
+
+/// ADR-0029: `parseOrder`'s own `return new Order($input);` is a type
+/// position nothing captured before this — `object_creation_expression`
+/// isn't one of `calls.scm`'s four call shapes for PHP, so this is
+/// genuinely new signal, not a duplicate of an existing `calls` edge.
+#[test]
+fn object_creation_produces_a_references_edge() {
+    let out = TempDir::new("references");
+    let graph = index(out.path());
+
+    let edge = references_edge(&graph, "parseOrder", "Order");
+    assert_eq!(edge["confidence"], "inferred");
+    assert_eq!(
+        edge["evidence"].as_array().unwrap(),
+        &[Value::String("type-reference:same-file".into())]
+    );
+}
+
 #[test]
 fn extracts_every_expected_symbol_with_correct_sym_kind() {
     let out = TempDir::new("symbols");

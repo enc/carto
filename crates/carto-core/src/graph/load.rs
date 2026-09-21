@@ -164,6 +164,9 @@ mod tests {
                 )),
                 unresolved_calls: vec![],
                 uncaptured_inbound_calls: 0,
+                uncaptured_outbound_calls: 0,
+                unresolved_inbound_calls: vec![],
+                unresolved_inbound_call_count: 0,
             },
         ));
         graph.insert_node(Node::module(

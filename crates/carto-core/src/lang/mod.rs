@@ -8,6 +8,7 @@ pub mod csharp;
 pub mod ecma;
 pub mod extractor;
 pub mod go;
+pub mod hcl;
 pub mod php;
 pub mod python;
 pub mod resolve;
@@ -15,8 +16,11 @@ pub mod rust;
 
 pub use csharp::CSharpExtractor;
 pub use ecma::{JavaScriptExtractor, TsxExtractor, TypeScriptExtractor};
-pub use extractor::{ExtractOut, ImportedName, LangExtractor, RawCallSite, RawImport, RawSymbol};
+pub use extractor::{
+    ExtractOut, ImportedName, LangExtractor, RawCallSite, RawImport, RawLiteral, RawSymbol,
+};
 pub use go::GoExtractor;
+pub use hcl::HclExtractor;
 pub use php::PhpExtractor;
 pub use python::PythonExtractor;
 pub use resolve::{FileExtraction, ResolvedExtraction, resolve};
@@ -94,6 +98,7 @@ fn extractors() -> Vec<Box<dyn LangExtractor>> {
         Box::new(JavaScriptExtractor),
         Box::new(GoExtractor),
         Box::new(CSharpExtractor),
+        Box::new(HclExtractor),
     ]
 }
 
@@ -112,7 +117,10 @@ fn extractors() -> Vec<Box<dyn LangExtractor>> {
 /// size cap. A file that becomes unreadable between the two reads
 /// (TOCTOU) is silently skipped, same tolerance `walk::classify`
 /// already has for the same race.
-pub fn extract_and_resolve(repo_root: &Path, file_nodes: &[Node]) -> ResolvedExtraction {
+pub fn extract_and_resolve(
+    repo_root: &Path,
+    file_nodes: &[Node],
+) -> crate::error::Result<ResolvedExtraction> {
     let extractors = extractors();
     let mut extractions = Vec::new();
 
@@ -138,10 +146,16 @@ pub fn extract_and_resolve(repo_root: &Path, file_nodes: &[Node]) -> ResolvedExt
             ns_separator: extractor.namespace_separator(),
             qualified_external_is_full_fqn: extractor.qualified_external_is_full_fqn(),
             declares_module: extractor.relative_import_declares_module(),
+            lang: extractor.lang(),
         });
     }
 
-    resolve(extractions)
+    // ADR-0026/0027: built-in contract-classification rules plus this
+    // repo's own `.carto/contracts.json`, if any — a malformed override
+    // file stops the index rather than silently classifying nothing.
+    let contract_rules = crate::contracts::ContractRules::load(repo_root)?;
+
+    Ok(resolve(extractions, &contract_rules))
 }
 
 #[cfg(test)]

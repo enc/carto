@@ -54,7 +54,7 @@ pub fn run() -> SelfcheckReport {
         git_sha: env!("CARTO_GIT_SHA"),
         min_rust_version: env!("CARGO_PKG_RUST_VERSION"),
         target_triple: env!("CARTO_TARGET_TRIPLE"),
-        grammar_mode: "native (rust, python, php, typescript, tsx, javascript, go, csharp)",
+        grammar_mode: "native (rust, python, php, typescript, tsx, javascript, go, csharp, hcl)",
         confinement,
         default_out_root,
         pathguard_denylist_digest: pathguard::denylist_digest(),

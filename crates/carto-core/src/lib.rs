@@ -3,6 +3,7 @@
 //! against. No I/O besides fs; no clap, no rmcp (spec §3.1).
 
 pub mod consts;
+pub mod contracts;
 pub mod error;
 pub mod gitinfo;
 pub mod graph;

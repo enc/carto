@@ -10,7 +10,7 @@
 //! `docs/adr/0011-python-resolution-policy-mapping.md`.
 
 use super::extractor::{
-    ExtractOut, ImportedName, LangExtractor, RawCallSite, RawImport, RawSymbol,
+    ExtractOut, ImportedName, LangExtractor, RawCallSite, RawImport, RawSymbol, RawTypeRef,
 };
 use crate::graph::SymKind;
 use crate::lang::Lang;
@@ -21,6 +21,7 @@ use tree_sitter::{Node, Parser, Query, QueryCursor};
 const SYMBOLS_QUERY: &str = include_str!("queries/python/symbols.scm");
 const IMPORTS_QUERY: &str = include_str!("queries/python/imports.scm");
 const CALLS_QUERY: &str = include_str!("queries/python/calls.scm");
+const TYPES_QUERY: &str = include_str!("queries/python/types.scm");
 
 pub struct PythonExtractor;
 
@@ -54,12 +55,14 @@ impl LangExtractor for PythonExtractor {
 
         ExtractOut {
             symbols: extract_symbols(root, src),
+            literals: Vec::new(),
             imports: extract_imports(root, src),
             call_sites: extract_call_sites(root, src),
             // Python's grammar has no node distinguishing a
             // module-qualified call from an instance call (ADR-0011) —
             // there's no separate shape to exclude, so nothing to count.
             uncaptured_call_sites: Vec::new(),
+            type_refs: extract_type_refs(root, src),
             declared_namespace: None,
         }
     }
@@ -127,11 +130,15 @@ fn extract_symbols(root: Node, src: &[u8]) -> Vec<RawSymbol> {
         }
 
         let name = text(src, name_node);
+        // ADR-0032: `owner` reuses `class_name_node` — already computed
+        // for `qualified_name` below, and exactly "the class this
+        // symbol is declared in".
+        let owner = class_name_node.map(|c| text(src, c));
         // Python's own attribute syntax ("Order.summary"), not Rust's
         // "::" — spec §4.3 leaves qualified-name spelling to the
         // extractor.
-        let qualified_name = match class_name_node {
-            Some(c) => format!("{}.{}", text(src, c), name),
+        let qualified_name = match &owner {
+            Some(c) => format!("{c}.{name}"),
             None => name.clone(),
         };
         let start_line = item_node.start_position().row as u32 + 1;
@@ -163,6 +170,7 @@ fn extract_symbols(root: Node, src: &[u8]) -> Vec<RawSymbol> {
                     end_line,
                     signature,
                     is_pub,
+                    owner,
                 },
             );
         }
@@ -335,6 +343,90 @@ fn extract_call_sites(root: Node, src: &[u8]) -> Vec<RawCallSite> {
     out
 }
 
+/// ADR-0029: every identifier `types.scm` found in a type position,
+/// walked down to head identifiers by [`collect_type_names`]. See that
+/// function and `types.scm`'s own module comment for the position
+/// list.
+fn extract_type_refs(root: Node, src: &[u8]) -> Vec<RawTypeRef> {
+    let language = carto_grammars::python_language();
+    let query = Query::new(&language, TYPES_QUERY).expect("types.scm must compile");
+    let names = query.capture_names();
+    let mut cursor = QueryCursor::new();
+
+    let mut out = Vec::new();
+    let mut matches = cursor.matches(&query, root, src);
+    while let Some(m) = matches.next() {
+        for cap in m.captures {
+            if names[cap.index as usize] == "type.pos" {
+                collect_type_names(cap.node, src, &mut out);
+            }
+        }
+    }
+    out
+}
+
+/// Descends a captured type-position subtree down to the head
+/// identifier(s) it names: `Foo`, `pkg.Foo` (rightmost segment only,
+/// via `attribute`'s own `attribute:` field — the same policy every
+/// other extractor's qualified-reference capture already applies),
+/// `dict[str, Foo]`/`list[Foo]` (in annotation position this grammar
+/// parses a subscripted generic as `generic_type (identifier)
+/// (type_parameter (type ...) (type ...))`, *not* a plain `subscript` —
+/// verified against a real parse tree, not assumed from node-types.json
+/// alone, after an initial `subscript`-only implementation silently
+/// captured nothing for this exact shape; the `subscript` arm below
+/// stays anyway as a defensive fallback for any annotation shape that
+/// does resolve to it), and a class's base list (`class Order(Base,
+/// metaclass=Meta):` — each non-keyword argument; `keyword_argument`'s
+/// own `value:` field for `metaclass=Meta`, its `name:` deliberately
+/// skipped since `metaclass` itself never names a type). A bare string
+/// annotation (`"Foo"`, a forward reference) is **silently skipped,
+/// not resolved** — Python's grammar gives it no distinguishing shape
+/// from any other string literal, and guessing that a given string is
+/// a forward reference rather than ordinary data would be exactly the
+/// kind of guess INV-8 exists to avoid; documented in the skill doc's
+/// known-gaps list alongside every other language's own unresolvable-
+/// annotation cases. Unlike C#/TS/PHP, this grammar gives a builtin
+/// type (`str`, `int`, `dict`, ...) no distinguishing node kind of its
+/// own — it's a plain `identifier`, so it's captured the same as any
+/// other name rather than filtered out (the same caveat Go's own
+/// `collect_type_names` doc comment already documents for the
+/// identical reason).
+fn collect_type_names(node: Node, src: &[u8], out: &mut Vec<RawTypeRef>) {
+    match node.kind() {
+        "identifier" => out.push(RawTypeRef {
+            name: text(src, node),
+            line: node.start_position().row as u32 + 1,
+        }),
+        "attribute" => {
+            if let Some(attr) = node.child_by_field_name("attribute") {
+                collect_type_names(attr, src, out);
+            }
+        }
+        "subscript" => {
+            if let Some(v) = node.child_by_field_name("value") {
+                collect_type_names(v, src, out);
+            }
+            let mut cursor = node.walk();
+            for arg in node.children_by_field_name("subscript", &mut cursor) {
+                collect_type_names(arg, src, out);
+            }
+        }
+        "keyword_argument" => {
+            if let Some(v) = node.child_by_field_name("value") {
+                collect_type_names(v, src, out);
+            }
+        }
+        "argument_list" | "type" | "union_type" | "generic_type" | "type_parameter" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                collect_type_names(child, src, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn text(src: &[u8], node: Node) -> String {
     text_range(src, node.start_byte(), node.end_byte())
 }
@@ -351,6 +443,90 @@ mod tests {
 
     fn extract(src: &str) -> ExtractOut {
         PythonExtractor.extract(src.as_bytes(), "test.py")
+    }
+
+    fn type_ref_names(out: &ExtractOut) -> Vec<&str> {
+        out.type_refs.iter().map(|t| t.name.as_str()).collect()
+    }
+
+    // ADR-0029: parameter/return annotations and base classes —
+    // nothing captured any of these before.
+    #[test]
+    fn extracts_type_refs_from_parameter_and_return_annotations() {
+        let out = extract("class Order:\n    pass\n\ndef take(o: Order) -> Order:\n    return o\n");
+        let names = type_ref_names(&out);
+        assert_eq!(
+            names.iter().filter(|&&n| n == "Order").count(),
+            2,
+            "parameter + return type, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn default_valued_parameter_annotation_is_captured() {
+        let out = extract("class Order:\n    pass\n\ndef take(o: Order = None):\n    pass\n");
+        assert!(type_ref_names(&out).contains(&"Order"));
+    }
+
+    #[test]
+    fn annotated_assignment_is_captured() {
+        let out = extract("class Order:\n    pass\n\nx: Order = Order()\n");
+        assert!(type_ref_names(&out).contains(&"Order"));
+    }
+
+    #[test]
+    fn base_class_list_is_captured_including_keyword_metaclass_value_only() {
+        let out = extract(
+            "class Meta:\n    pass\n\nclass Base:\n    pass\n\nclass Order(Base, metaclass=Meta):\n    pass\n",
+        );
+        let names = type_ref_names(&out);
+        assert!(names.contains(&"Base"));
+        assert!(names.contains(&"Meta"));
+        // "metaclass" itself is a keyword name, never a type.
+        assert!(!names.contains(&"metaclass"));
+    }
+
+    #[test]
+    fn qualified_attribute_annotation_yields_only_the_rightmost_segment() {
+        let out = extract("import abc\n\ndef take(x: abc.ABC):\n    pass\n");
+        assert_eq!(type_ref_names(&out), vec!["ABC"]);
+    }
+
+    #[test]
+    fn subscripted_generic_annotation_yields_head_and_every_argument() {
+        let out = extract(
+            "class Order:\n    pass\n\ndef take(x: dict[str, Order]) -> list[Order]:\n    pass\n",
+        );
+        let names = type_ref_names(&out);
+        assert!(names.contains(&"dict"));
+        assert!(names.contains(&"list"));
+        assert_eq!(names.iter().filter(|&&n| n == "Order").count(), 2);
+        // Unlike C#/TS/PHP, Python's grammar gives a builtin type
+        // (`str`, `int`, `dict`, ...) no distinguishing node kind of
+        // its own — it's a plain `identifier`, the same as any other
+        // name, so it's captured here too rather than filtered out
+        // (the same "no separate primitive_type node" caveat Go's own
+        // `collect_type_names` doc comment already documents).
+        assert!(names.contains(&"str"));
+    }
+
+    #[test]
+    fn string_forward_reference_is_not_resolved() {
+        // Documented gap (ADR-0029, user-confirmed): guessing a string
+        // literal is a forward reference rather than ordinary data
+        // would be exactly the kind of guess INV-8 forbids.
+        let out = extract("def take(x: \"Order\"):\n    pass\n");
+        assert!(type_ref_names(&out).is_empty());
+    }
+
+    #[test]
+    fn plain_function_call_argument_list_is_not_mistaken_for_a_base_class_list() {
+        // Regression guard: `argument_list` recursion is only ever
+        // reached from `class_definition`'s own `superclasses:` field
+        // (an anchored top-level pattern), never globally — an ordinary
+        // call's arguments must not be treated as type references.
+        let out = extract("class Order:\n    pass\n\ndef make():\n    return dict(Order)\n");
+        assert!(type_ref_names(&out).is_empty());
     }
 
     #[test]

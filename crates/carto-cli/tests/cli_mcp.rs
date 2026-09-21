@@ -90,7 +90,18 @@ fn serve_handshake_and_tools_list_round_trip_through_the_real_binary() {
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(names, vec!["index", "where", "deps", "map", "selfcheck"]);
+    assert_eq!(
+        names,
+        vec![
+            "index",
+            "where",
+            "deps",
+            "map",
+            "contract",
+            "orphans",
+            "selfcheck"
+        ]
+    );
 }
 
 /// `tools/call` for `where`, against a real index built by a real `carto

@@ -3,9 +3,11 @@
 //! `where`/`deps`/`map` (M1.b.3), and `serve` (the MCP stdio server,
 //! spec §7.3, mounted from `carto-mcp`) exist.
 
+mod contract_cmd;
 mod deps_cmd;
 mod index;
 mod map_cmd;
+mod orphans_cmd;
 mod selfcheck;
 mod where_cmd;
 
@@ -39,6 +41,14 @@ enum Command {
     Deps(deps_cmd::DepsArgs),
     /// Layered overview, hard-capped at --budget lines (spec §7.1).
     Map(map_cmd::MapArgs),
+    /// Every producer/consumer of a categorised literal, exact-value
+    /// matched (ADR-0026 — not spec §7.1's command set).
+    Contract(contract_cmd::ContractArgs),
+    /// Categorised literals with a `consumes` edge but no `produces`
+    /// edge, and vice versa (ADR-0026 — not spec §7.1's command set).
+    /// The acceptance-test command for the SID Cloud cross-language
+    /// contract slice.
+    Orphans(orphans_cmd::OrphansArgs),
     /// Run the MCP stdio server (spec §7.3): newline-delimited JSON-RPC
     /// on stdin/stdout, exposing `index`/`where`/`deps`/`map`/`selfcheck`
     /// as tools — the same core functions this CLI's own subcommands
@@ -87,6 +97,14 @@ fn run(cli: &Cli) -> carto_core::Result<u8> {
         Command::Map(args) => {
             let result = map_cmd::run(args)?;
             emit(cli.json, &result, || map_cmd::print_human(&result))?;
+        }
+        Command::Contract(args) => {
+            let result = contract_cmd::run(args)?;
+            emit(cli.json, &result, || contract_cmd::print_human(&result))?;
+        }
+        Command::Orphans(args) => {
+            let result = orphans_cmd::run(args)?;
+            emit(cli.json, &result, || orphans_cmd::print_human(&result))?;
         }
         Command::Serve => {
             // Own protocol, own framing — bypasses `emit`'s human/--json

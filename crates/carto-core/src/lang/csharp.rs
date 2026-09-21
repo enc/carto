@@ -21,7 +21,9 @@
 //! themselves are deliberately not extracted — see symbols.scm's own
 //! comment for why extracting them would poison exactly those edges).
 
-use super::extractor::{ExtractOut, LangExtractor, RawCallSite, RawImport, RawSymbol};
+use super::extractor::{
+    ExtractOut, LangExtractor, RawCallSite, RawImport, RawLiteral, RawSymbol, RawTypeRef,
+};
 use crate::graph::SymKind;
 use crate::lang::Lang;
 use streaming_iterator::StreamingIterator as _;
@@ -30,6 +32,7 @@ use tree_sitter::{Node, Parser, Query, QueryCursor};
 const SYMBOLS_QUERY: &str = include_str!("queries/csharp/symbols.scm");
 const IMPORTS_QUERY: &str = include_str!("queries/csharp/imports.scm");
 const CALLS_QUERY: &str = include_str!("queries/csharp/calls.scm");
+const TYPES_QUERY: &str = include_str!("queries/csharp/types.scm");
 
 pub struct CSharpExtractor;
 
@@ -72,12 +75,14 @@ impl LangExtractor for CSharpExtractor {
         let (imports, declared_namespace) = extract_imports_and_namespace(root, src);
         ExtractOut {
             symbols: extract_symbols(root, src),
+            literals: extract_literals(root, src),
             imports,
             call_sites: extract_call_sites(root, src),
             // No call shape is deliberately excluded from resolution the
             // way Rust's path-qualified calls are (ADR-0016 excludes
             // whole *symbol kinds*, not call syntax) — nothing to count.
             uncaptured_call_sites: Vec::new(),
+            type_refs: extract_type_refs(root, src),
             declared_namespace,
         }
     }
@@ -177,14 +182,17 @@ fn extract_symbols(root: Node, src: &[u8]) -> Vec<RawSymbol> {
 /// choice Go's `Order.Summary` makes; type declarations themselves stay
 /// bare, nested or not — same as every other extractor's containers).
 fn raw_symbol(item_node: Node, name: &str, sym_kind: SymKind, src: &[u8]) -> RawSymbol {
-    let qualified_name = match sym_kind {
-        SymKind::Method | SymKind::Const => match enclosing_type(item_node) {
-            Some(ty) => match ty.child_by_field_name("name") {
-                Some(ty_name) => format!("{}.{name}", text(src, ty_name)),
-                None => name.to_string(),
-            },
-            None => name.to_string(),
-        },
+    // `owner` (ADR-0032): the nearest enclosing type's bare name,
+    // computed once and reused for `qualified_name` below rather than
+    // walking `enclosing_type` twice — `Method`/`Const`'s existing
+    // `Type.Member` qualified-name spelling and the new owner-type
+    // disambiguation tier both need exactly the same lookup.
+    let owner = enclosing_type(item_node).and_then(|ty| {
+        ty.child_by_field_name("name")
+            .map(|ty_name| text(src, ty_name))
+    });
+    let qualified_name = match (sym_kind, &owner) {
+        (SymKind::Method | SymKind::Const, Some(ty_name)) => format!("{ty_name}.{name}"),
         _ => name.to_string(),
     };
     let sig_end = item_node
@@ -199,6 +207,7 @@ fn raw_symbol(item_node: Node, name: &str, sym_kind: SymKind, src: &[u8]) -> Raw
         end_line: item_node.end_position().row as u32 + 1,
         signature: text_range(src, item_node.start_byte(), sig_end),
         is_pub: is_pub(item_node, src),
+        owner,
     }
 }
 
@@ -381,6 +390,244 @@ fn extract_call_sites(root: Node, src: &[u8]) -> Vec<RawCallSite> {
         }
     }
     out
+}
+
+/// ADR-0029: every identifier `types.scm` found in a type position,
+/// walked down to head identifiers by [`collect_type_names`]. See that
+/// function and `types.scm`'s own module comment for the position list
+/// and the exclusions (no supertype-name query matching, no
+/// double-representing `new Foo()`'s own call site).
+fn extract_type_refs(root: Node, src: &[u8]) -> Vec<RawTypeRef> {
+    let language = carto_grammars::csharp_language();
+    let query = Query::new(&language, TYPES_QUERY).expect("types.scm must compile");
+    let names = query.capture_names();
+    let mut cursor = QueryCursor::new();
+
+    let mut out = Vec::new();
+    let mut matches = cursor.matches(&query, root, src);
+    while let Some(m) = matches.next() {
+        for cap in m.captures {
+            if names[cap.index as usize] == "type.pos" {
+                collect_type_names(cap.node, src, &mut out);
+            }
+        }
+    }
+    out
+}
+
+/// Descends a captured type-position subtree down to the head
+/// identifier(s) it names, recursing through every wrapper C#'s `type`
+/// supertype has (nullable/array/pointer/ref/tuple/generic) and the two
+/// non-`type` container shapes `types.scm` also captures whole
+/// (`base_list`, `primary_constructor_base_type`). A qualified name
+/// (`Acme.Orders.OrderParser`, `global::System.String`) yields only its
+/// *rightmost* segment — the same policy `calls.scm`'s member/qualified
+/// call capture already applies, so a type reference and a call to a
+/// same-named member resolve through identical name-matching semantics.
+/// `predefined_type` (`string`, `int`, ...), `implicit_type` (`var`),
+/// and `function_pointer_type` are silently skipped: a builtin has no
+/// symbol to reference, `var`'s actual type isn't syntactically present
+/// at the use site at all, and a function pointer's own component types
+/// are a rare enough shape that capturing them isn't worth the descent
+/// complexity — documented exclusions, not oversights.
+fn collect_type_names(node: Node, src: &[u8], out: &mut Vec<RawTypeRef>) {
+    match node.kind() {
+        "identifier" => out.push(RawTypeRef {
+            name: text(src, node),
+            line: node.start_position().row as u32 + 1,
+        }),
+        "qualified_name" | "alias_qualified_name" => {
+            if let Some(name) = node.child_by_field_name("name") {
+                collect_type_names(name, src, out);
+            }
+        }
+        "generic_name" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                match child.kind() {
+                    "identifier" => out.push(RawTypeRef {
+                        name: text(src, child),
+                        line: child.start_position().row as u32 + 1,
+                    }),
+                    "type_argument_list" => collect_type_names(child, src, out),
+                    _ => {}
+                }
+            }
+        }
+        "type_argument_list" | "base_list" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                collect_type_names(child, src, out);
+            }
+        }
+        "nullable_type"
+        | "array_type"
+        | "pointer_type"
+        | "ref_type"
+        | "scoped_type"
+        | "primary_constructor_base_type" => {
+            if let Some(t) = node.child_by_field_name("type") {
+                collect_type_names(t, src, out);
+            }
+        }
+        "tuple_type" => {
+            let mut cursor = node.walk();
+            for el in node
+                .named_children(&mut cursor)
+                .filter(|c| c.kind() == "tuple_element")
+            {
+                if let Some(t) = el.child_by_field_name("type") {
+                    collect_type_names(t, src, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// ADR-0026's C# side of the metric-name acceptance test: every
+/// anonymous-object member named `Name` whose value is a plain string
+/// literal (`new { Name = "X", ... }`), qualified by the literal's own
+/// *enclosing type's* `const string Namespace = "...";` if it declares
+/// one. A member whose value isn't a plain string literal (a method
+/// call, an interpolated string, …) is silently not extracted — INV-8's
+/// honesty extended to `RawLiteral` — not tracked as "uncaptured" this
+/// slice (see
+/// `docs/adr/0026-contract-node-and-produces-consumes-edges.md`'s
+/// "slice 1" scope note).
+fn extract_literals(root: Node, src: &[u8]) -> Vec<RawLiteral> {
+    let mut out = Vec::new();
+    collect_object_init_names(root, src, &mut out);
+    out
+}
+
+/// The literal's *own* enclosing type's `const string Namespace =
+/// "...";`, not the first one found anywhere in the file — a file with
+/// two metrics-exporting classes, each declaring its own `Namespace`
+/// const, must not let the first class's value leak onto the second
+/// class's emissions. `None` (no qualifier, not "search a different
+/// class") when the literal has no enclosing type at all (a top-level
+/// statement) or its enclosing type declares no such const.
+fn qualifier_for(literal_node: Node, src: &[u8]) -> Option<String> {
+    let ty = enclosing_type(literal_node)?;
+    find_own_const_field_value(ty, "Namespace", src)
+}
+
+/// Same search `find_namespace_const_value` used to do file-wide, but
+/// scoped to `scope`'s own members: recursion stops at any nested type
+/// declaration, so a nested class's own `const` field can never be
+/// mistaken for `scope`'s.
+fn find_own_const_field_value(scope: Node, want_name: &str, src: &[u8]) -> Option<String> {
+    let mut cursor = scope.walk();
+    for child in scope.children(&mut cursor) {
+        if is_type_declaration(child) {
+            continue;
+        }
+        if child.kind() == "field_declaration"
+            && modifier_texts(child, src).iter().any(|m| m == "const")
+        {
+            if let Some(v) = const_field_value(child, want_name, src) {
+                return Some(v);
+            }
+        }
+        if let Some(v) = find_own_const_field_value(child, want_name, src) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+fn is_type_declaration(node: Node) -> bool {
+    matches!(
+        node.kind(),
+        "class_declaration"
+            | "struct_declaration"
+            | "record_declaration"
+            | "interface_declaration"
+            | "enum_declaration"
+    )
+}
+
+/// The string value of a `const`-field's declarator named `want_name`
+/// (`const string DefaultStatus = "open", AltStatus = "alt";` has one
+/// declarator per name) — `None` if no declarator matches or the match
+/// isn't a plain string literal.
+fn const_field_value(field: Node, want_name: &str, src: &[u8]) -> Option<String> {
+    let mut outer = field.walk();
+    for decl in field
+        .children(&mut outer)
+        .filter(|c| c.kind() == "variable_declaration")
+    {
+        let mut inner = decl.walk();
+        for declarator in decl
+            .children(&mut inner)
+            .filter(|c| c.kind() == "variable_declarator")
+        {
+            let Some(name_node) = declarator.child_by_field_name("name") else {
+                continue;
+            };
+            if text(src, name_node) != want_name {
+                continue;
+            }
+            let mut dcursor = declarator.walk();
+            if let Some(value_node) = declarator
+                .children(&mut dcursor)
+                .find(|c| c.kind() == "string_literal")
+            {
+                return Some(string_literal_text(value_node, src));
+            }
+        }
+    }
+    None
+}
+
+/// `anonymous_object_creation_expression`'s children are a flat,
+/// alternating `(identifier, expression)*` list — no wrapping "member
+/// declarator" node in this grammar (verified empirically) — so pairing
+/// consecutive named children is exact, not a heuristic. The qualifier
+/// is looked up fresh per literal (`qualifier_for`), not threaded down
+/// from a single whole-file computation — two classes in one file, each
+/// with their own `Namespace` const, must get their own qualifier.
+fn collect_object_init_names(node: Node, src: &[u8], out: &mut Vec<RawLiteral>) {
+    if node.kind() == "anonymous_object_creation_expression" {
+        let qualifier = qualifier_for(node, src);
+        let mut cursor = node.walk();
+        let members: Vec<Node> = node
+            .children(&mut cursor)
+            .filter(|c| c.is_named())
+            .collect();
+        let mut i = 0;
+        while i + 1 < members.len() {
+            let name_node = members[i];
+            let value_node = members[i + 1];
+            if name_node.kind() == "identifier"
+                && text(src, name_node) == "Name"
+                && value_node.kind() == "string_literal"
+            {
+                out.push(RawLiteral {
+                    position: "object-init:Name".to_string(),
+                    value: string_literal_text(value_node, src),
+                    qualifier: qualifier.clone(),
+                    line: value_node.start_position().row as u32 + 1,
+                });
+            }
+            i += 2;
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_object_init_names(child, src, out);
+    }
+}
+
+/// A `string_literal` node's inner text (its `string_literal_content`
+/// child) — empty string for `""` (no content child at all).
+fn string_literal_text(node: Node, src: &[u8]) -> String {
+    let mut cursor = node.walk();
+    node.children(&mut cursor)
+        .find(|c| c.kind() == "string_literal_content")
+        .map(|n| text(src, n))
+        .unwrap_or_default()
 }
 
 fn text(src: &[u8], node: Node) -> String {
@@ -622,5 +869,195 @@ mod tests {
             .map(|c| c.callee_name.as_str())
             .collect();
         assert_eq!(names, vec!["Order", "OrderParser", "List"]);
+    }
+
+    #[test]
+    fn anonymous_object_name_member_is_a_literal_qualified_by_the_files_namespace_const() {
+        let out = extract(
+            "public class EmfMetricsExportService\n{\n    private const string Namespace = \"SIDCloud/Ingest\";\n\n    public void Emit()\n    {\n        var m = new { Name = \"QuoteDropsPerSecond\", Unit = \"Count/Second\" };\n    }\n}\n",
+        );
+        assert_eq!(out.literals.len(), 1);
+        let lit = &out.literals[0];
+        assert_eq!(lit.position, "object-init:Name");
+        assert_eq!(lit.value, "QuoteDropsPerSecond");
+        assert_eq!(lit.qualifier.as_deref(), Some("SIDCloud/Ingest"));
+    }
+
+    #[test]
+    fn computed_name_member_is_not_extracted() {
+        let out = extract(
+            "public class EmfMetricsExportService\n{\n    public void Emit()\n    {\n        var m = new { Name = ComputeName(), Unit = \"Count/Second\" };\n    }\n}\n",
+        );
+        assert!(out.literals.is_empty());
+    }
+
+    #[test]
+    fn no_namespace_const_leaves_qualifier_none() {
+        let out = extract(
+            "public class Service\n{\n    public void Emit()\n    {\n        var m = new { Name = \"Plain\" };\n    }\n}\n",
+        );
+        assert_eq!(out.literals.len(), 1);
+        assert_eq!(out.literals[0].qualifier, None);
+    }
+
+    /// Regression guard: a file with two metrics-exporting classes, each
+    /// declaring its own `Namespace` const, must not let the first
+    /// class's value leak onto the second class's emissions — a bug the
+    /// original whole-file "first Namespace const wins" search had.
+    #[test]
+    fn qualifier_does_not_leak_across_classes_in_the_same_file() {
+        let out = extract(
+            "public class EmfMetricsExportService\n{\n    private const string Namespace = \"SIDCloud/Ingest\";\n    public void Emit() { var a = new { Name = \"Errors\" }; }\n}\n\npublic class LegacyMetricsExportService\n{\n    private const string Namespace = \"SIDCloud/Legacy\";\n    public void Emit() { var b = new { Name = \"Errors\" }; }\n}\n",
+        );
+        assert_eq!(out.literals.len(), 2);
+        assert_eq!(
+            out.literals[0].qualifier.as_deref(),
+            Some("SIDCloud/Ingest")
+        );
+        assert_eq!(
+            out.literals[1].qualifier.as_deref(),
+            Some("SIDCloud/Legacy")
+        );
+    }
+
+    /// A nested class's own `Namespace` const must not be mistaken for
+    /// its containing class's qualifier, or vice versa.
+    #[test]
+    fn nested_class_namespace_const_does_not_leak_to_the_outer_class() {
+        let out = extract(
+            "public class Outer\n{\n    private const string Namespace = \"Outer/NS\";\n\n    public class Inner\n    {\n        private const string Namespace = \"Inner/NS\";\n        public void Emit() { var a = new { Name = \"InnerMetric\" }; }\n    }\n\n    public void Emit() { var b = new { Name = \"OuterMetric\" }; }\n}\n",
+        );
+        let inner = out
+            .literals
+            .iter()
+            .find(|l| l.value == "InnerMetric")
+            .unwrap();
+        let outer = out
+            .literals
+            .iter()
+            .find(|l| l.value == "OuterMetric")
+            .unwrap();
+        assert_eq!(inner.qualifier.as_deref(), Some("Inner/NS"));
+        assert_eq!(outer.qualifier.as_deref(), Some("Outer/NS"));
+    }
+
+    // ADR-0029: the reported-bug reproduction — an interface referenced
+    // only via a base clause, a field declaration, a constructor
+    // parameter, and a generic type argument, none of which produced
+    // any edge before this (calls.scm never looked at a type
+    // position). `type_names` collects every emitted name so each
+    // assertion below is a single positive check, not four fragile
+    // index lookups into extraction order.
+    #[test]
+    fn extracts_type_refs_from_base_clause_field_parameter_and_generic_argument() {
+        let out = extract(
+            "public interface IQueryJobStore { }\n\npublic sealed class QueryJobService : IQueryJobStore\n{\n    private readonly IQueryJobStore _store;\n\n    public QueryJobService(IQueryJobStore store)\n    {\n        _store = store;\n    }\n\n    public Dictionary<string, IQueryJobStore> Map()\n    {\n        return null;\n    }\n}\n",
+        );
+        let names: Vec<&str> = out.type_refs.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(
+            names.iter().filter(|&&n| n == "IQueryJobStore").count(),
+            4,
+            "base clause + field + parameter + generic argument, got {names:?}"
+        );
+        assert!(names.contains(&"Dictionary"), "{names:?}");
+        // `string` is `predefined_type` — no symbol to reference, must
+        // not appear at all.
+        assert!(!names.contains(&"string"), "{names:?}");
+    }
+
+    #[test]
+    fn generic_invocation_and_object_creation_arguments_are_captured() {
+        let out = extract(
+            "public class Registrar\n{\n    public void Configure()\n    {\n        Services.AddSingleton<IQueryJobStore, QueryJobStore>();\n        var map = new Dictionary<string, IQueryJobStore>();\n    }\n}\n",
+        );
+        let names: Vec<&str> = out.type_refs.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(
+            names.iter().filter(|&&n| n == "IQueryJobStore").count(),
+            2,
+            "one from AddSingleton's type args, one from the Dictionary literal, got {names:?}"
+        );
+        assert!(names.contains(&"QueryJobStore"));
+        // `Dictionary` itself is NOT expected here: `new Dictionary<...>()`'s
+        // own type head is `calls.scm`'s territory (a constructor call),
+        // not `types.scm`'s — see
+        // `new_foo_is_a_call_site_only_not_also_a_type_reference` for the
+        // same exclusion on the simpler non-generic case.
+        assert!(out.call_sites.iter().any(|c| c.callee_name == "Dictionary"));
+        assert!(!names.contains(&"Dictionary"));
+    }
+
+    #[test]
+    fn new_foo_is_a_call_site_only_not_also_a_type_reference() {
+        // Regression guard for types.scm's own stated exclusion:
+        // object_creation_expression's plain (non-generic) type head
+        // must not be double-represented as both a `calls` site and a
+        // type ref.
+        let out = extract(
+            "public class Order { }\n\npublic class Factory\n{\n    public object Make()\n    {\n        return new Order();\n    }\n}\n",
+        );
+        assert!(out.call_sites.iter().any(|c| c.callee_name == "Order"));
+        assert!(!out.type_refs.iter().any(|t| t.name == "Order"));
+    }
+
+    #[test]
+    fn base_predefined_and_implicit_types_are_not_captured() {
+        let out = extract(
+            "public class Widget\n{\n    private int _count;\n    public void Run()\n    {\n        var x = 1;\n    }\n}\n",
+        );
+        let names: Vec<&str> = out.type_refs.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.is_empty(), "{names:?}");
+    }
+
+    #[test]
+    fn cast_typeof_as_and_catch_positions_are_captured() {
+        let out = extract(
+            "public class Worker\n{\n    public void Run(object o)\n    {\n        var t = typeof(IQueryJobStore);\n        var x = (IQueryJobStore)o;\n        var y = o as IQueryJobStore;\n        try { }\n        catch (System.Exception e) { }\n    }\n}\n",
+        );
+        let names: Vec<&str> = out.type_refs.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(
+            names.iter().filter(|&&n| n == "IQueryJobStore").count(),
+            3,
+            "typeof + cast + as, got {names:?}"
+        );
+        assert!(names.contains(&"Exception"));
+    }
+
+    #[test]
+    fn non_name_members_are_not_extracted() {
+        let out = extract(
+            "public class Service\n{\n    public void Emit()\n    {\n        var m = new { Unit = \"Count/Second\" };\n    }\n}\n",
+        );
+        assert!(out.literals.is_empty());
+    }
+
+    /// ADR-0031's regression-anchor test: proves the extractor was
+    /// never the bug. A C# 9+ top-level-statements file (no `Main`
+    /// method, no enclosing class for the statement itself — real
+    /// ASP.NET Core minimal-API `Program.cs` style) still yields a
+    /// correctly-lined `RawCallSite`/`RawTypeRef` for a generic DI-
+    /// registration-shaped invocation; tree-sitter queries match
+    /// anywhere in the tree regardless of containing scope. The actual
+    /// gap (an item with no *enclosing symbol* to attribute it to being
+    /// silently dropped) lives entirely in `resolve.rs`'s attachment
+    /// step, covered separately by `resolve.rs`'s own
+    /// `unattached_call_resolves_at_file_scope`/
+    /// `unattached_type_ref_resolves_at_file_scope`.
+    #[test]
+    fn top_level_statement_invocation_is_extracted_like_any_other() {
+        let out = extract(
+            "Registrar.Register<IQueryJobStore, QueryJobService>();\n\npublic static class Registrar\n{\n    public static void Register<TService, TImplementation>()\n    {\n    }\n}\n",
+        );
+        assert!(out.call_sites.iter().any(|c| c.callee_name == "Register"));
+        let type_names: Vec<&str> = out.type_refs.iter().map(|t| t.name.as_str()).collect();
+        assert!(type_names.contains(&"IQueryJobStore"));
+        assert!(type_names.contains(&"QueryJobService"));
+        // No symbol in this file contains line 1 — proving the
+        // top-level statement really does sit outside every symbol's
+        // range, the precondition `resolve.rs`'s fix depends on.
+        assert!(
+            out.symbols
+                .iter()
+                .all(|s| !(s.start_line <= 1 && 1 <= s.end_line))
+        );
     }
 }

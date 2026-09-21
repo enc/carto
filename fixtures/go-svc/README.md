@@ -23,6 +23,7 @@ directory-shaped import paths (`RawImport::PackagePath`):
 | `main` calling `orders.ParseOrder` (`cmd/server/main.go`) | resolution tier (c) again, across the `cmd/server` / `internal/orders` directory boundary |
 | `main` calling `fmt.Println` | a real call-site that never resolves — no symbol carto sees is named `Println` — lands in `main`'s `unresolved_calls`, same honesty principle as every other fixture's stdlib-call case |
 | `main` calling `unknownExternalCall()` | the deliberate honesty-path case: no candidate anywhere ⇒ no edge, `unresolved_calls` |
+| `ParseOrder`'s own `*Order` return type, and `Summary`'s own `*Order` receiver | ADR-0029's `references` edges: `parameter_declaration`'s `type:` field is captured *unanchored* (matches anywhere, including a method's own `receiver:` parameter list) — both resolve tier (a) same-file, `EdgeKind::References`, evidence `type-reference:same-file` |
 
 Verify with:
 

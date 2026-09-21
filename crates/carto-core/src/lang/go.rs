@@ -12,7 +12,7 @@
 //! visibility boundary is the directory, not the file) — is recorded in
 //! `docs/adr/0015-go-resolution-policy-mapping.md`.
 
-use super::extractor::{ExtractOut, LangExtractor, RawCallSite, RawImport, RawSymbol};
+use super::extractor::{ExtractOut, LangExtractor, RawCallSite, RawImport, RawSymbol, RawTypeRef};
 use crate::graph::SymKind;
 use crate::lang::Lang;
 use streaming_iterator::StreamingIterator as _;
@@ -21,6 +21,7 @@ use tree_sitter::{Node, Parser, Query, QueryCursor};
 const SYMBOLS_QUERY: &str = include_str!("queries/go/symbols.scm");
 const IMPORTS_QUERY: &str = include_str!("queries/go/imports.scm");
 const CALLS_QUERY: &str = include_str!("queries/go/calls.scm");
+const TYPES_QUERY: &str = include_str!("queries/go/types.scm");
 
 pub struct GoExtractor;
 
@@ -58,6 +59,7 @@ impl LangExtractor for GoExtractor {
 
         ExtractOut {
             symbols: extract_symbols(root, src),
+            literals: Vec::new(),
             imports: extract_imports(root, src),
             call_sites: extract_call_sites(root, src),
             // Go's selector calls (`pkg.Func()`) are captured, with only
@@ -65,6 +67,7 @@ impl LangExtractor for GoExtractor {
             // itself isn't excluded from resolution, so nothing to
             // count here.
             uncaptured_call_sites: Vec::new(),
+            type_refs: extract_type_refs(root, src),
             // Go has no namespace/FQN model (PHP-only, ADR-0012) — package
             // membership is directory-based, handled entirely by
             // `package_scope_is_directory` + `resolve`'s tier (a′), not
@@ -123,16 +126,20 @@ fn extract_symbols(root: Node, src: &[u8]) -> Vec<RawSymbol> {
         };
 
         let name = text(src, name_node);
-        let qualified_name = match sym_kind {
+        // ADR-0032: `owner` is the receiver type name, only meaningful
+        // for a method — Go has no other symbol kind with an owning
+        // type (a `type_spec` is the type itself, not owned by one).
+        let owner = match sym_kind {
+            SymKind::Method => receiver_type_name(item_node, src),
+            _ => None,
+        };
+        let qualified_name = match &owner {
             // Go's own selector spelling (`Order.Summary`), the same
             // separator Go source itself uses to call a method value —
             // distinct from Rust's/PHP's "::", spec §4.3 leaves
             // qualified-name spelling to the extractor.
-            SymKind::Method => match receiver_type_name(item_node, src) {
-                Some(recv) => format!("{recv}.{name}"),
-                None => name.clone(),
-            },
-            _ => name.clone(),
+            Some(recv) => format!("{recv}.{name}"),
+            None => name.clone(),
         };
         let start_line = item_node.start_position().row as u32 + 1;
         let end_line = item_node.end_position().row as u32 + 1;
@@ -154,6 +161,7 @@ fn extract_symbols(root: Node, src: &[u8]) -> Vec<RawSymbol> {
             end_line,
             signature,
             is_pub,
+            owner,
         });
     }
     out
@@ -268,6 +276,103 @@ fn extract_call_sites(root: Node, src: &[u8]) -> Vec<RawCallSite> {
     out
 }
 
+/// ADR-0029: every identifier `types.scm` found in a type position,
+/// walked down to head identifiers by [`collect_type_names`]. See that
+/// function and `types.scm`'s own module comment for the position list
+/// and the deliberate no-recursion cases that avoid double-counting a
+/// node two different global patterns could otherwise both reach.
+fn extract_type_refs(root: Node, src: &[u8]) -> Vec<RawTypeRef> {
+    let language = carto_grammars::go_language();
+    let query = Query::new(&language, TYPES_QUERY).expect("types.scm must compile");
+    let names = query.capture_names();
+    let mut cursor = QueryCursor::new();
+
+    let mut out = Vec::new();
+    let mut matches = cursor.matches(&query, root, src);
+    while let Some(m) = matches.next() {
+        for cap in m.captures {
+            if names[cap.index as usize] == "type.pos" {
+                collect_type_names(cap.node, src, &mut out);
+            }
+        }
+    }
+    out
+}
+
+/// Descends a captured type-position subtree down to the head
+/// identifier(s) it names, recursing through every wrapper Go's hidden
+/// `_type`/`_simple_type` supertypes have (pointer/slice/array/map/
+/// channel/generic) and the two container shapes `types.scm` captures
+/// whole (`type_arguments`, an embedding interface's own `type_elem`).
+/// A package-qualified type (`pkg.Type`) yields only its type name,
+/// the qualifier discarded — the same rightmost-identifier policy
+/// `calls.scm`'s own selector capture already applies to
+/// `pkg.Func(...)`, so a type reference and a call resolve through
+/// identical name-matching semantics. `struct_type`, `interface_type`,
+/// and `function_type` are deliberately **not** recursed into at
+/// all — see `types.scm`'s own module comment for why (their
+/// `field_declaration`/`type_elem` children are always independently,
+/// globally captured already; recursing here too would double-count
+/// them), and Go's builtin type names (`int`, `string`, `bool`, ...)
+/// parse as plain `type_identifier`s with no distinguishing node kind
+/// this grammar exposes, so — unlike every other language's dedicated
+/// `predefined_type`/`primitive_type` node — they're captured the same
+/// as any other bare name rather than filtered out.
+fn collect_type_names(node: Node, src: &[u8], out: &mut Vec<RawTypeRef>) {
+    match node.kind() {
+        "type_identifier" => out.push(RawTypeRef {
+            name: text(src, node),
+            line: node.start_position().row as u32 + 1,
+        }),
+        "qualified_type" => {
+            if let Some(name) = node.child_by_field_name("name") {
+                collect_type_names(name, src, out);
+            }
+        }
+        "generic_type" => {
+            if let Some(t) = node.child_by_field_name("type") {
+                collect_type_names(t, src, out);
+            }
+            if let Some(args) = node.child_by_field_name("type_arguments") {
+                collect_type_names(args, src, out);
+            }
+        }
+        "slice_type" | "array_type" => {
+            if let Some(t) = node.child_by_field_name("element") {
+                collect_type_names(t, src, out);
+            }
+        }
+        "map_type" => {
+            if let Some(t) = node.child_by_field_name("key") {
+                collect_type_names(t, src, out);
+            }
+            if let Some(t) = node.child_by_field_name("value") {
+                collect_type_names(t, src, out);
+            }
+        }
+        "channel_type" => {
+            if let Some(t) = node.child_by_field_name("value") {
+                collect_type_names(t, src, out);
+            }
+        }
+        // Deliberate no-op: a named multiple-return-value list
+        // (`func f() (a int, b string)`) is a `parameter_list` of
+        // `parameter_declaration`s, already reached — independently,
+        // globally — by `types.scm`'s own unanchored
+        // `parameter_declaration` pattern. Recursing here too would
+        // double-count every named return type (see `types.scm`'s
+        // module comment).
+        "parameter_list" => {}
+        "pointer_type" | "negated_type" | "parenthesized_type" | "type_elem" | "type_arguments" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                collect_type_names(child, src, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn text(src: &[u8], node: Node) -> String {
     text_range(src, node.start_byte(), node.end_byte())
 }
@@ -288,6 +393,116 @@ mod tests {
 
     fn go(body: &str) -> String {
         format!("package main\n\n{body}")
+    }
+
+    fn type_ref_names(out: &ExtractOut) -> Vec<&str> {
+        out.type_refs.iter().map(|t| t.name.as_str()).collect()
+    }
+
+    // ADR-0029: struct field, embedded-interface-as-field, parameter,
+    // and result types — nothing captured any of these before.
+    #[test]
+    fn extracts_type_refs_from_field_parameter_and_result_positions() {
+        let out = extract(&go(
+            "type Order struct {\n\tID string\n}\n\ntype Handler struct {\n\tOrder Order\n}\n\nfunc Make() Order {\n\treturn Order{}\n}\n\nfunc Take(o Order) {}\n",
+        ));
+        let names = type_ref_names(&out);
+        assert_eq!(
+            names.iter().filter(|&&n| n == "Order").count(),
+            4,
+            "field + result type + parameter + the composite literal in Make's body, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn named_multiple_return_values_are_captured_exactly_once() {
+        // The double-match risk types.scm's own comment calls out:
+        // `result:` captures the whole parameter_list, but its
+        // parameter_declaration children are already globally
+        // captured — must not be counted twice.
+        let out = extract(&go(
+            "type Order struct{}\n\nfunc Split() (a Order, b Order) {\n\treturn Order{}, Order{}\n}\n",
+        ));
+        let names = type_ref_names(&out);
+        assert_eq!(
+            names.iter().filter(|&&n| n == "Order").count(),
+            4,
+            "two named return types + two composite literals in the body, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn method_receiver_type_is_not_captured_as_a_type_ref() {
+        // The receiver's own type is read directly via
+        // `child_by_field_name` for symbol qualification (go.rs's own
+        // module doc), not through a `parameter_declaration` — Go
+        // parses `receiver: (parameter_list (parameter_declaration
+        // type: ...))`, so this actually verifies it *is* captured
+        // (parameter_declaration's `type:` is unanchored/global) and
+        // resolves like any other reference, not that it's excluded.
+        let out = extract(&go(
+            "type Order struct{}\n\nfunc (o Order) Summary() string {\n\treturn \"\"\n}\n",
+        ));
+        let names = type_ref_names(&out);
+        assert!(names.contains(&"Order"));
+    }
+
+    #[test]
+    fn pointer_slice_map_and_generic_wrappers_recurse_to_the_element_type() {
+        let out = extract(&go(
+            "type Order struct{}\n\nfunc Take(a *Order, b []Order, c map[string]Order) {}\n",
+        ));
+        let names = type_ref_names(&out);
+        assert_eq!(names.iter().filter(|&&n| n == "Order").count(), 3);
+    }
+
+    #[test]
+    fn qualified_package_type_yields_only_the_type_name() {
+        let out = extract(&go("import \"io\"\n\nfunc Take(r io.Reader) {}\n"));
+        let names = type_ref_names(&out);
+        assert_eq!(names, vec!["Reader"]);
+    }
+
+    #[test]
+    fn var_const_and_composite_literal_types_are_captured() {
+        let out = extract(&go(
+            "type Order struct{}\n\nvar shared Order\nconst zero Order = Order{}\n\nfunc make() Order {\n\treturn Order{}\n}\n",
+        ));
+        let names = type_ref_names(&out);
+        // var + const + two composite literals (`zero`'s initializer
+        // and `make`'s return) + the const/var declarations' own type
+        // annotations — every occurrence should resolve to `Order`.
+        assert!(names.iter().filter(|&&n| n == "Order").count() >= 4);
+    }
+
+    #[test]
+    fn type_assertion_and_conversion_are_captured() {
+        let out = extract(&go(
+            "type Order struct{}\n\nfunc take(x interface{}) {\n\t_ = x.(Order)\n\t_ = []byte(\"s\")\n}\n",
+        ));
+        let names = type_ref_names(&out);
+        assert!(names.contains(&"Order"));
+    }
+
+    #[test]
+    fn embedded_interface_is_captured_without_double_counting_generic_arguments() {
+        // Interface composition (`type Foo interface { Bar }`) must be
+        // captured once; a generic type's own argument list
+        // (`Container[Order]`) reaches `type_elem` through a different
+        // path (`generic_type`'s `type_arguments`) and must not also be
+        // matched by the interface-embedding pattern — the exact
+        // collision `types.scm`'s own comment documents avoiding.
+        let out = extract(&go(
+            "type Bar interface{}\n\ntype Foo interface {\n\tBar\n}\n\ntype Order struct{}\ntype Container[T any] struct{ V T }\n\nfunc take(c Container[Order]) {}\n",
+        ));
+        let names = type_ref_names(&out);
+        assert_eq!(names.iter().filter(|&&n| n == "Bar").count(), 1);
+        assert_eq!(
+            names.iter().filter(|&&n| n == "Order").count(),
+            1,
+            "{names:?}"
+        );
+        assert!(names.contains(&"Container"));
     }
 
     #[test]

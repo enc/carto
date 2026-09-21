@@ -16,6 +16,8 @@ records the interpretation decisions this exercises):
 | `handle` calling `order.summary()` (no `use`, `pub` in another file) | resolution tier (c) again, via the `field_expression`/method-call capture path rather than a plain identifier call |
 | `validate` calling `input.is_empty()` | a real call-site that never resolves — `&str::is_empty` isn't a symbol carto ever sees, so it lands in `validate`'s `unresolved_calls`. Expected, not a bug: spec §5.3's name-based matching has no type information, so stdlib/external method calls are indistinguishable from unresolved user calls (INV-8: honest, not guessed) |
 | `handle` calling `unknown_external_call()` | the deliberate honesty-path case: no candidate anywhere ⇒ no edge, recorded in `handle`'s `unresolved_calls` |
+| `parse_order`'s own `-> Order` return type | ADR-0029's `references` edge: a type position, resolved cross-file via tier (a) same-file (`Order` is declared in this same file) — `EdgeKind::References`, evidence `type-reference:same-file` |
+| `impl Order { ... }`'s own Self type | ADR-0031's file-scope fallback: an `impl` block is never itself a symbol (its methods' own ranges start *below* the `impl Order {` line), so this type ref sits outside every symbol's range — resolves as a `references` edge from the **File** node (`src/orders.rs`), not a Symbol, same tier (a) same-file |
 
 Verify with:
 

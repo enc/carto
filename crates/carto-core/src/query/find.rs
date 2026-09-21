@@ -138,7 +138,10 @@ pub fn run(qg: &QueryGraph, query: &FindQuery) -> FindResult {
                     external: m.external,
                 });
             }
-            NodeData::File(_) => {}
+            // Contract nodes have their own lookup surface (`carto
+            // contract`/`orphans`, ADR-0026) rather than folding into
+            // `where`'s symbol/module matching.
+            NodeData::File(_) | NodeData::Contract(_) => {}
         }
     }
 
@@ -210,6 +213,9 @@ mod tests {
                     signature: None,
                     unresolved_calls: vec![],
                     uncaptured_inbound_calls: 0,
+                    uncaptured_outbound_calls: 0,
+                    unresolved_inbound_calls: vec![],
+                    unresolved_inbound_call_count: 0,
                 },
             ));
         }
@@ -265,6 +271,9 @@ mod tests {
                 signature: None,
                 unresolved_calls: vec![],
                 uncaptured_inbound_calls: 0,
+                uncaptured_outbound_calls: 0,
+                unresolved_inbound_calls: vec![],
+                unresolved_inbound_call_count: 0,
             },
         );
         let dead_sym = Node::symbol(
@@ -280,6 +289,9 @@ mod tests {
                 signature: None,
                 unresolved_calls: vec![],
                 uncaptured_inbound_calls: 0,
+                uncaptured_outbound_calls: 0,
+                unresolved_inbound_calls: vec![],
+                unresolved_inbound_call_count: 0,
             },
         );
         GraphDocument {

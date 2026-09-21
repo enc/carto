@@ -38,6 +38,18 @@ pub struct RawSymbol {
     /// private same-file call is ordinary and Rust itself wouldn't
     /// compile a private cross-file one anyway.
     pub is_pub: bool,
+    /// The bare name of the type/class/struct this symbol is declared
+    /// in — `None` at top level (a free function, or the type
+    /// declaration itself). Explicit rather than parsed back out of
+    /// `qualified_name` for the same reason `qualified_name` itself is
+    /// explicit: only the extractor knows how to compute it for its
+    /// language. Feeds `resolve`'s owner-type disambiguation tier
+    /// (ADR-0032) — when a bare callee/type name has more than one
+    /// same-named candidate repo-wide (an interface method and its
+    /// implementation both named `Save`, say), the candidate whose
+    /// owner the caller actually names in a type position (via
+    /// `RawTypeRef`) is preferred over leaving the call unresolved.
+    pub owner: Option<String>,
 }
 
 /// One name brought into scope by an import — the identifier a call
@@ -182,6 +194,28 @@ pub enum RawImport {
     /// makes *all* of the namespace's types visible — the aliased form
     /// `using F = X.Y.Z;` is different, and maps to `Qualified`).
     NamespaceImport { path: String },
+    /// A Rust fully-qualified-path reference with **no** `use`/`mod`
+    /// bringing it into scope at all (`carto_core::Result<u8>` needs no
+    /// `use carto_core;` — valid since Rust 2018) — ADR-0024. Unlike
+    /// every other variant, this is **heuristic, not a verified
+    /// declaration**: `root` is only kept when (a) it isn't inside a
+    /// `use_declaration` already (that's `Absolute`'s job), (b) it
+    /// isn't a `call_expression`'s own callee (`Type::method()`'s exact
+    /// shape, ADR-0008's existing exclusion — capturing it here would
+    /// reintroduce the ambiguity that exclusion exists to avoid), and
+    /// (c) the root starts lowercase, matching Rust's crate-naming
+    /// convention (crates.io itself nudges snake_case; types/traits/
+    /// generic parameters are conventionally PascalCase) — the only
+    /// signal available to tell a plausible crate name apart from a
+    /// local `Type::associated_item` path without cross-referencing the
+    /// whole symbol table. `resolve` classifies it exactly like
+    /// `Absolute` (`known_modules`/`crate`/`self`/`super` internal
+    /// check, dedup-by-root external `Module` node) but with a
+    /// distinct evidence string, so a caller can tell a verified `use`
+    /// declaration apart from this naming-convention heuristic. No
+    /// `imported_names` — a bare reference binds no local name, so it
+    /// can never feed call-resolution tier (b) either.
+    BareReference { root: String },
 }
 
 /// A call expression's callee, before resolution. `line` locates it for
@@ -194,6 +228,51 @@ pub struct RawCallSite {
     pub line: u32,
 }
 
+/// One identifier appearing in a *type position* — a field or
+/// parameter type, a return type, a base/implements/extends clause, a
+/// generic type argument (ADR-0029). Distinct from [`RawCallSite`]:
+/// referencing a type is not invoking it, so this feeds an
+/// `EdgeKind::References` edge, never a `calls` edge, though it goes
+/// through the exact same name-resolution tiers in `resolve`. Added to
+/// close a real gap the calls-only model left: nothing in any
+/// extractor captured `private readonly IFoo _foo;` or
+/// `class Impl : IFoo` at all, so `deps IFoo --dir in` could only ever
+/// answer from the `imports` edge's file-level granularity — accurate,
+/// but far too coarse for "who actually uses this type" in a namespace/
+/// module holding more than one exported name.
+pub struct RawTypeRef {
+    pub name: String,
+    /// 1-based.
+    pub line: u32,
+}
+
+/// One string literal an extractor recognized as sitting in a
+/// contract-relevant position — ADR-0026/0027, not spec vocabulary. The
+/// extractor decides *where* it looked (`position`, e.g. `"object-init:
+/// Name"` for a C# anonymous-object member, `"aws_cloudwatch_metric_
+/// alarm.metric_name"` for an HCL attribute); `.carto/contracts.json`
+/// (built-in defaults + repo overrides, `crate::contracts`) decides what
+/// that position *means* (category, producer/consumer role, confidence)
+/// — kept out of the extractor so a repo can extend the vocabulary
+/// without touching extraction code. `qualifier`, when the extractor's
+/// language has one for this position (a C# metric's `Namespace` const,
+/// an HCL alarm's sibling `namespace` attribute), disambiguates
+/// same-spelled values in different scopes; deriving it is a per-
+/// language mechanical concern, same as `position` itself, not
+/// something the config file expresses (a scope narrower than the
+/// original design's fully declarative qualifier rules — see ADR-0026's
+/// "slice 1" note). An extractor emits nothing at all (no `RawLiteral`)
+/// for a value it can't reduce to a plain string (interpolated HCL,
+/// computed C#) — INV-8's honesty extended to this new node kind: no
+/// value beats a guessed one.
+pub struct RawLiteral {
+    pub position: String,
+    pub value: String,
+    pub qualifier: Option<String>,
+    /// 1-based.
+    pub line: u32,
+}
+
 /// One file's raw extraction output (spec §5.2: "symbols, imports,
 /// call-sites").
 #[derive(Default)]
@@ -201,6 +280,10 @@ pub struct ExtractOut {
     pub symbols: Vec<RawSymbol>,
     pub imports: Vec<RawImport>,
     pub call_sites: Vec<RawCallSite>,
+    /// String literals this extractor recognized in a contract-relevant
+    /// position (ADR-0026). Empty for every extractor that doesn't look
+    /// for any — today, every extractor except C#'s and HCL's.
+    pub literals: Vec<RawLiteral>,
     /// Call sites this extractor recognizes but deliberately never
     /// attempts to resolve — Rust's path-qualified `Type::method()`/
     /// `module::func()` (ADR-0008) is the only producer today. Carried
@@ -211,6 +294,15 @@ pub struct ExtractOut {
     /// land in a symbol's `unresolved_calls`; a call site belongs to
     /// exactly one of the two lists, never both.
     pub uncaptured_call_sites: Vec<RawCallSite>,
+    /// Identifiers this extractor found in a type position (ADR-0029).
+    /// Empty for an extractor that doesn't look for any yet. Unlike
+    /// `uncaptured_call_sites`, there is no "attempted but excluded"
+    /// counterpart for type refs — a name that doesn't resolve is
+    /// silently dropped in `resolve` (see `RawTypeRef`'s own doc
+    /// comment): overwhelmingly stdlib/BCL/third-party noise (`Task`,
+    /// `string`, `ILogger`), not a signal worth a counter the way an
+    /// unresolved call is.
+    pub type_refs: Vec<RawTypeRef>,
     /// The file's declared namespace, PHP's `namespace App\Orders;`
     /// (ADR-0012) — `None` for a file with no namespace declaration
     /// (PHP's global namespace) and always `None` for Rust/Python, which

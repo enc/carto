@@ -129,6 +129,19 @@ fn extracts_every_expected_symbol_with_correct_sym_kind() {
         ("AuditLog", "class"),
         ("Record", "method"),
         ("Flush", "method"),
+        ("IQueryJobStore", "interface"),
+        ("Save", "method"), // the interface's own declaration — the first Save
+        ("InMemoryQueryJobStore", "class"),
+        ("Save", "method"), // InMemoryQueryJobStore's implementation — the second Save declaration (ADR-0032's acceptance case)
+        ("IPresignedUrlProvider", "interface"),
+        ("Sign", "method"), // the interface's own declaration
+        ("QueryJobService", "class"),
+        ("CancelQuery", "method"),
+        ("S3PresignedUrlProvider", "class"),
+        ("Sign", "method"), // S3PresignedUrlProvider's implementation — a second, distinct symbol sharing the interface member's name, same as any real interface implementation
+        ("Registrar", "class"),
+        ("Register", "method"),
+        ("RegisterQueryJobStore", "method"),
     ];
     for (name, sym_kind) in expected {
         let sym = symbol_named(&graph, name);
@@ -224,6 +237,165 @@ fn namespace_using_fans_out_to_every_file_declaring_the_namespace() {
         .collect();
     assert!(targets.contains(&"Orders/Order.cs".to_string()));
     assert!(targets.contains(&"Orders/OrderParser.cs".to_string()));
+}
+
+/// ADR-0029's acceptance test, at the CLI/JSON level: the field-report
+/// reproduction. `Services/QueryJobService.cs` and
+/// `Services/S3PresignedUrlProvider.cs` both `using Acme.Ports;`, so
+/// both honestly appear in `IQueryJobStore.cs`'s `imports` fan-out —
+/// but only `QueryJobService` actually names `IQueryJobStore` in a type
+/// position (a field and a constructor parameter), so only it gets a
+/// `references` edge. `S3PresignedUrlProvider` names
+/// `IPresignedUrlProvider` instead (its base clause) and must not
+/// appear in `IQueryJobStore`'s `references` inbound edges at all —
+/// this is the exact false-positive the field report caught `imports`-
+/// only traversal producing.
+#[test]
+fn references_edges_are_precise_where_the_namespace_import_fan_out_was_not() {
+    let out = TempDir::new("references-precision");
+    let graph = index(out.path());
+
+    // The fan-out both service files' `using Acme.Ports;` produces —
+    // unchanged, still `certain`, still honestly broad.
+    let ports_imports = imports_edges_from(&graph, "Ports/IQueryJobStore.cs");
+    // (imports_edges_from filters by `from`, so check the `in`-direction
+    // fan-out via the two service files' own outgoing edges instead.)
+    let query_job_service_imports = imports_edges_from(&graph, "Services/QueryJobService.cs");
+    let s3_provider_imports = imports_edges_from(&graph, "Services/S3PresignedUrlProvider.cs");
+    for imports in [&query_job_service_imports, &s3_provider_imports] {
+        let targets: Vec<String> = imports
+            .iter()
+            .map(|e| id_to_name(&graph, e["to"].as_str().unwrap()))
+            .collect();
+        assert!(
+            targets.contains(&"Ports/IQueryJobStore.cs".to_string()),
+            "{targets:?}"
+        );
+        assert!(
+            targets.contains(&"Ports/IPresignedUrlProvider.cs".to_string()),
+            "{targets:?}"
+        );
+    }
+    assert!(
+        ports_imports.is_empty(),
+        "Ports/IQueryJobStore.cs imports nothing itself"
+    );
+
+    let references: Vec<&Value> = graph["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "references")
+        .collect();
+
+    let refs_to = |target: &str| -> Vec<String> {
+        let mut froms: Vec<String> = references
+            .iter()
+            .filter(|e| id_to_name(&graph, e["to"].as_str().unwrap()) == target)
+            .map(|e| id_to_name(&graph, e["from"].as_str().unwrap()))
+            .collect();
+        froms.sort();
+        froms
+    };
+    // ADR-0031: `TopLevelRegistration.cs`'s own top-level-statement
+    // `Registrar.Register<IQueryJobStore, QueryJobService>();` now
+    // resolves at file scope too, alongside `QueryJobService`'s field/
+    // parameter, `InMemoryQueryJobStore`'s own `: IQueryJobStore` base
+    // clause, and `RegisterQueryJobStore`'s `IQueryJobStore primary`
+    // parameter — proving the top-level-statement fix adds the missing
+    // true positive without reopening the false-positive hole this
+    // whole test exists to keep closed (`S3PresignedUrlProvider` still
+    // absent below).
+    assert_eq!(
+        refs_to("IQueryJobStore"),
+        vec![
+            "InMemoryQueryJobStore",
+            "QueryJobService",
+            "RegisterQueryJobStore",
+            "TopLevelRegistration.cs"
+        ]
+    );
+    assert_eq!(
+        refs_to("IPresignedUrlProvider"),
+        vec!["S3PresignedUrlProvider"]
+    );
+
+    for edge_from in [
+        "QueryJobService",
+        "S3PresignedUrlProvider",
+        "TopLevelRegistration.cs",
+    ] {
+        let edge = references
+            .iter()
+            .find(|e| id_to_name(&graph, e["from"].as_str().unwrap()) == edge_from)
+            .unwrap();
+        assert_eq!(edge["confidence"], "inferred");
+        assert_eq!(
+            edge["evidence"].as_array().unwrap(),
+            &[Value::String("type-reference:same-package".into())]
+        );
+    }
+}
+
+/// ADR-0031's acceptance test, at the CLI/JSON level: the retest-report
+/// reproduction. `TopLevelRegistration.cs` is genuine C# 9+ top-level
+/// statements — no `Main`, no enclosing class for the statement itself
+/// — calling a generic method whose type arguments cross-reference
+/// `Ports/IQueryJobStore.cs` and `Services/QueryJobService.cs`. Before
+/// ADR-0031 none of this produced any edge at all, since nothing in
+/// `symbols.scm` captures "the top level of a file" as a symbol for
+/// `smallest_containing_symbol` to attribute the call/type-refs to.
+#[test]
+fn top_level_statement_call_and_type_refs_resolve_at_file_scope() {
+    let out = TempDir::new("top-level-statements");
+    let graph = index(out.path());
+
+    // The `Register` call: same-file tier, since `Registrar` is
+    // declared later in the same top-level-statements file.
+    let calls: Vec<&Value> = graph["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| {
+            e["kind"] == "calls"
+                && id_to_name(&graph, e["from"].as_str().unwrap()) == "TopLevelRegistration.cs"
+        })
+        .collect();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        id_to_name(&graph, calls[0]["to"].as_str().unwrap()),
+        "Register"
+    );
+    assert_eq!(calls[0]["confidence"], "inferred");
+    assert_eq!(
+        calls[0]["evidence"].as_array().unwrap(),
+        &[Value::String("same-file".into())]
+    );
+
+    // The two type refs from the generic type arguments: cross-file,
+    // same-package tier.
+    let references: Vec<&Value> = graph["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| {
+            e["kind"] == "references"
+                && id_to_name(&graph, e["from"].as_str().unwrap()) == "TopLevelRegistration.cs"
+        })
+        .collect();
+    let mut targets: Vec<String> = references
+        .iter()
+        .map(|e| id_to_name(&graph, e["to"].as_str().unwrap()))
+        .collect();
+    targets.sort();
+    assert_eq!(targets, vec!["IQueryJobStore", "QueryJobService"]);
+    for edge in &references {
+        assert_eq!((*edge)["confidence"], "inferred");
+        assert_eq!(
+            edge["evidence"].as_array().unwrap(),
+            &[Value::String("type-reference:same-package".into())]
+        );
+    }
 }
 
 #[test]

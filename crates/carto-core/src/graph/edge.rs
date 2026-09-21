@@ -28,6 +28,12 @@ pub enum EdgeKind {
     DeployedAs,
     TriggeredBy,
     Annotates,
+    /// Symbol/File -> Contract: this code/config site emits the literal
+    /// (ADR-0026, spec §4.2 amendment).
+    Produces,
+    /// Symbol/File -> Contract: this code/config site reads/references
+    /// the literal (ADR-0026).
+    Consumes,
 }
 
 impl EdgeKind {
@@ -44,6 +50,8 @@ impl EdgeKind {
             EdgeKind::DeployedAs => "deployed_as",
             EdgeKind::TriggeredBy => "triggered_by",
             EdgeKind::Annotates => "annotates",
+            EdgeKind::Produces => "produces",
+            EdgeKind::Consumes => "consumes",
         }
     }
 
@@ -63,6 +71,8 @@ impl EdgeKind {
             "deployed_as" => Some(EdgeKind::DeployedAs),
             "triggered_by" => Some(EdgeKind::TriggeredBy),
             "annotates" => Some(EdgeKind::Annotates),
+            "produces" => Some(EdgeKind::Produces),
+            "consumes" => Some(EdgeKind::Consumes),
             _ => None,
         }
     }

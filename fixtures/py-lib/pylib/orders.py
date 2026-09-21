@@ -6,7 +6,7 @@ class Order:
         return f"order #{self.id}"
 
 
-def parse_order(input):
+def parse_order(input) -> Order:
     validate(input)
     return Order(1)
 

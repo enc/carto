@@ -16,7 +16,7 @@
 use super::{Direction, FindQuery, QueryGraph, Truncation, find};
 use crate::consts;
 use crate::error::{Error, ErrorKind, Result};
-use crate::graph::{Confidence, EdgeKind, NodeData, NodeId, UnresolvedCall};
+use crate::graph::{Confidence, EdgeKind, InboundCallSite, NodeData, NodeId, UnresolvedCall};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
@@ -119,6 +119,28 @@ pub struct DepsResult {
     /// absence signal, ADR-0020). Never itself evidence of a caller —
     /// see the field's own doc comment on `SymbolNode`.
     pub root_uncaptured_inbound_calls: u32,
+    /// The root symbol's own [`crate::graph::SymbolNode::
+    /// uncaptured_outbound_calls`] (0 for a File/Module root, or a
+    /// language with no such exclusion) — the outbound counterpart to
+    /// `root_uncaptured_inbound_calls` (ADR-0023): `--dir out` returning
+    /// few/no `calls` edges is otherwise indistinguishable from "this
+    /// symbol genuinely calls little" vs. "N of its own call sites spell
+    /// a name in a shape this repo's extractor never attempted to
+    /// resolve". Never itself evidence of what those calls target — see
+    /// the field's own doc comment on `SymbolNode`.
+    pub root_uncaptured_outbound_calls: u32,
+    /// The root symbol's own [`crate::graph::SymbolNode::
+    /// unresolved_inbound_calls`] (empty for a File/Module root) — the
+    /// third honesty signal alongside `root_uncaptured_inbound_calls`
+    /// (ADR-0033). Distinct from that field: this covers call sites that
+    /// *were* attempted and produced no edge (most often bare-name
+    /// ambiguity — an interface method and its implementation both
+    /// named the same thing), not syntax an extractor never attempts at
+    /// all. Not itself evidence any of these sites target the root.
+    pub root_unresolved_inbound_calls: Vec<InboundCallSite>,
+    /// Uncapped count backing `root_unresolved_inbound_calls` — see
+    /// [`crate::graph::SymbolNode::unresolved_inbound_call_count`].
+    pub root_unresolved_inbound_call_count: u32,
     pub hops: Vec<Hop>,
     pub truncation: Truncation,
 }
@@ -144,6 +166,18 @@ pub fn run(qg: &QueryGraph, query: &DepsQuery) -> Result<DepsResult> {
     };
     let root_uncaptured_inbound_calls = match qg.node(&root_id).map(|n| &n.data) {
         Some(NodeData::Symbol(s)) => s.uncaptured_inbound_calls,
+        _ => 0,
+    };
+    let root_uncaptured_outbound_calls = match qg.node(&root_id).map(|n| &n.data) {
+        Some(NodeData::Symbol(s)) => s.uncaptured_outbound_calls,
+        _ => 0,
+    };
+    let root_unresolved_inbound_calls = match qg.node(&root_id).map(|n| &n.data) {
+        Some(NodeData::Symbol(s)) => s.unresolved_inbound_calls.clone(),
+        _ => Vec::new(),
+    };
+    let root_unresolved_inbound_call_count = match qg.node(&root_id).map(|n| &n.data) {
+        Some(NodeData::Symbol(s)) => s.unresolved_inbound_call_count,
         _ => 0,
     };
 
@@ -248,6 +282,9 @@ pub fn run(qg: &QueryGraph, query: &DepsQuery) -> Result<DepsResult> {
         root,
         root_unresolved_calls,
         root_uncaptured_inbound_calls,
+        root_uncaptured_outbound_calls,
+        root_unresolved_inbound_calls,
+        root_unresolved_inbound_call_count,
         hops,
         truncation,
     })
@@ -370,7 +407,7 @@ fn owning_file(qg: &QueryGraph, id: &NodeId) -> Option<NodeId> {
     match qg.node(id).map(|n| &n.data) {
         Some(NodeData::Symbol(s)) => Some(s.file.clone()),
         Some(NodeData::File(_)) => Some(id.clone()),
-        Some(NodeData::Module(_)) | None => None,
+        Some(NodeData::Module(_)) | Some(NodeData::Contract(_)) | None => None,
     }
 }
 
@@ -392,6 +429,15 @@ fn summarize(qg: &QueryGraph, id: &NodeId) -> NodeSummary {
             id: id.clone(),
             kind: data.kind_str().to_string(),
             label: m.path.clone(),
+            location: None,
+        },
+        // `value` is tainted (ADR-0026) — `render_capped` is the INV-5
+        // accessor, same as every other tainted-field-to-plain-`String`
+        // conversion in this crate (e.g. a symbol's `signature`).
+        Some(data @ NodeData::Contract(c)) => NodeSummary {
+            id: id.clone(),
+            kind: data.kind_str().to_string(),
+            label: c.value.render_capped(crate::consts::SIGNATURE_CAP),
             location: None,
         },
         // A dangling reference would mean the graph itself is malformed
@@ -453,6 +499,64 @@ mod tests {
                 signature: None,
                 unresolved_calls,
                 uncaptured_inbound_calls: 0,
+                uncaptured_outbound_calls: 0,
+                unresolved_inbound_calls: vec![],
+                unresolved_inbound_call_count: 0,
+            },
+        )
+    }
+
+    fn symbol_with_uncaptured_outbound(
+        relpath: &str,
+        name: &str,
+        file_id: &NodeId,
+        line: u32,
+        uncaptured_outbound_calls: u32,
+    ) -> Node {
+        Node::symbol(
+            crate::graph::sym_id(relpath, "function", name, line),
+            Provenance::Syntactic,
+            "test@1",
+            SymbolNode {
+                name: name.to_string(),
+                sym_kind: SymKind::Function,
+                file: file_id.clone(),
+                start_line: line,
+                end_line: line + 1,
+                signature: None,
+                unresolved_calls: vec![],
+                uncaptured_inbound_calls: 0,
+                uncaptured_outbound_calls,
+                unresolved_inbound_calls: vec![],
+                unresolved_inbound_call_count: 0,
+            },
+        )
+    }
+
+    fn symbol_with_unresolved_inbound(
+        relpath: &str,
+        name: &str,
+        file_id: &NodeId,
+        line: u32,
+        unresolved_inbound_calls: Vec<InboundCallSite>,
+        unresolved_inbound_call_count: u32,
+    ) -> Node {
+        Node::symbol(
+            crate::graph::sym_id(relpath, "function", name, line),
+            Provenance::Syntactic,
+            "test@1",
+            SymbolNode {
+                name: name.to_string(),
+                sym_kind: SymKind::Function,
+                file: file_id.clone(),
+                start_line: line,
+                end_line: line + 1,
+                signature: None,
+                unresolved_calls: vec![],
+                uncaptured_inbound_calls: 0,
+                uncaptured_outbound_calls: 0,
+                unresolved_inbound_calls,
+                unresolved_inbound_call_count,
             },
         )
     }
@@ -956,6 +1060,123 @@ mod tests {
         };
         let result = run(&qg, &query).unwrap();
         assert_eq!(result.root_unresolved_calls.len(), 1);
+    }
+
+    // ADR-0023: root_uncaptured_outbound_calls, mirroring the
+    // root_unresolved_calls tests above exactly — same root-level-
+    // metadata shape, opposite direction.
+
+    #[test]
+    fn root_uncaptured_outbound_calls_is_surfaced_when_present() {
+        let f = file("src/indexer.rs");
+        let build_and_persist =
+            symbol_with_uncaptured_outbound("src/indexer.rs", "build_and_persist", &f.id, 1, 6);
+        let qg = QueryGraph::from_document(doc(vec![f, build_and_persist], vec![]));
+
+        let result = run(&qg, &DepsQuery::new("build_and_persist")).unwrap();
+        assert_eq!(result.hops.len(), 0, "no resolved edges");
+        assert_eq!(result.root_uncaptured_outbound_calls, 6);
+    }
+
+    #[test]
+    fn root_uncaptured_outbound_calls_is_zero_when_the_root_has_none() {
+        let qg = QueryGraph::from_document(chain_doc());
+        let result = run(&qg, &DepsQuery::new("handle")).unwrap();
+        assert_eq!(result.root_uncaptured_outbound_calls, 0);
+    }
+
+    #[test]
+    fn root_uncaptured_outbound_calls_is_zero_for_a_non_symbol_root() {
+        let f = file("src/lib.rs");
+        let qg = QueryGraph::from_document(doc(vec![f.clone()], vec![]));
+        let result = run(&qg, &DepsQuery::new(f.id.as_str())).unwrap();
+        assert_eq!(result.root_uncaptured_outbound_calls, 0);
+    }
+
+    #[test]
+    fn root_uncaptured_outbound_calls_is_unaffected_by_dir_and_kinds_filtering() {
+        // Root-node metadata, not traversal output — --dir/--kinds only
+        // ever filter `hops`.
+        let f = file("src/indexer.rs");
+        let build_and_persist =
+            symbol_with_uncaptured_outbound("src/indexer.rs", "build_and_persist", &f.id, 1, 6);
+        let qg = QueryGraph::from_document(doc(vec![f, build_and_persist], vec![]));
+
+        let mut kinds = BTreeSet::new();
+        kinds.insert(EdgeKind::Contains);
+        let query = DepsQuery {
+            target: "build_and_persist".to_string(),
+            dir: Direction::In,
+            depth: 1,
+            kinds: Some(kinds),
+            subpath: None,
+        };
+        let result = run(&qg, &query).unwrap();
+        assert_eq!(result.root_uncaptured_outbound_calls, 6);
+    }
+
+    // ADR-0033: root_unresolved_inbound_calls — the third honesty
+    // signal, mirroring the two families above's shape but answering a
+    // question neither covers: call sites elsewhere that spell the
+    // root's bare name, *were* attempted, and still produced no edge
+    // (typically bare-name ambiguity, e.g. an interface method and its
+    // implementation).
+
+    #[test]
+    fn root_unresolved_inbound_calls_are_surfaced_when_present() {
+        let f = file("src/lib.rs");
+        let save = symbol_with_unresolved_inbound(
+            "src/lib.rs",
+            "Save",
+            &f.id,
+            1,
+            vec![
+                InboundCallSite {
+                    file: "src/CancelQueryUseCase.cs".to_string(),
+                    line: 77,
+                },
+                InboundCallSite {
+                    file: "src/GetQueryStatusUseCase.cs".to_string(),
+                    line: 102,
+                },
+            ],
+            2,
+        );
+        let qg = QueryGraph::from_document(doc(vec![f, save], vec![]));
+
+        let result = run(&qg, &DepsQuery::new("Save")).unwrap();
+        assert_eq!(result.hops.len(), 0, "no resolved edges");
+        assert_eq!(result.root_unresolved_inbound_call_count, 2);
+        assert_eq!(
+            result.root_unresolved_inbound_calls,
+            vec![
+                InboundCallSite {
+                    file: "src/CancelQueryUseCase.cs".to_string(),
+                    line: 77,
+                },
+                InboundCallSite {
+                    file: "src/GetQueryStatusUseCase.cs".to_string(),
+                    line: 102,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn root_unresolved_inbound_calls_is_empty_when_the_root_has_none() {
+        let qg = QueryGraph::from_document(chain_doc());
+        let result = run(&qg, &DepsQuery::new("handle")).unwrap();
+        assert!(result.root_unresolved_inbound_calls.is_empty());
+        assert_eq!(result.root_unresolved_inbound_call_count, 0);
+    }
+
+    #[test]
+    fn root_unresolved_inbound_calls_is_empty_for_a_non_symbol_root() {
+        let f = file("src/lib.rs");
+        let qg = QueryGraph::from_document(doc(vec![f.clone()], vec![]));
+        let result = run(&qg, &DepsQuery::new(f.id.as_str())).unwrap();
+        assert!(result.root_unresolved_inbound_calls.is_empty());
+        assert_eq!(result.root_unresolved_inbound_call_count, 0);
     }
 
     #[test]

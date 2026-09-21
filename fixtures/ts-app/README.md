@@ -25,6 +25,7 @@ illustrative "30 files."
 | `src/reexport.ts`'s `export { parseOrder } from './orders'` | a re-export — a `certain` `imports` edge to `orders.ts`, same evidence (`mod-declaration`) Rust's bare `mod foo;` gets, since neither targets a specific name the way a named import does (ADR-0013) |
 | `src/Component.tsx`'s `import { legacyHelper } from './legacy'` | a `.tsx` file importing a `.js` file — cross-`Lang`-variant resolution, extension-guessing finds `legacy.js` |
 | `Component` calling `legacyHelper(1)` | resolution tier (b), proving `.tsx`'s own extractor and JSX parsing (`return <div>{value}</div>;`) don't interfere with normal extraction |
+| `parseOrder`'s own `: Order` return-type annotation | ADR-0029's `references` edge: a `type_annotation` (TS-only capture), resolved tier (a) same-file — `EdgeKind::References`, evidence `type-reference:same-file` |
 
 Verify with:
 

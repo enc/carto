@@ -53,7 +53,7 @@ pub struct DepsArgs {
     depth: u32,
 
     /// Comma-separated edge kinds to include (e.g.
-    /// `contains,imports,calls`). Defaults to every kind.
+    /// `contains,imports,calls,references`). Defaults to every kind.
     #[arg(long)]
     kinds: Option<String>,
 
@@ -151,6 +151,50 @@ pub fn print_human(result: &query::DepsResult, dir: Direction) {
              callers; INV-8 honest omission, not a claim)",
             result.root_uncaptured_inbound_calls,
             if result.root_uncaptured_inbound_calls == 1 {
+                ""
+            } else {
+                "s"
+            },
+        );
+    }
+    // ADR-0033's third honesty signal: sites that spell this symbol's
+    // name and *were* attempted, unlike `root_uncaptured_inbound_calls`
+    // above (never-attempted syntax). Also inbound-only, so gated the
+    // same way.
+    if !result.root_unresolved_inbound_calls.is_empty()
+        && matches!(dir, Direction::In | Direction::Both)
+    {
+        let total = result.root_unresolved_inbound_call_count;
+        let shown = result.root_unresolved_inbound_calls.len() as u32;
+        let sites: Vec<String> = result
+            .root_unresolved_inbound_calls
+            .iter()
+            .map(|s| format!("{}:{}", s.file, s.line))
+            .collect();
+        let count_note = if total > shown {
+            format!(" (first {shown} of {total})")
+        } else {
+            String::new()
+        };
+        println!(
+            "  ({total} call site{} elsewhere spell this symbol's name and were attempted but \
+             produced no edge (most often because the name is declared more than once — e.g. \
+             an interface method and its implementation): {}{count_note}; not evidence of zero \
+             callers)",
+            if total == 1 { "" } else { "s" },
+            sites.join(", "),
+        );
+    }
+    // Outbound counterpart (ADR-0023) — only relevant to an outbound
+    // question, noise on --dir in.
+    if result.root_uncaptured_outbound_calls > 0 && matches!(dir, Direction::Out | Direction::Both)
+    {
+        println!(
+            "  ({} call site{} inside this symbol's own body spell a callee name in a shape \
+             this language's extractor never attempts to resolve — not evidence it calls \
+             little; INV-8 honest omission, not a claim)",
+            result.root_uncaptured_outbound_calls,
+            if result.root_uncaptured_outbound_calls == 1 {
                 ""
             } else {
                 "s"

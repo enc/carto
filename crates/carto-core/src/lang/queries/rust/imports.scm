@@ -9,3 +9,21 @@
 (mod_item) @mod.decl
 
 (use_declaration) @use.decl
+
+; Bare fully-qualified-path references with no `use`/`mod` bringing
+; them into scope at all (`carto_core::Result<u8>` needs no `use
+; carto_core;` — valid since Rust 2018) — ADR-0024. Deliberately broad:
+; this also matches nodes already inside a `use_declaration`'s own
+; argument tree, and a `call_expression`'s `Type::method()`-shaped
+; callee (the same node shape as a genuine crate-rooted path, ADR-0008
+; already excludes this from call resolution for the identical
+; ambiguity) — both are filtered out in rust.rs, which also applies the
+; lowercase-root heuristic that separates a plausible crate name from a
+; local PascalCase type/trait/generic-parameter name. Query-only
+; filtering can't express "not inside a use_declaration" or "not a
+; call's own callee" cleanly, the same reason every other shape in this
+; file is decomposed in plain Rust rather than here.
+
+(scoped_identifier) @path.ref
+
+(scoped_type_identifier) @path.ref

@@ -17,6 +17,7 @@ interpretation decisions this exercises):
 | `handle` calling `order.summary()` (not imported, an attribute call) | resolution tier (c) again — Python's attribute-call syntax doesn't distinguish this from a module-qualified call the way Rust's `scoped_identifier` does (see ADR-0011); it resolves through the same tiers as any other attribute call |
 | `handle` calling `input.strip()` | a real call-site that never resolves — `str.strip` isn't a symbol carto ever sees, so it lands in `handle`'s `unresolved_calls`. Expected, not a bug — same honesty principle as the Rust fixture's `input.is_empty()` case |
 | `handle` calling `unknown_external_call()` | the deliberate honesty-path case: no candidate anywhere ⇒ no edge, recorded in `handle`'s `unresolved_calls` |
+| `parse_order`'s own `-> Order` return annotation | ADR-0029's `references` edge: a `function_definition`'s `return_type:` field, resolved tier (a) same-file — `EdgeKind::References`, evidence `type-reference:same-file` |
 
 Verify with:
 

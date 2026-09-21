@@ -31,7 +31,7 @@
 //! `docs/adr/0013-typescript-javascript-resolution-policy-mapping.md`.
 
 use super::extractor::{
-    ExtractOut, ImportedName, LangExtractor, RawCallSite, RawImport, RawSymbol,
+    ExtractOut, ImportedName, LangExtractor, RawCallSite, RawImport, RawSymbol, RawTypeRef,
 };
 use crate::graph::SymKind;
 use crate::lang::Lang;
@@ -47,6 +47,9 @@ const SYMBOLS_QUERY_CLASS_TYPE_IDENTIFIER: &str =
 const SYMBOLS_QUERY_TS: &str = include_str!("queries/ecma/symbols_ts.scm");
 const IMPORTS_QUERY: &str = include_str!("queries/ecma/imports.scm");
 const CALLS_QUERY: &str = include_str!("queries/ecma/calls.scm");
+const TYPES_QUERY: &str = include_str!("queries/ecma/types.scm");
+const TYPES_QUERY_TS: &str = include_str!("queries/ecma/types_ts.scm");
+const TYPES_QUERY_JS: &str = include_str!("queries/ecma/types_js.scm");
 
 pub struct TypeScriptExtractor;
 
@@ -117,9 +120,11 @@ fn extract_with(language: Language, src: &[u8], is_ts_family: bool) -> ExtractOu
         symbols: extract_symbols(root, src, &language, is_ts_family),
         imports: extract_imports(root, src, &language),
         call_sites: extract_call_sites(root, src, &language),
+        literals: Vec::new(),
         // TS/JS's member/selector calls are captured, not excluded
         // (ADR-0013) — nothing to count here.
         uncaptured_call_sites: Vec::new(),
+        type_refs: extract_type_refs(root, src, &language, is_ts_family),
         declared_namespace: None,
     }
 }
@@ -260,13 +265,17 @@ fn run_symbols_query(
         };
 
         let name = text(src, name_node);
+        // ADR-0032: `owner` reuses `class_name_node` — already computed
+        // for `qualified_name` below, and exactly "the class this
+        // symbol is declared in".
+        let owner = class_name_node.map(|c| text(src, c));
         // JS/TS's own dot convention for referring to a class's member
         // (`Order.summary`) — spec §4.3 leaves qualified-name spelling
         // to the extractor; same spelling Python's own class.method
         // convention happens to use, for the same reason (neither
         // language has Rust's/PHP's "::").
-        let qualified_name = match class_name_node {
-            Some(c) => format!("{}.{}", text(src, c), name),
+        let qualified_name = match &owner {
+            Some(c) => format!("{c}.{name}"),
             None => name.clone(),
         };
 
@@ -289,6 +298,7 @@ fn run_symbols_query(
             end_line,
             signature,
             is_pub,
+            owner,
         });
     }
 }
@@ -547,6 +557,117 @@ fn extract_call_sites(root: Node, src: &[u8], language: &Language) -> Vec<RawCal
     out
 }
 
+/// ADR-0029: every identifier `types.scm` (and, for TS/TSX,
+/// `types_ts.scm`) found in a type position, walked down to head
+/// identifiers by [`collect_type_names`]. Mirrors `extract_symbols`'s
+/// own shared-then-TS-only two-pass shape.
+fn extract_type_refs(
+    root: Node,
+    src: &[u8],
+    language: &Language,
+    is_ts_family: bool,
+) -> Vec<RawTypeRef> {
+    let mut out = Vec::new();
+    run_types_query(TYPES_QUERY, root, src, language, &mut out);
+    if is_ts_family {
+        run_types_query(TYPES_QUERY_TS, root, src, language, &mut out);
+    } else {
+        run_types_query(TYPES_QUERY_JS, root, src, language, &mut out);
+    }
+    out
+}
+
+fn run_types_query(
+    query_src: &str,
+    root: Node,
+    src: &[u8],
+    language: &Language,
+    out: &mut Vec<RawTypeRef>,
+) {
+    let query = Query::new(language, query_src).expect("ecma types.scm must compile");
+    let names = query.capture_names();
+    let mut cursor = QueryCursor::new();
+    let mut matches = cursor.matches(&query, root, src);
+    while let Some(m) = matches.next() {
+        for cap in m.captures {
+            if names[cap.index as usize] == "type.pos" {
+                collect_type_names(cap.node, src, out);
+            }
+        }
+    }
+}
+
+/// Descends a captured type-position subtree down to the head
+/// identifier(s) it names, recursing through every TS wrapper type
+/// (union/intersection/parenthesized/optional/array/tuple/generic) and
+/// the shared JS/TS container shapes `types.scm`/`types_ts.scm` capture
+/// whole (`type_annotation`, `implements_clause`). A member path
+/// (`ns.Foo`, both `new ns.Foo()` and `class X extends ns.Base`) yields
+/// only its rightmost segment via `member_expression`'s own `property:`
+/// field — the same rightmost-identifier policy `calls.scm`'s own
+/// member-call capture already applies.
+///
+/// `required_parameter`/`optional_parameter` are a **deliberate no-op**
+/// here, not an oversight: their own `type:` field is itself a
+/// `type_annotation`, already reached independently by
+/// `types_ts.scm`'s unanchored top-level pattern. A tuple type's own
+/// named members (`[x: Foo]`) parse as these same two node kinds, so
+/// without this no-op, recursing into a tuple's children would
+/// double-count every named tuple member's type the same way an
+/// unguarded Go `parameter_list` recursion would double-count a named
+/// return value (see `queries/go/types.scm`'s own comment on the
+/// identical hazard). `predefined_type` (`string`, `number`, `void`,
+/// `any`, `unknown`, ...) has no symbol to reference and is silently
+/// skipped, like every other language's builtin-type exclusion.
+fn collect_type_names(node: Node, src: &[u8], out: &mut Vec<RawTypeRef>) {
+    match node.kind() {
+        "identifier"
+        | "type_identifier"
+        | "property_identifier"
+        | "private_property_identifier" => out.push(RawTypeRef {
+            name: text(src, node),
+            line: node.start_position().row as u32 + 1,
+        }),
+        "member_expression" => {
+            if let Some(prop) = node.child_by_field_name("property") {
+                collect_type_names(prop, src, out);
+            }
+        }
+        "nested_type_identifier" => {
+            if let Some(name) = node.child_by_field_name("name") {
+                collect_type_names(name, src, out);
+            }
+        }
+        "generic_type" => {
+            if let Some(name) = node.child_by_field_name("name") {
+                collect_type_names(name, src, out);
+            }
+            if let Some(args) = node.child_by_field_name("type_arguments") {
+                collect_type_names(args, src, out);
+            }
+        }
+        "as_expression" | "satisfies_expression" => {
+            // No named field for the `type` operand in this grammar
+            // (`children: [expression, type]`, both positional) — the
+            // type is always the *last* named child.
+            let mut cursor = node.walk();
+            if let Some(last) = node.named_children(&mut cursor).last() {
+                collect_type_names(last, src, out);
+            }
+        }
+        "type_annotation" | "implements_clause" | "union_type" | "intersection_type"
+        | "parenthesized_type" | "optional_type" | "rest_type" | "tuple_type" | "array_type"
+        | "type_arguments" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                collect_type_names(child, src, out);
+            }
+        }
+        "required_parameter" | "optional_parameter" => {}
+        _ => {}
+    }
+}
+
 fn text(src: &[u8], node: Node) -> String {
     text_range(src, node.start_byte(), node.end_byte())
 }
@@ -583,6 +704,115 @@ mod tests {
 
     fn js(src: &str) -> ExtractOut {
         JavaScriptExtractor.extract(src.as_bytes(), "test.js")
+    }
+
+    fn type_ref_names(out: &ExtractOut) -> Vec<&str> {
+        out.type_refs.iter().map(|t| t.name.as_str()).collect()
+    }
+
+    // ADR-0029: nothing in this extractor captured a type position
+    // before this — `interface`/type-annotated params, `class X
+    // extends Y`, and `new Foo()` (which `calls.scm` never captures at
+    // all, in any of the three languages this file handles) all
+    // produced zero edges.
+
+    #[test]
+    fn extracts_parameter_property_and_return_type_annotations() {
+        let out = ts(
+            "interface Order {}\n\nclass Handler {\n    order: Order;\n\n    take(o: Order): Order {\n        return o;\n    }\n}\n",
+        );
+        let names = type_ref_names(&out);
+        assert_eq!(
+            names.iter().filter(|&&n| n == "Order").count(),
+            3,
+            "field + parameter + return type, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn variable_annotation_is_captured() {
+        let out = ts("interface Order {}\n\nconst x: Order = {} as Order;\n");
+        let names = type_ref_names(&out);
+        // The `: Order` annotation and the `as Order` assertion.
+        assert_eq!(names.iter().filter(|&&n| n == "Order").count(), 2);
+    }
+
+    #[test]
+    fn class_extends_is_captured_in_plain_javascript_too() {
+        let out = js("class Base {}\n\nclass Derived extends Base {}\n");
+        assert_eq!(type_ref_names(&out), vec!["Base"]);
+    }
+
+    #[test]
+    fn new_expression_is_captured_in_plain_javascript_where_calls_scm_never_looked() {
+        let out = js("class Order {}\n\nfunction make() {\n    return new Order();\n}\n");
+        // calls.scm only matches call_expression, never new_expression
+        // -- this must be genuinely new signal, not a duplicate of an
+        // existing calls edge.
+        assert!(out.call_sites.iter().all(|c| c.callee_name != "Order"));
+        assert_eq!(type_ref_names(&out), vec!["Order"]);
+    }
+
+    #[test]
+    fn generic_type_argument_and_implements_clause_are_captured() {
+        let out = ts(
+            "interface Comparable {}\ninterface Order {}\n\nclass Handler implements Comparable {\n    items: Array<Order>;\n}\n",
+        );
+        let names = type_ref_names(&out);
+        assert!(names.contains(&"Comparable"));
+        assert!(names.contains(&"Array"));
+        assert!(names.contains(&"Order"));
+    }
+
+    #[test]
+    fn generic_new_expression_and_generic_call_type_arguments_are_captured() {
+        let out = ts(
+            "interface Order {}\n\nfunction make() {\n    const m = new Map<string, Order>();\n    identity<Order>(m);\n}\n",
+        );
+        let names = type_ref_names(&out);
+        assert_eq!(names.iter().filter(|&&n| n == "Order").count(), 2);
+        assert!(names.contains(&"Map"));
+    }
+
+    #[test]
+    fn interface_extends_is_captured() {
+        let out = ts("interface Base {}\n\ninterface Derived extends Base {}\n");
+        assert!(type_ref_names(&out).contains(&"Base"));
+    }
+
+    #[test]
+    fn tsx_supports_the_same_type_annotation_capture_as_ts() {
+        let out = tsx("interface Order {}\n\nfunction take(o: Order) {}\n");
+        assert_eq!(type_ref_names(&out), vec!["Order"]);
+    }
+
+    #[test]
+    fn plain_javascript_has_no_type_annotations_to_capture() {
+        let out = js("function take(o) {}\n");
+        assert!(type_ref_names(&out).is_empty());
+    }
+
+    #[test]
+    fn predefined_types_are_not_captured() {
+        let out = ts("function take(a: string, b: number, c: boolean): void {}\n");
+        assert!(type_ref_names(&out).is_empty());
+    }
+
+    /// Regression guard for the double-match hazard `types_ts.scm`'s
+    /// own comment documents: a tuple type's named member
+    /// (`required_parameter`) must not be counted twice — once via
+    /// `tuple_type`'s own descent, once via the independent, global
+    /// `type_annotation` capture reaching the same node's `type:`
+    /// field.
+    #[test]
+    fn named_tuple_member_is_not_double_counted() {
+        let out = ts("interface Order {}\n\nfunction take(t: [x: Order, y: Order]) {}\n");
+        let names = type_ref_names(&out);
+        assert_eq!(
+            names.iter().filter(|&&n| n == "Order").count(),
+            2,
+            "{names:?}"
+        );
     }
 
     #[test]

@@ -59,7 +59,7 @@ pub fn tool_list() -> Vec<Value> {
                     "out": { "type": "string", "description": "Output directory carto previously indexed into." },
                     "dir": { "type": "string", "enum": ["in", "out", "both"], "description": "Which direction to follow edges.", "default": "out" },
                     "depth": { "type": "integer", "description": "How many hops to traverse (1..=5).", "default": 1 },
-                    "kinds": { "type": "string", "description": "Comma-separated edge kinds to include (e.g. contains,imports,calls). Defaults to every kind." },
+                    "kinds": { "type": "string", "description": "Comma-separated edge kinds to include (e.g. contains,imports,calls,references). Defaults to every kind." },
                     "subpath": { "type": "string", "description": "Restrict reported rows to nodes under this repo-relative directory." },
                 },
                 "required": ["repo_path", "target"],
@@ -81,6 +81,35 @@ pub fn tool_list() -> Vec<Value> {
             },
         }),
         json!({
+            "name": "contract",
+            "description": "Every producer and consumer of a categorised string-literal contract (e.g. a CloudWatch metric name), exact-value matched — not spec §7.1's tool set (ADR-0026, the cross-language contract slice). Complements `orphans`: 'who else touches this one value.'",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "repo_path": { "type": "string", "description": "Repo previously indexed with the `index` tool." },
+                    "value": { "type": "string", "description": "Exact literal value to look up (e.g. a metric name)." },
+                    "out": { "type": "string", "description": "Output directory carto previously indexed into." },
+                    "category": { "type": "string", "description": "Restrict to one category (e.g. metric_name). Defaults to every category." },
+                    "limit": { "type": "integer", "description": "Max matches to return.", "default": 50 },
+                },
+                "required": ["repo_path", "value"],
+            },
+        }),
+        json!({
+            "name": "orphans",
+            "description": "Categorised literals (e.g. CloudWatch metric names) with a `consumes` edge but no `produces` edge, and vice versa — not spec §7.1's tool set (ADR-0026, the cross-language contract slice). Answers 'which Terraform alarm references a metric name no service emits' and its mirror.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "repo_path": { "type": "string", "description": "Repo previously indexed with the `index` tool." },
+                    "out": { "type": "string", "description": "Output directory carto previously indexed into." },
+                    "category": { "type": "string", "description": "Restrict to one category (e.g. metric_name). Defaults to every category." },
+                    "limit": { "type": "integer", "description": "Max rows per list.", "default": 200 },
+                },
+                "required": ["repo_path"],
+            },
+        }),
+        json!({
             "name": "selfcheck",
             "description": "Environment report: carto version, schema version, grammar mode, confinement status. Useful for confirming the server is the version you expect.",
             "inputSchema": {
@@ -89,4 +118,31 @@ pub fn tool_list() -> Vec<Value> {
             },
         }),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `skill/carto/SKILL.md` (spec §9.3, packaging per ADR-0028) is the
+    /// one thing a user copies to get carto's tools described to their
+    /// agent — it went stale silently once before (ADR-0026's `contract`/
+    /// `orphans` shipped with no matching skill-file update). `include_str!`
+    /// makes the skill file a build-time dependency of this crate, the
+    /// same drift-prevention idea `tools/mod.rs`'s
+    /// `schema_properties_match_each_handlers_declared_params` already
+    /// uses for schema/handler drift, extended one level further.
+    const SKILL_FILE: &str = include_str!("../../../skill/carto/SKILL.md");
+
+    #[test]
+    fn skill_file_names_every_advertised_tool() {
+        for tool in tool_list() {
+            let name = tool["name"].as_str().unwrap();
+            assert!(
+                SKILL_FILE.contains(name),
+                "tool `{name}` is advertised in schema.rs's tool_list() but \
+                 not mentioned anywhere in skill/carto/SKILL.md — likely drift"
+            );
+        }
+    }
 }

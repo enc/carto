@@ -130,7 +130,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_advertises_the_m1_tool_set() {
+    fn tools_list_advertises_every_implemented_tool() {
         let out = run(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#);
         let msgs = lines(&out);
         let names: Vec<String> = msgs[0]["result"]["tools"]
@@ -139,7 +139,20 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap().to_string())
             .collect();
-        assert_eq!(names, vec!["index", "where", "deps", "map", "selfcheck"]);
+        // M1's set (index/where/deps/map/selfcheck) plus `contract`/
+        // `orphans` (ADR-0026 — not spec §7.1's tool set).
+        assert_eq!(
+            names,
+            vec![
+                "index",
+                "where",
+                "deps",
+                "map",
+                "contract",
+                "orphans",
+                "selfcheck"
+            ]
+        );
     }
 
     #[test]

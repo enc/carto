@@ -1,6 +1,8 @@
 //! Node kinds (spec §4.1). `File`, `Symbol`, and `Module` exist as of
 //! M1.b.2a — `IacResource`, `IamPolicyStmt`, `CloudResourceRef`, `Note`
-//! arrive with infra ingestion/agent-ingest (M2/M4).
+//! arrive with infra ingestion/agent-ingest (M2/M4). `Contract` is a
+//! spec amendment (not in §4.1) — see
+//! `docs/adr/0026-contract-node-and-produces-consumes-edges.md`.
 
 use super::id::NodeId;
 use crate::lang::Lang;
@@ -65,6 +67,20 @@ impl Node {
             data: NodeData::Module(module),
         }
     }
+
+    pub fn contract(
+        id: NodeId,
+        provenance: Provenance,
+        origin: impl Into<String>,
+        contract: ContractNode,
+    ) -> Self {
+        Node {
+            id,
+            provenance,
+            origin: origin.into(),
+            data: NodeData::Contract(contract),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,6 +89,7 @@ pub enum NodeData {
     File(FileNode),
     Symbol(SymbolNode),
     Module(ModuleNode),
+    Contract(ContractNode),
 }
 
 impl NodeData {
@@ -98,6 +115,7 @@ impl NodeData {
             NodeData::File(_) => "file",
             NodeData::Symbol(_) => "symbol",
             NodeData::Module(_) => "module",
+            NodeData::Contract(_) => "contract",
         }
     }
 }
@@ -193,6 +211,24 @@ pub struct UnresolvedCall {
     pub line: u32,
 }
 
+/// One call site elsewhere in the repo that spells a symbol's bare
+/// `name` and was *attempted* for resolution but produced no edge —
+/// the inbound counterpart to [`UnresolvedCall`], and the third
+/// honesty signal alongside `uncaptured_inbound_calls` (ADR-0020, which
+/// counts *never-attempted* syntax, not this). `file` is a plain
+/// `String`, matching [`FileNode::path`]: a repo-relative path is an
+/// extractor-computed identifier, not captured source text, so it
+/// carries no taint. Recording this doesn't mean the site targets this
+/// symbol — most often it means the bare name is ambiguous (an
+/// interface method and its implementation both named `Save`), the
+/// same "missing honestly beats guessing" principle INV-8 already
+/// applies to the edge itself. See ADR-0033.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct InboundCallSite {
+    pub file: String,
+    pub line: u32,
+}
+
 /// `Symbol` node (spec §4.1). `name` is the bare declared identifier —
 /// used both for display and as what call-resolution matches against
 /// (spec §5.3's matching is name-based, not qualified-path-based). The
@@ -227,6 +263,36 @@ pub struct SymbolNode {
     /// exclusion.
     #[serde(default)]
     pub uncaptured_inbound_calls: u32,
+    /// How many call sites *inside this symbol's own body* spell a
+    /// callee name in a shape its language's extractor deliberately
+    /// never attempts to resolve (Rust's `Type::method()`/
+    /// `module::func()`, ADR-0008) — the outbound counterpart to
+    /// `uncaptured_inbound_calls` (ADR-0023). A count of unattempted
+    /// syntax *this symbol itself* contains, not evidence of what those
+    /// calls target: `deps --dir out` returning few/no `calls` edges
+    /// for a symbol with a nonzero count here means "carto didn't
+    /// attempt some of what this symbol calls", not "this symbol calls
+    /// little". Zero for every language without such an exclusion.
+    #[serde(default)]
+    pub uncaptured_outbound_calls: u32,
+    /// Call sites elsewhere in the repo that spell this symbol's bare
+    /// `name`, *were* attempted for resolution (unlike
+    /// `uncaptured_inbound_calls`, which counts syntax an extractor
+    /// never even tries), and produced no edge — most often because the
+    /// name is ambiguous (an interface method and its implementation
+    /// both named the same thing). Capped at
+    /// [`crate::consts::UNRESOLVED_INBOUND_SITES_CAP`], sorted by
+    /// `(file, line)`; `unresolved_inbound_call_count` below carries the
+    /// uncapped total. Not evidence any of these sites actually target
+    /// this symbol — same non-claim as `uncaptured_inbound_calls`.
+    /// ADR-0033.
+    #[serde(default)]
+    pub unresolved_inbound_calls: Vec<InboundCallSite>,
+    /// Uncapped count backing `unresolved_inbound_calls` above, so the
+    /// signal stays honest past the cap (a caller can tell "these are
+    /// all of them" from "these are the first 25 of N"). ADR-0033.
+    #[serde(default)]
+    pub unresolved_inbound_call_count: u32,
 }
 
 /// `Module` node (spec §4.1): "logical module/package path". `external`
@@ -239,4 +305,26 @@ pub struct SymbolNode {
 pub struct ModuleNode {
     pub path: String,
     pub external: bool,
+}
+
+/// A categorised string literal — a cross-language contract carto's node
+/// vocabulary otherwise has no way to represent (a CloudWatch metric
+/// name, an env var key, …). Not in spec §4.1; see
+/// `docs/adr/0026-contract-node-and-produces-consumes-edges.md` for the
+/// amendment and why `value`/`qualifier` are tainted (a string literal is
+/// arbitrary captured source text, exactly where a credential would
+/// hide — INV-6 must scan it, unlike `FileNode.path`/`SymbolNode.name`,
+/// which are extractor-computed identifiers, not captured text).
+///
+/// `category` is an open, repo-extensible string (`.carto/contracts.json`,
+/// ADR-0027) rather than a closed enum — new categories are exactly what
+/// that config file is for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContractNode {
+    pub category: String,
+    /// Disambiguates same-spelled values in different scopes (e.g. a
+    /// CloudWatch metric namespace) — `None` for a category with no
+    /// natural qualifier.
+    pub qualifier: Option<TaintedString>,
+    pub value: TaintedString,
 }

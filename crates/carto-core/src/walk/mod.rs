@@ -142,6 +142,27 @@ struct WalkedFile {
     hashed: Option<(String, String)>,
 }
 
+/// [`Lang::from_extension`] only ever sees a file name's last extension
+/// segment (`Path::extension()`'s own contract). A real Terraform
+/// monorepo pattern this misses: `locals.tf.simu`/`locals.tf.prod`, a
+/// per-environment source file (ADR-0025) whose contents `prepare-
+/// environment.sh`-style tooling copies into a gitignored `locals_env.
+/// tf` — `Path::extension()` alone would see `simu`/`prod` and classify
+/// it `Other`, never reaching the HCL extractor. Checked first, ahead of
+/// the ordinary single-extension lookup; general (`<name>.tf.<anything>`
+/// → `Hcl`), not a `simu`/`prod` allowlist.
+fn lang_for_file_name(file_name: &str) -> Lang {
+    let parts: Vec<&str> = file_name.rsplitn(3, '.').collect();
+    if parts.len() == 3 && parts[1].eq_ignore_ascii_case("tf") {
+        return Lang::Hcl;
+    }
+    Path::new(file_name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(Lang::from_extension)
+        .unwrap_or(Lang::Other)
+}
+
 fn path_of(node: &Node) -> &str {
     &node
         .data
@@ -158,11 +179,7 @@ fn classify(root: &Path, abs_path: &Path) -> Option<WalkedFile> {
     let rel = abs_path.strip_prefix(root).ok()?;
     let path = to_repo_relative_string(rel);
     let file_name = abs_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    let lang = abs_path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(Lang::from_extension)
-        .unwrap_or(Lang::Other);
+    let lang = lang_for_file_name(file_name);
 
     if is_sensitive(file_name) {
         // INV-3/§5.1: contents never read. `size` still comes from
@@ -495,5 +512,20 @@ mod tests {
         let mut sorted = paths.clone();
         sorted.sort();
         assert_eq!(paths, sorted);
+    }
+
+    #[test]
+    fn two_part_tf_extension_classifies_as_hcl() {
+        let dir = TempDir::new("tf-two-part-ext");
+        write(dir.path(), "locals.tf.simu", b"locals { x = 1 }");
+        write(dir.path(), "locals.tf.prod", b"locals { x = 2 }");
+        write(dir.path(), "main.tf", b"");
+        write(dir.path(), "notes.txt.bak", b"");
+
+        let out = walk(dir.path(), true).unwrap();
+        assert_eq!(node_path(&out, "locals.tf.simu").unwrap().lang, Lang::Hcl);
+        assert_eq!(node_path(&out, "locals.tf.prod").unwrap().lang, Lang::Hcl);
+        assert_eq!(node_path(&out, "main.tf").unwrap().lang, Lang::Hcl);
+        assert_eq!(node_path(&out, "notes.txt.bak").unwrap().lang, Lang::Other);
     }
 }

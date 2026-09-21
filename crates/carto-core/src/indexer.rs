@@ -44,7 +44,7 @@ pub fn build_and_persist(
     let walked = walk::walk(repo_root, respect_gitignore)?;
     let file_count = walked.nodes.len();
 
-    let resolved = lang::extract_and_resolve(repo_root, &walked.nodes);
+    let resolved = lang::extract_and_resolve(repo_root, &walked.nodes)?;
 
     let mut g = Graph::new();
     for node in walked.nodes {

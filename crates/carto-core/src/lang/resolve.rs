@@ -9,9 +9,13 @@
 //! classification, "same-package" -> "same walked repo") is recorded in
 //! `docs/adr/0008-rust-resolution-policy-mapping.md`.
 
-use super::extractor::{ExtractOut, RawCallSite, RawImport, RawSymbol};
+use super::Lang;
+use super::extractor::{ExtractOut, RawImport, RawSymbol};
+use crate::consts;
+use crate::contracts::{ContractRules, Role};
 use crate::graph::{
-    self, Confidence, Edge, EdgeKind, ModuleNode, Node, NodeId, SymKind, SymbolNode, UnresolvedCall,
+    self, Confidence, ContractNode, Edge, EdgeKind, InboundCallSite, ModuleNode, Node, NodeId,
+    SymKind, SymbolNode, UnresolvedCall,
 };
 use crate::taint::{Provenance, TaintedString};
 use std::collections::{BTreeMap, BTreeSet};
@@ -49,6 +53,13 @@ pub struct FileExtraction {
     /// `relative-import` evidence label for an empty-names
     /// `RawImport::Relative`.
     pub declares_module: bool,
+    /// The producing extractor's own [`super::LangExtractor::lang`] —
+    /// ADR-0026's contract-literal pass classifies each
+    /// `ExtractOut::literals` entry by `(lang, position)`, so it needs
+    /// this alongside `origin` (a distinct string, not reused: `origin`
+    /// carries a version suffix `contracts::ContractRules` has no reason
+    /// to key on).
+    pub lang: Lang,
 }
 
 pub struct ResolvedExtraction {
@@ -56,7 +67,10 @@ pub struct ResolvedExtraction {
     pub edges: Vec<Edge>,
 }
 
-pub fn resolve(extractions: Vec<FileExtraction>) -> ResolvedExtraction {
+pub fn resolve(
+    extractions: Vec<FileExtraction>,
+    contract_rules: &ContractRules,
+) -> ResolvedExtraction {
     // Every top-level `mod <name>;` declared anywhere — a `use` path
     // whose root matches one of these is treated as internal (spec §5.3
     // rule 1's "package imports become Module nodes" only applies to the
@@ -248,8 +262,11 @@ pub fn resolve(extractions: Vec<FileExtraction>) -> ResolvedExtraction {
                     // (ADR-0015): Go can never feed tier (b). C#'s
                     // namespace `using` is the same shape (ADR-0016): it
                     // makes a whole namespace's types visible without
-                    // binding any one name.
-                    RawImport::PackagePath { .. } | RawImport::NamespaceImport { .. } => {}
+                    // binding any one name. A bare reference (ADR-0024)
+                    // binds no name at all either — same reasoning.
+                    RawImport::PackagePath { .. }
+                    | RawImport::NamespaceImport { .. }
+                    | RawImport::BareReference { .. } => {}
                 }
             }
             m
@@ -302,29 +319,116 @@ pub fn resolve(extractions: Vec<FileExtraction>) -> ResolvedExtraction {
         }
     }
 
+    // ADR-0032's owner-type disambiguation tier: two indices, in
+    // lockstep with `symbol_ids`/`same_file_by_name`'s own per-`(fi,
+    // si)` shape. `sym_owner` is each symbol's `RawSymbol::owner`
+    // (`None` for a free function/top-level type); `type_ref_names` is,
+    // per file, every type name that file's own `type_refs` names in a
+    // type position (a field/parameter/base-clause type — the same
+    // `RawTypeRef` channel ADR-0029 added for `references` edges).
+    // Together they answer "does the calling file name this candidate's
+    // owner type anywhere" — the evidence this tier requires before
+    // narrowing an otherwise-ambiguous bare-name match.
+    let sym_owner: Vec<Vec<Option<&str>>> = extractions
+        .iter()
+        .map(|fe| {
+            fe.extract
+                .symbols
+                .iter()
+                .map(|s| s.owner.as_deref())
+                .collect()
+        })
+        .collect();
+    let type_ref_names: Vec<BTreeSet<&str>> = extractions
+        .iter()
+        .map(|fe| {
+            fe.extract
+                .type_refs
+                .iter()
+                .map(|t| t.name.as_str())
+                .collect()
+        })
+        .collect();
+
+    let resolver = CallResolver {
+        same_file_by_name: &same_file_by_name,
+        alias_to_declared: &alias_to_declared,
+        sym_owner: &sym_owner,
+        type_ref_names: &type_ref_names,
+        pub_by_name: &pub_by_name,
+        dir_scoped: &dir_scoped,
+        file_dir: &file_dir,
+        same_dir_by_name: &same_dir_by_name,
+    };
+
+    // ADR-0033's inbound honesty pre-pass: every *attempted* call site
+    // repo-wide (every `call_sites` entry, attached to a symbol or not —
+    // ADR-0031 file-scope calls spell a name too) that this resolver
+    // couldn't resolve, keyed by `(origin, name)` exactly like
+    // `uncaptured_by_name` above, so a Rust `load` call never inflates a
+    // Python `load` symbol's count. Distinct from `uncaptured_by_name`:
+    // that counts syntax never even attempted; this counts syntax that
+    // *was* attempted and still produced no edge (the common case being
+    // bare-name ambiguity — an interface method and its implementation).
+    // A second resolve() pass over the same call sites the node loop
+    // below resolves again is deliberate, not an oversight: `resolve()`
+    // is a pure BTreeMap-lookup function, and keeping this pass separate
+    // (rather than threading a second output channel through the
+    // per-symbol loop) keeps the two honesty signals' bookkeeping
+    // independent, each easy to verify on its own.
+    let mut unresolved_by_name: BTreeMap<(&'static str, &str), Vec<InboundCallSite>> =
+        BTreeMap::new();
+    for (fi, fe) in extractions.iter().enumerate() {
+        for call in &fe.extract.call_sites {
+            if resolver.resolve(fi, call.callee_name.as_str()).is_none() {
+                unresolved_by_name
+                    .entry((fe.origin, call.callee_name.as_str()))
+                    .or_default()
+                    .push(InboundCallSite {
+                        file: fe.relpath.clone(),
+                        line: call.line,
+                    });
+            }
+        }
+    }
+
     let mut nodes = Vec::new();
     let mut edges = Vec::new();
     let mut external_modules: BTreeMap<&str, NodeId> = BTreeMap::new();
 
     for (fi, fe) in extractions.iter().enumerate() {
-        let calls_by_symbol =
-            assign_calls_to_innermost_symbol(&fe.extract.symbols, &fe.extract.call_sites);
+        let (calls_by_symbol, unattached_calls) =
+            assign_to_innermost_symbol(&fe.extract.symbols, &fe.extract.call_sites, |c| c.line);
+        // ADR-0023, the outbound half of §1.1's honest-absence signal:
+        // the same innermost-containment assignment `calls_by_symbol`
+        // uses, applied to the *uncaptured* call sites instead —
+        // answers "how many of this symbol's own calls did the
+        // extractor never even attempt", not "who calls this symbol
+        // that the extractor missed" (that's `uncaptured_by_name`,
+        // below, keyed by name repo-wide rather than by containment).
+        // Its own leftover bucket is unused: `uncaptured_call_sites`
+        // today comes only from Rust's path-qualified-call exclusion,
+        // which never occurs in top-level-statement-shaped code, and
+        // its repo-wide counting doesn't go through this function's
+        // per-symbol assignment at all (see `uncaptured_by_name`).
+        let (uncaptured_by_symbol, _) = assign_to_innermost_symbol(
+            &fe.extract.symbols,
+            &fe.extract.uncaptured_call_sites,
+            |c| c.line,
+        );
+        // ADR-0029: type refs get the same innermost-containment
+        // assignment as calls — a field/parameter/base-clause type
+        // name is attributed to its own enclosing symbol exactly like
+        // a call site would be.
+        let (type_refs_by_symbol, unattached_type_refs) =
+            assign_to_innermost_symbol(&fe.extract.symbols, &fe.extract.type_refs, |t| t.line);
 
         for (si, sym) in fe.extract.symbols.iter().enumerate() {
             let id = symbol_ids[fi][si].clone();
 
             let mut unresolved_calls = Vec::new();
             for &call in &calls_by_symbol[si] {
-                match resolve_call(
-                    fi,
-                    call,
-                    &same_file_by_name,
-                    &alias_to_declared,
-                    &pub_by_name,
-                    &dir_scoped,
-                    &file_dir,
-                    &same_dir_by_name,
-                ) {
+                match resolver.resolve(fi, call.callee_name.as_str()) {
                     Some((target_fi, target_si, evidence)) => {
                         let to_id = symbol_ids[target_fi][target_si].clone();
                         edges.push(Edge::new(
@@ -342,6 +446,32 @@ pub fn resolve(extractions: Vec<FileExtraction>) -> ResolvedExtraction {
                 }
             }
 
+            // ADR-0029: a type ref goes through the identical tier
+            // ladder a call would, since it's the same "which
+            // declaration does this bare name mean" question. Unlike
+            // calls, an unresolved type ref is silently dropped (see
+            // `RawTypeRef`'s doc comment) — no `unresolved_`-style
+            // list, and a resolved self-reference (a field/generic
+            // naming its own enclosing type) is suppressed rather than
+            // emitted, since a symbol referencing itself is not a
+            // dependency edge worth reporting.
+            for &tref in &type_refs_by_symbol[si] {
+                if let Some((target_fi, target_si, evidence)) =
+                    resolver.resolve(fi, tref.name.as_str())
+                {
+                    let to_id = symbol_ids[target_fi][target_si].clone();
+                    if to_id != id {
+                        edges.push(Edge::new(
+                            EdgeKind::References,
+                            id.clone(),
+                            to_id,
+                            Confidence::Inferred,
+                            format!("type-reference:{evidence}"),
+                        ));
+                    }
+                }
+            }
+
             let signature = if sym.signature.trim().is_empty() {
                 None
             } else {
@@ -352,6 +482,25 @@ pub fn resolve(extractions: Vec<FileExtraction>) -> ResolvedExtraction {
                 .get(&(fe.origin, sym.name.as_str()))
                 .copied()
                 .unwrap_or(0);
+            let uncaptured_outbound_calls = uncaptured_by_symbol[si].len() as u32;
+
+            // ADR-0033: capped list + uncapped count, same pairing
+            // `unresolved_inbound_calls`'s doc comment describes. Sorted
+            // by `(file, line)` — `InboundCallSite`'s derived `Ord` —
+            // rather than relying on `unresolved_by_name`'s incidental
+            // insertion order, so the rendered list is legible on its
+            // own and stays order-stable regardless of extraction order
+            // (INV-7).
+            let unresolved_inbound_call_count = unresolved_by_name
+                .get(&(fe.origin, sym.name.as_str()))
+                .map(|sites| sites.len() as u32)
+                .unwrap_or(0);
+            let mut unresolved_inbound_calls = unresolved_by_name
+                .get(&(fe.origin, sym.name.as_str()))
+                .cloned()
+                .unwrap_or_default();
+            unresolved_inbound_calls.sort();
+            unresolved_inbound_calls.truncate(consts::UNRESOLVED_INBOUND_SITES_CAP);
 
             nodes.push(Node::symbol(
                 id.clone(),
@@ -366,6 +515,9 @@ pub fn resolve(extractions: Vec<FileExtraction>) -> ResolvedExtraction {
                     signature,
                     unresolved_calls,
                     uncaptured_inbound_calls,
+                    uncaptured_outbound_calls,
+                    unresolved_inbound_calls,
+                    unresolved_inbound_call_count,
                 },
             ));
 
@@ -376,6 +528,48 @@ pub fn resolve(extractions: Vec<FileExtraction>) -> ResolvedExtraction {
                 Confidence::Certain,
                 fe.origin.to_string(),
             ));
+        }
+
+        // ADR-0031: a call or type ref with no enclosing symbol at all
+        // (top-level-statement code — see `assign_to_innermost_symbol`'s
+        // own doc comment) is resolved at *file* scope instead of being
+        // silently dropped, through the identical tier ladder the
+        // symbol-scoped loops above already use — `resolve_call` itself
+        // doesn't care whether the caller is a symbol or a file. Only
+        // the *resolved* case is handled (user-confirmed scope): an
+        // unattached item that fails to resolve is simply not pushed,
+        // the same invisible-miss behavior as before this ADR — there
+        // is no `FileNode` equivalent of `unresolved_calls` yet, and
+        // adding one is a separate, unscoped decision. No self-
+        // reference suppression is needed the way the symbol-scoped
+        // type-ref loop above needs one: a `File` ID and a `Symbol` ID
+        // are never equal.
+        for &call in &unattached_calls {
+            if let Some((target_fi, target_si, evidence)) =
+                resolver.resolve(fi, call.callee_name.as_str())
+            {
+                let to_id = symbol_ids[target_fi][target_si].clone();
+                edges.push(Edge::new(
+                    EdgeKind::Calls,
+                    fe.file_id.clone(),
+                    to_id,
+                    Confidence::Inferred,
+                    evidence.to_string(),
+                ));
+            }
+        }
+        for &tref in &unattached_type_refs {
+            if let Some((target_fi, target_si, evidence)) = resolver.resolve(fi, tref.name.as_str())
+            {
+                let to_id = symbol_ids[target_fi][target_si].clone();
+                edges.push(Edge::new(
+                    EdgeKind::References,
+                    fe.file_id.clone(),
+                    to_id,
+                    Confidence::Inferred,
+                    format!("type-reference:{evidence}"),
+                ));
+            }
         }
 
         for imp in &fe.extract.imports {
@@ -483,6 +677,48 @@ pub fn resolve(extractions: Vec<FileExtraction>) -> ResolvedExtraction {
                         module_id,
                         Confidence::Certain,
                         "external-package".to_string(),
+                    ));
+                }
+                RawImport::BareReference { root } => {
+                    // ADR-0024: same internal/external classification
+                    // `Absolute` uses immediately above (a bare
+                    // reference to a genuinely internal module — e.g.
+                    // `orders::helper()` naming a local `mod orders;`
+                    // in a call-callee-excluded position — is still
+                    // internal, no edge needed since call resolution's
+                    // own tiers already cover same-repo references).
+                    // Only the evidence string differs, so a caller can
+                    // tell this heuristic detection apart from a
+                    // verified `use` declaration.
+                    let is_internal = root == "crate"
+                        || root == "self"
+                        || root == "super"
+                        || known_modules.contains(root.as_str());
+                    if is_internal {
+                        continue;
+                    }
+                    let module_id = external_modules
+                        .entry(root.as_str())
+                        .or_insert_with(|| {
+                            let id = graph::module_id(root, true);
+                            nodes.push(Node::module(
+                                id.clone(),
+                                Provenance::Syntactic,
+                                fe.origin,
+                                ModuleNode {
+                                    path: root.clone(),
+                                    external: true,
+                                },
+                            ));
+                            id
+                        })
+                        .clone();
+                    edges.push(Edge::new(
+                        EdgeKind::Imports,
+                        fe.file_id.clone(),
+                        module_id,
+                        Confidence::Certain,
+                        "external-package-bare-reference".to_string(),
                     ));
                 }
                 RawImport::Qualified { fqn, .. } => {
@@ -673,51 +909,135 @@ pub fn resolve(extractions: Vec<FileExtraction>) -> ResolvedExtraction {
                 }
             }
         }
+
+        // ADR-0026: every literal this file's extractor recognized in a
+        // contract-relevant position, classified by `(lang, position)`.
+        // An unclassified position (no rule matches) is dropped — same
+        // "unmapped beats guessed" honesty `resolve_call` already
+        // applies to an ambiguous call. Node/edge duplicates across
+        // files (the same metric name produced or consumed more than
+        // once) are handled by `Graph::insert_node`'s overwrite and
+        // `insert_edge`'s §4.3 merge once `indexer::build_and_persist`
+        // folds this Vec in — both are pure functions of
+        // (category, qualifier, value)/(kind, from, to), so re-pushing
+        // identical content here needs no dedup of its own.
+        for lit in &fe.extract.literals {
+            let Some((category, role, confidence, evidence_prefix)) =
+                contract_rules.classify(fe.lang, &lit.position)
+            else {
+                continue;
+            };
+
+            let attach_id = smallest_containing_symbol(&fe.extract.symbols, lit.line)
+                .map(|si| symbol_ids[fi][si].clone())
+                .unwrap_or_else(|| fe.file_id.clone());
+
+            let contract_node_id =
+                graph::contract_id(category, lit.qualifier.as_deref(), &lit.value);
+            nodes.push(Node::contract(
+                contract_node_id.clone(),
+                Provenance::Syntactic,
+                fe.origin,
+                ContractNode {
+                    category: category.to_string(),
+                    qualifier: lit
+                        .qualifier
+                        .as_deref()
+                        .map(|q| TaintedString::new(q, Provenance::Syntactic)),
+                    value: TaintedString::new(&lit.value, Provenance::Syntactic),
+                },
+            ));
+
+            let edge_kind = match role {
+                Role::Producer => EdgeKind::Produces,
+                Role::Consumer => EdgeKind::Consumes,
+            };
+            edges.push(Edge::new(
+                edge_kind,
+                attach_id,
+                contract_node_id,
+                confidence,
+                format!("{evidence_prefix}:{}", lit.position),
+            ));
+        }
     }
 
     ResolvedExtraction { nodes, edges }
 }
 
-/// Assigns each call site to the *innermost* symbol whose line range
-/// contains it, rather than every symbol whose range does. A
-/// class/interface/trait/enum symbol's own range spans its methods'
-/// bodies too (PHP, Python — a Rust `struct`/`impl` doesn't have this
-/// shape, since an `impl` block itself is never a symbol), so naive
-/// per-symbol containment would attribute a method's call to both the
-/// method *and* its enclosing class: two `calls` edges (or two
-/// `unresolved_calls` entries) for what is textually one call site —
-/// caught by eyeballing real `fixtures/php-app` output (ADR-0012), not
-/// by a unit test on an isolated snippet, since `fixtures/py-lib`
-/// happens to have no call site inside a class body's methods and never
-/// exercised this. Ties (two symbols with identical ranges) fall back to
-/// whichever is encountered first — doesn't arise from any current
-/// extractor, which never emits two symbols with identical ranges.
-fn assign_calls_to_innermost_symbol<'a>(
-    symbols: &[RawSymbol],
-    call_sites: &'a [RawCallSite],
-) -> Vec<Vec<&'a RawCallSite>> {
-    let mut by_symbol: Vec<Vec<&RawCallSite>> = vec![Vec::new(); symbols.len()];
-    for call in call_sites {
-        let mut best: Option<usize> = None;
-        for (si, sym) in symbols.iter().enumerate() {
-            if call.line < sym.start_line || call.line > sym.end_line {
-                continue; // not textually inside this symbol
-            }
-            let smaller = match best {
-                None => true,
-                Some(b) => {
-                    (sym.end_line - sym.start_line) < (symbols[b].end_line - symbols[b].start_line)
-                }
-            };
-            if smaller {
-                best = Some(si);
-            }
+/// The innermost-containment primitive shared by
+/// [`assign_to_innermost_symbol`] (batched over every call site or type
+/// ref in a file) and the contract-literal pass above
+/// (`innermost_symbol_for_line`, one line at a time): the *smallest*
+/// symbol (by line-range width) whose range contains `line`, or `None`
+/// if no symbol does. A class/interface/trait/enum symbol's own range
+/// spans its methods' bodies too (PHP, Python — a Rust `struct`/`impl`
+/// doesn't have this shape, since an `impl` block itself is never a
+/// symbol), so naive per-symbol containment would attribute a method's
+/// call to both the method *and* its enclosing class: two `calls` edges
+/// (or two `unresolved_calls` entries) for what is textually one call
+/// site — caught by eyeballing real `fixtures/php-app` output
+/// (ADR-0012), not by a unit test on an isolated snippet, since
+/// `fixtures/py-lib` happens to have no call site inside a class body's
+/// methods and never exercised this. Ties (two symbols with identical
+/// ranges) fall back to whichever is encountered first — doesn't arise
+/// from any current extractor, which never emits two symbols with
+/// identical ranges. Kept as one function (rather than two independent
+/// copies of the same loop, ADR-0026's contract-literal pass had before
+/// this) so a future change to the tie-break rule can't apply to one
+/// call site and silently miss the other.
+fn smallest_containing_symbol(symbols: &[RawSymbol], line: u32) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    for (si, sym) in symbols.iter().enumerate() {
+        if line < sym.start_line || line > sym.end_line {
+            continue;
         }
-        if let Some(si) = best {
-            by_symbol[si].push(call);
+        let smaller = match best {
+            None => true,
+            Some(b) => {
+                (sym.end_line - sym.start_line) < (symbols[b].end_line - symbols[b].start_line)
+            }
+        };
+        if smaller {
+            best = Some(si);
         }
     }
-    by_symbol
+    best
+}
+
+/// Assigns each item (a call site or a type ref — anything with a
+/// `line`) to the *innermost* symbol whose line range contains it,
+/// rather than every symbol whose range does — see
+/// [`smallest_containing_symbol`] for the containment/tie-break rule
+/// itself. Generalized (ADR-0029) from an original `RawCallSite`-only
+/// `assign_calls_to_innermost_symbol` once `RawTypeRef` needed the
+/// identical assignment; `line_of` is the one difference between the
+/// two callers' item shapes.
+///
+/// Also returns every item `smallest_containing_symbol` couldn't place
+/// at all (ADR-0031) — most commonly C#/TS/JS/Python top-level-
+/// statement code, which no `symbols.scm` pattern captures as a
+/// container of anything (ASP.NET Core's minimal-API `Program.cs`
+/// style, with no `Main` method at all, is the concrete case that
+/// motivated this). Before ADR-0031, such an item was silently
+/// dropped here — never resolved, never counted, never visible
+/// anywhere, stricter silence than `unresolved_calls` gives an
+/// ordinary same-symbol miss. The two return values partition `items`
+/// completely: every item is in exactly one bucket.
+fn assign_to_innermost_symbol<'a, T>(
+    symbols: &[RawSymbol],
+    items: &'a [T],
+    line_of: impl Fn(&T) -> u32,
+) -> (Vec<Vec<&'a T>>, Vec<&'a T>) {
+    let mut by_symbol: Vec<Vec<&T>> = vec![Vec::new(); symbols.len()];
+    let mut unattached: Vec<&T> = Vec::new();
+    for item in items {
+        match smallest_containing_symbol(symbols, line_of(item)) {
+            Some(si) => by_symbol[si].push(item),
+            None => unattached.push(item),
+        }
+    }
+    (by_symbol, unattached)
 }
 
 /// Spec §5.3 rule 2, in order, first match wins: (a) same-file, (a′)
@@ -725,69 +1045,139 @@ fn assign_calls_to_innermost_symbol<'a>(
 /// same-package (v1: same walked repo). Returns `(target_file_index,
 /// target_symbol_index, evidence)` or `None` if no tier produced exactly
 /// one candidate.
-#[allow(clippy::too_many_arguments)]
-fn resolve_call(
-    caller_file_idx: usize,
-    call: &RawCallSite,
-    same_file_by_name: &[BTreeMap<&str, Vec<usize>>],
-    alias_to_declared: &[BTreeMap<&str, &str>],
-    pub_by_name: &BTreeMap<&str, Vec<(usize, usize)>>,
-    dir_scoped: &[bool],
-    file_dir: &[&str],
-    same_dir_by_name: &BTreeMap<(&str, &str), Vec<(usize, usize)>>,
-) -> Option<(usize, usize, &'static str)> {
-    let name = call.callee_name.as_str();
+///
+/// Takes a bare `name` rather than a `&RawCallSite` (ADR-0029) — the
+/// question "which declaration does this bare identifier mean" is
+/// identical for a call site's callee and a type ref's type name, and
+/// this tier ladder is the one place that answers it; `resolve`'s
+/// several call sites (calls, type refs, the ADR-0031 file-scope
+/// leftovers, and ADR-0033's inbound-honesty pre-pass) each extract
+/// their own `name` before calling in. Bundled into a struct (rather
+/// than passed as six loose slice/map parameters, as before ADR-0033)
+/// since the pre-pass added a fifth call site to what was already
+/// `#[allow(clippy::too_many_arguments)]`.
+struct CallResolver<'a> {
+    same_file_by_name: &'a [BTreeMap<&'a str, Vec<usize>>],
+    alias_to_declared: &'a [BTreeMap<&'a str, &'a str>],
+    pub_by_name: &'a BTreeMap<&'a str, Vec<(usize, usize)>>,
+    dir_scoped: &'a [bool],
+    file_dir: &'a [&'a str],
+    same_dir_by_name: &'a BTreeMap<(&'a str, &'a str), Vec<(usize, usize)>>,
+    /// ADR-0032: each symbol's `RawSymbol::owner`, in the same `[fi][si]`
+    /// lockstep as `symbol_ids`/`same_file_by_name`.
+    sym_owner: &'a [Vec<Option<&'a str>>],
+    /// ADR-0032: per file, every type name that file's own `type_refs`
+    /// names in a type position — what `disambiguate_by_owner` checks a
+    /// candidate's owner against.
+    type_ref_names: &'a [BTreeSet<&'a str>],
+}
 
-    match same_file_by_name[caller_file_idx]
-        .get(name)
-        .map(Vec::as_slice)
-    {
-        Some([si]) => return Some((caller_file_idx, *si, "same-file")),
-        // Two-or-more same-file declarations: the callee is almost
-        // certainly one of them (local scope wins in every supported
-        // language), but which one is ambiguous — no edge, and no
-        // fall-through to a lower tier that would "resolve" it
-        // elsewhere (INV-8: missing honestly beats guessing).
-        Some([_, _, ..]) => return None,
-        _ => {}
-    }
+impl<'a> CallResolver<'a> {
+    fn resolve(&self, caller_file_idx: usize, name: &str) -> Option<(usize, usize, &'static str)> {
+        match self.same_file_by_name[caller_file_idx]
+            .get(name)
+            .map(Vec::as_slice)
+        {
+            Some([si]) => return Some((caller_file_idx, *si, "same-file")),
+            // Two-or-more same-file declarations: the callee is almost
+            // certainly one of them (local scope wins in every supported
+            // language), and truly ambiguous only if ADR-0032's owner-type
+            // filter (below) can't narrow it further — no fall-through to
+            // a lower tier that would "resolve" it elsewhere either way
+            // (INV-8: missing honestly beats guessing).
+            Some(candidates) if candidates.len() >= 2 => {
+                let pairs = candidates.iter().map(|&si| (caller_file_idx, si));
+                if let Some((fi, si)) = self.disambiguate_by_owner(caller_file_idx, pairs) {
+                    return Some((fi, si, "same-file+owner-type-referenced"));
+                }
+                return None;
+            }
+            _ => {}
+        }
 
-    // Tier (a′), Go only (ADR-0015): same directory, any visibility —
-    // files in one Go package see each other's unexported symbols with
-    // no import at all. Gated on `dir_scoped` so a non-Go file that
-    // happens to share a directory with a Go file (an unusual mixed-repo
-    // layout) never picks up this tier.
-    if dir_scoped[caller_file_idx] {
-        let dir = file_dir[caller_file_idx];
-        if let Some(candidates) = same_dir_by_name.get(&(dir, name)) {
-            let mut others = candidates.iter().filter(|(fi, _)| *fi != caller_file_idx);
-            if let (Some(&(fi, si)), None) = (others.next(), others.next()) {
-                return Some((fi, si, "same-directory"));
+        // Tier (a′), Go only (ADR-0015): same directory, any visibility —
+        // files in one Go package see each other's unexported symbols with
+        // no import at all. Gated on `dir_scoped` so a non-Go file that
+        // happens to share a directory with a Go file (an unusual mixed-repo
+        // layout) never picks up this tier. Not extended with the
+        // owner-type filter below — ADR-0032 scopes that to the three
+        // tiers real field feedback motivated it for.
+        if self.dir_scoped[caller_file_idx] {
+            let dir = self.file_dir[caller_file_idx];
+            if let Some(candidates) = self.same_dir_by_name.get(&(dir, name)) {
+                let mut others = candidates.iter().filter(|(fi, _)| *fi != caller_file_idx);
+                if let (Some(&(fi, si)), None) = (others.next(), others.next()) {
+                    return Some((fi, si, "same-directory"));
+                }
             }
         }
-    }
 
-    // Alias-aware: `name` is what the call site spells; the map's
-    // value (if any) is the *declared* name `pub_by_name` is keyed by
-    // — the same string for an unaliased import, a different one for
-    // `import { foo as bar }`/`from x import foo as bar`/`use Foo as
-    // X;`. See `ImportedName`'s doc comment.
-    if let Some(&declared) = alias_to_declared[caller_file_idx].get(name) {
-        if let Some(candidates) = pub_by_name.get(declared) {
-            if let [(fi, si)] = candidates[..] {
-                return Some((fi, si, "imported"));
+        // Alias-aware: `name` is what the call site spells; the map's
+        // value (if any) is the *declared* name `pub_by_name` is keyed by
+        // — the same string for an unaliased import, a different one for
+        // `import { foo as bar }`/`from x import foo as bar`/`use Foo as
+        // X;`. See `ImportedName`'s doc comment.
+        if let Some(&declared) = self.alias_to_declared[caller_file_idx].get(name) {
+            if let Some(candidates) = self.pub_by_name.get(declared) {
+                if let [(fi, si)] = candidates[..] {
+                    return Some((fi, si, "imported"));
+                }
+                if candidates.len() >= 2 {
+                    if let Some((fi, si)) =
+                        self.disambiguate_by_owner(caller_file_idx, candidates.iter().copied())
+                    {
+                        return Some((fi, si, "imported+owner-type-referenced"));
+                    }
+                }
             }
         }
+
+        if let Some(candidates) = self.pub_by_name.get(name) {
+            let others: Vec<(usize, usize)> = candidates
+                .iter()
+                .filter(|(fi, _)| *fi != caller_file_idx)
+                .copied()
+                .collect();
+            match others.as_slice() {
+                [(fi, si)] => return Some((*fi, *si, "same-package")),
+                many if many.len() >= 2 => {
+                    if let Some((fi, si)) =
+                        self.disambiguate_by_owner(caller_file_idx, many.iter().copied())
+                    {
+                        return Some((fi, si, "same-package+owner-type-referenced"));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        None
     }
 
-    if let Some(candidates) = pub_by_name.get(name) {
-        let mut others = candidates.iter().filter(|(fi, _)| *fi != caller_file_idx);
-        if let (Some(&(fi, si)), None) = (others.next(), others.next()) {
-            return Some((fi, si, "same-package"));
+    /// ADR-0032: narrows an otherwise-ambiguous candidate list to the
+    /// single one whose `owner` the calling file actually names in a
+    /// type position (`type_ref_names[caller_file_idx]`) — e.g. a field
+    /// typed `IQueryRepository` disambiguates a `CancelQuery` call
+    /// between `IQueryRepository.CancelQuery` and
+    /// `QueryRepository.CancelQuery`. A candidate with no owner (a free
+    /// function, or a type name itself) never survives the filter.
+    /// Exactly one survivor resolves; zero or several leave the
+    /// ambiguity exactly as before this tier existed — this can only
+    /// ever turn a `None` into a `Some`, never change which candidate an
+    /// already-unambiguous tier would have picked.
+    fn disambiguate_by_owner(
+        &self,
+        caller_file_idx: usize,
+        candidates: impl Iterator<Item = (usize, usize)>,
+    ) -> Option<(usize, usize)> {
+        let referenced = &self.type_ref_names[caller_file_idx];
+        let mut survivors = candidates
+            .filter(|&(fi, si)| self.sym_owner[fi][si].is_some_and(|o| referenced.contains(o)));
+        match (survivors.next(), survivors.next()) {
+            (Some(only), None) => Some(only),
+            _ => None,
         }
     }
-
-    None
 }
 
 /// Resolves a relative import (Rust's `mod <name>;`, `levels_up` always
@@ -898,7 +1288,7 @@ fn resolve_go_package_path<'a>(
 mod tests {
     use super::*;
     use crate::graph::{NodeData, SymKind};
-    use crate::lang::extractor::{ImportedName, RawSymbol};
+    use crate::lang::extractor::{ImportedName, RawCallSite, RawLiteral, RawSymbol, RawTypeRef};
 
     fn file(relpath: &str) -> FileExtraction {
         FileExtraction {
@@ -917,6 +1307,7 @@ mod tests {
             // semantics turned off set `declares_module = false`
             // explicitly (see `ts_relative_import_...` below).
             declares_module: true,
+            lang: Lang::Rust,
         }
     }
 
@@ -928,6 +1319,7 @@ mod tests {
         fe.ns_separator = ".";
         fe.qualified_external_is_full_fqn = true;
         fe.declares_module = false;
+        fe.lang = Lang::CSharp;
         fe
     }
 
@@ -940,6 +1332,24 @@ mod tests {
             end_line: end,
             signature: format!("fn {name}()"),
             is_pub,
+            owner: None,
+        }
+    }
+
+    /// Like `sym`, but with an owner type set — ADR-0032's
+    /// disambiguation tier only ever fires for a symbol declared inside
+    /// a type (a method, most commonly).
+    fn sym_with_owner(
+        name: &str,
+        kind: SymKind,
+        start: u32,
+        end: u32,
+        is_pub: bool,
+        owner: &str,
+    ) -> RawSymbol {
+        RawSymbol {
+            owner: Some(owner.to_string()),
+            ..sym(name, kind, start, end, is_pub)
         }
     }
 
@@ -981,6 +1391,20 @@ mod tests {
             .collect()
     }
 
+    fn references_edges(edges: &[Edge]) -> Vec<&Edge> {
+        edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::References)
+            .collect()
+    }
+
+    fn type_ref(name: &str, line: u32) -> RawTypeRef {
+        RawTypeRef {
+            name: name.to_string(),
+            line,
+        }
+    }
+
     #[test]
     fn same_file_call_resolves_with_same_file_evidence() {
         let mut f = file("src/orders.rs");
@@ -990,7 +1414,7 @@ mod tests {
         ];
         f.extract.call_sites = vec![call("validate", 3)];
 
-        let out = resolve(vec![f]);
+        let out = resolve(vec![f], &ContractRules::builtin());
         assert!(
             find_symbol(&out.nodes, "parse_order")
                 .unresolved_calls
@@ -1016,7 +1440,7 @@ mod tests {
         let mut orders = file("src/orders.rs");
         orders.extract.symbols = vec![sym("parse_order", SymKind::Function, 1, 3, true)];
 
-        let out = resolve(vec![handlers, orders]);
+        let out = resolve(vec![handlers, orders], &ContractRules::builtin());
         assert!(
             find_symbol(&out.nodes, "handle")
                 .unresolved_calls
@@ -1025,6 +1449,202 @@ mod tests {
         assert_eq!(
             calls_edges(&out.edges)[0].evidence,
             vec!["imported".to_string()]
+        );
+    }
+
+    // ADR-0032: owner-type disambiguation. The reported gap, reproduced
+    // directly: an interface method and its implementation share a bare
+    // name (`Save`), so tier (c)/(b)/(a) each see ≥2 candidates and
+    // would otherwise drop the call — but the caller's own field/
+    // parameter type (a `type_refs` entry, ADR-0029's channel) names
+    // exactly one of the two owning types, which is enough evidence to
+    // resolve it without guessing.
+
+    #[test]
+    fn ambiguous_same_package_call_resolves_via_callers_owner_type_reference() {
+        let mut store = cs_file("Ports/IQueryJobStore.cs");
+        store.extract.symbols = vec![sym_with_owner(
+            "Save",
+            SymKind::Method,
+            3,
+            3,
+            true,
+            "IQueryJobStore",
+        )];
+
+        let mut in_memory = cs_file("Services/InMemoryQueryJobStore.cs");
+        in_memory.extract.symbols = vec![sym_with_owner(
+            "Save",
+            SymKind::Method,
+            5,
+            7,
+            true,
+            "InMemoryQueryJobStore",
+        )];
+
+        let mut service = cs_file("Services/QueryJobService.cs");
+        service.extract.symbols = vec![sym("CancelQuery", SymKind::Method, 1, 6, true)];
+        service.extract.call_sites = vec![call("Save", 4)];
+        // A field/parameter typed `IQueryJobStore` — the same
+        // `RawTypeRef` a constructor-injected field produces.
+        service.extract.type_refs = vec![type_ref("IQueryJobStore", 2)];
+
+        let out = resolve(vec![store, in_memory, service], &ContractRules::builtin());
+
+        let edges = calls_edges(&out.edges);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(
+            edges[0].to,
+            graph::sym_id("Ports/IQueryJobStore.cs", "method", "Save", 3)
+        );
+        assert_eq!(
+            edges[0].evidence,
+            vec!["same-package+owner-type-referenced".to_string()]
+        );
+        assert!(
+            find_symbol(&out.nodes, "CancelQuery")
+                .unresolved_calls
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn ambiguous_call_stays_unresolved_when_caller_references_both_owner_types() {
+        // The negative case: a registration-style file that names
+        // *both* candidate owner types (e.g. `services.AddSingleton
+        // <IQueryJobStore, InMemoryQueryJobStore>()`) leaves the filter
+        // with two survivors, not one — exactly as ambiguous as before
+        // this tier existed. This is also the case ADR-0033's
+        // `unresolved_inbound_calls` exists to surface: neither
+        // `IQueryJobStore.Save` nor `InMemoryQueryJobStore.Save` gets a
+        // `calls` edge from this call site, but each records it as an
+        // attempted-and-dropped inbound site.
+        let mut store = cs_file("Ports/IQueryJobStore.cs");
+        store.extract.symbols = vec![sym_with_owner(
+            "Save",
+            SymKind::Method,
+            3,
+            3,
+            true,
+            "IQueryJobStore",
+        )];
+
+        let mut in_memory = cs_file("Services/InMemoryQueryJobStore.cs");
+        in_memory.extract.symbols = vec![sym_with_owner(
+            "Save",
+            SymKind::Method,
+            5,
+            7,
+            true,
+            "InMemoryQueryJobStore",
+        )];
+
+        let mut registration = cs_file("Program.cs");
+        registration.extract.symbols = vec![sym("Register", SymKind::Method, 1, 6, true)];
+        registration.extract.call_sites = vec![call("Save", 4)];
+        registration.extract.type_refs = vec![
+            type_ref("IQueryJobStore", 2),
+            type_ref("InMemoryQueryJobStore", 3),
+        ];
+
+        let out = resolve(
+            vec![store, in_memory, registration],
+            &ContractRules::builtin(),
+        );
+
+        assert!(calls_edges(&out.edges).is_empty());
+        let register = find_symbol(&out.nodes, "Register");
+        assert_eq!(register.unresolved_calls.len(), 1);
+        assert_eq!(register.unresolved_calls[0].name, "Save");
+
+        // Both `Save` symbols must carry the honest inbound signal —
+        // ADR-0033's field this scenario motivated.
+        let store_save = find_symbol(&out.nodes, "Save");
+        assert_eq!(store_save.unresolved_inbound_call_count, 1);
+        assert_eq!(store_save.unresolved_inbound_calls[0].file, "Program.cs");
+    }
+
+    #[test]
+    fn owner_type_disambiguation_never_fires_for_ownerless_candidates() {
+        // Two free functions (no owner) sharing a bare name, with an
+        // unrelated type ref present — the filter must never engage for
+        // a candidate with no owner (a free function or a type
+        // declaration itself), so this stays exactly as ambiguous as
+        // `ambiguous_same_package_candidates_produce_no_edge`.
+        let mut caller = file("src/a.rs");
+        caller.extract.symbols = vec![sym("run", SymKind::Function, 1, 5, true)];
+        caller.extract.call_sites = vec![call("helper", 3)];
+        caller.extract.type_refs = vec![type_ref("Helper", 1)];
+
+        let mut b = file("src/b.rs");
+        b.extract.symbols = vec![sym("helper", SymKind::Function, 1, 2, true)];
+        let mut c = file("src/c.rs");
+        c.extract.symbols = vec![sym("helper", SymKind::Function, 1, 2, true)];
+
+        let out = resolve(vec![caller, b, c], &ContractRules::builtin());
+        assert!(calls_edges(&out.edges).is_empty());
+        assert_eq!(find_symbol(&out.nodes, "run").unresolved_calls.len(), 1);
+    }
+
+    #[test]
+    fn ambiguous_same_file_call_resolves_via_owner_type_reference() {
+        let mut f = file("src/a.rs");
+        f.extract.symbols = vec![
+            sym_with_owner("Save", SymKind::Method, 1, 2, true, "Store"),
+            sym_with_owner("Save", SymKind::Method, 4, 5, true, "OtherStore"),
+            sym("run", SymKind::Function, 7, 10, true),
+        ];
+        f.extract.call_sites = vec![call("Save", 8)];
+        f.extract.type_refs = vec![type_ref("Store", 7)];
+
+        let out = resolve(vec![f], &ContractRules::builtin());
+        let edges = calls_edges(&out.edges);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].to, graph::sym_id("src/a.rs", "method", "Save", 1));
+        assert_eq!(
+            edges[0].evidence,
+            vec!["same-file+owner-type-referenced".to_string()]
+        );
+    }
+
+    #[test]
+    fn ambiguous_imported_call_resolves_via_owner_type_reference() {
+        let mut handlers = file("src/handlers.rs");
+        handlers.extract.imports = vec![RawImport::Absolute {
+            root: "crate".into(),
+            imported_names: vec![name("Save")],
+        }];
+        handlers.extract.symbols = vec![sym("handle", SymKind::Function, 1, 5, true)];
+        handlers.extract.call_sites = vec![call("Save", 3)];
+        handlers.extract.type_refs = vec![type_ref("Store", 2)];
+
+        let mut store = file("src/store.rs");
+        store.extract.symbols = vec![sym_with_owner("Save", SymKind::Method, 1, 3, true, "Store")];
+        let mut other = file("src/other_store.rs");
+        other.extract.symbols = vec![sym_with_owner(
+            "Save",
+            SymKind::Method,
+            1,
+            3,
+            true,
+            "OtherStore",
+        )];
+
+        let out = resolve(vec![handlers, store, other], &ContractRules::builtin());
+        assert!(
+            find_symbol(&out.nodes, "handle")
+                .unresolved_calls
+                .is_empty()
+        );
+        let edges = calls_edges(&out.edges);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(
+            edges[0].to,
+            graph::sym_id("src/store.rs", "method", "Save", 1)
+        );
+        assert_eq!(
+            edges[0].evidence,
+            vec!["imported+owner-type-referenced".to_string()]
         );
     }
 
@@ -1055,7 +1675,7 @@ mod tests {
         orders.origin = "lang-python@1";
         orders.extract.symbols = vec![sym("parse_order", SymKind::Function, 1, 3, true)];
 
-        let out = resolve(vec![handlers, orders]);
+        let out = resolve(vec![handlers, orders], &ContractRules::builtin());
         assert!(
             find_symbol(&out.nodes, "handle")
                 .unresolved_calls
@@ -1085,7 +1705,7 @@ mod tests {
         handlers.extract.symbols = vec![sym("handle", SymKind::Function, 5, 8, true)];
         handlers.extract.call_sites = vec![call("po", 6)];
 
-        let out = resolve(vec![handlers, orders]);
+        let out = resolve(vec![handlers, orders], &ContractRules::builtin());
         assert!(
             find_symbol(&out.nodes, "handle")
                 .unresolved_calls
@@ -1106,7 +1726,7 @@ mod tests {
         let mut orders = file("src/orders.rs");
         orders.extract.symbols = vec![sym("audit_order", SymKind::Function, 1, 3, true)];
 
-        let out = resolve(vec![handlers, orders]);
+        let out = resolve(vec![handlers, orders], &ContractRules::builtin());
         assert!(
             find_symbol(&out.nodes, "handle")
                 .unresolved_calls
@@ -1140,7 +1760,7 @@ mod tests {
         other.origin = "lang-php@1";
         other.extract.symbols = vec![sym("summary", SymKind::Function, 1, 2, true)];
 
-        let out = resolve(vec![f, other]);
+        let out = resolve(vec![f, other], &ContractRules::builtin());
         let handle = find_symbol(&out.nodes, "handle");
         assert_eq!(handle.unresolved_calls.len(), 1);
         assert_eq!(handle.unresolved_calls[0].name, "summary");
@@ -1176,7 +1796,7 @@ mod tests {
             imported_names: vec![],
         }];
 
-        let out = resolve(vec![app, orders, consumer]);
+        let out = resolve(vec![app, orders, consumer], &ContractRules::builtin());
         // The side-effect import still resolves file-to-file, with
         // relative-import (not mod-declaration) evidence...
         let imports = imports_edges(&out.edges);
@@ -1205,11 +1825,58 @@ mod tests {
         let mut c = file("src/c.rs");
         c.extract.symbols = vec![sym("helper", SymKind::Function, 1, 2, true)];
 
-        let out = resolve(vec![caller, b, c]);
+        let out = resolve(vec![caller, b, c], &ContractRules::builtin());
         let run = find_symbol(&out.nodes, "run");
         assert_eq!(run.unresolved_calls.len(), 1);
         assert_eq!(run.unresolved_calls[0].name, "helper");
         assert!(calls_edges(&out.edges).is_empty());
+
+        // ADR-0033: the same ambiguity, from the *inbound* side — both
+        // `b::helper` and `c::helper` must record the attempted-and-
+        // dropped call site from `src/a.rs:3`, since neither carto nor
+        // this test can say which one it meant. This is the honesty
+        // signal a `deps --dir in` answer on either symbol needs: an
+        // empty `calls` edge list here is not "no callers".
+        let helper_b = find_symbol(&out.nodes, "helper");
+        assert_eq!(helper_b.unresolved_inbound_call_count, 1);
+        assert_eq!(
+            helper_b.unresolved_inbound_calls,
+            vec![InboundCallSite {
+                file: "src/a.rs".to_string(),
+                line: 3,
+            }]
+        );
+    }
+
+    #[test]
+    fn unresolved_inbound_calls_is_capped_but_the_count_stays_uncapped() {
+        // One more unresolved site than the cap, each from its own file
+        // (so `unresolved_by_name`'s bucket for `helper` gets exactly
+        // `UNRESOLVED_INBOUND_SITES_CAP + 1` entries) — the list must
+        // truncate at the cap while the count still reports the real
+        // total, per ADR-0033.
+        let mut b = file("src/b.rs");
+        b.extract.symbols = vec![sym("helper", SymKind::Function, 1, 2, true)];
+        let mut c = file("src/c.rs");
+        c.extract.symbols = vec![sym("helper", SymKind::Function, 1, 2, true)];
+
+        let total = crate::consts::UNRESOLVED_INBOUND_SITES_CAP as u32 + 1;
+        let mut extractions = vec![b, c];
+        for i in 0..total {
+            let mut caller = file(&format!("src/caller_{i:02}.rs"));
+            caller.extract.call_sites = vec![call("helper", 1)];
+            extractions.push(caller);
+        }
+
+        let out = resolve(extractions, &ContractRules::builtin());
+        let helper = find_symbol(&out.nodes, "helper");
+        assert_eq!(helper.unresolved_inbound_call_count, total);
+        assert_eq!(
+            helper.unresolved_inbound_calls.len(),
+            crate::consts::UNRESOLVED_INBOUND_SITES_CAP
+        );
+        // Sorted by (file, line) — `src/caller_00.rs` sorts first.
+        assert_eq!(helper.unresolved_inbound_calls[0].file, "src/caller_00.rs");
     }
 
     #[test]
@@ -1218,7 +1885,7 @@ mod tests {
         f.extract.symbols = vec![sym("run", SymKind::Function, 1, 5, true)];
         f.extract.call_sites = vec![call("mystery", 3)];
 
-        let out = resolve(vec![f]);
+        let out = resolve(vec![f], &ContractRules::builtin());
         let run = find_symbol(&out.nodes, "run");
         assert_eq!(
             run.unresolved_calls,
@@ -1239,7 +1906,7 @@ mod tests {
         }];
         let orders = file("src/orders.rs");
 
-        let out = resolve(vec![lib, orders]);
+        let out = resolve(vec![lib, orders], &ContractRules::builtin());
         let imports = imports_edges(&out.edges);
         assert_eq!(imports.len(), 1);
         assert_eq!(imports[0].confidence, Confidence::Certain);
@@ -1256,7 +1923,7 @@ mod tests {
         }];
         let orders = file("src/orders/mod.rs");
 
-        let out = resolve(vec![lib, orders]);
+        let out = resolve(vec![lib, orders], &ContractRules::builtin());
         assert_eq!(imports_edges(&out.edges).len(), 1);
     }
 
@@ -1269,7 +1936,7 @@ mod tests {
             imported_names: vec![],
         }];
 
-        let out = resolve(vec![lib]);
+        let out = resolve(vec![lib], &ContractRules::builtin());
         assert!(imports_edges(&out.edges).is_empty());
     }
 
@@ -1288,7 +1955,7 @@ mod tests {
         }];
         let orders = file("pkg/orders.py");
 
-        let out = resolve(vec![python_file, orders]);
+        let out = resolve(vec![python_file, orders], &ContractRules::builtin());
         let imports = imports_edges(&out.edges);
         assert_eq!(imports.len(), 1); // one edge to the module, not one per name
         assert_eq!(imports[0].confidence, Confidence::Certain);
@@ -1309,7 +1976,7 @@ mod tests {
         }];
         let orders = file("pkg/orders.py");
 
-        let out = resolve(vec![python_file, orders]);
+        let out = resolve(vec![python_file, orders], &ContractRules::builtin());
         assert_eq!(imports_edges(&out.edges).len(), 1);
     }
 
@@ -1328,7 +1995,10 @@ mod tests {
         let orders = file("pkg/orders.py");
         let handlers = file("pkg/handlers.py");
 
-        let out = resolve(vec![python_file, orders, handlers]);
+        let out = resolve(
+            vec![python_file, orders, handlers],
+            &ContractRules::builtin(),
+        );
         assert_eq!(imports_edges(&out.edges).len(), 2);
     }
 
@@ -1349,7 +2019,7 @@ mod tests {
             bound_name: "Order".into(),
         }];
 
-        let out = resolve(vec![handlers, orders]);
+        let out = resolve(vec![handlers, orders], &ContractRules::builtin());
         let imports = imports_edges(&out.edges);
         assert_eq!(imports.len(), 1);
         assert_eq!(imports[0].confidence, Confidence::Certain);
@@ -1374,7 +2044,7 @@ mod tests {
             bound_name: "Thing".into(),
         }];
 
-        let out = resolve(vec![handlers, orders]);
+        let out = resolve(vec![handlers, orders], &ContractRules::builtin());
         assert!(imports_edges(&out.edges).is_empty());
         assert!(
             out.nodes
@@ -1392,7 +2062,7 @@ mod tests {
             bound_name: "LoggerInterface".into(),
         }];
 
-        let out = resolve(vec![handlers]);
+        let out = resolve(vec![handlers], &ContractRules::builtin());
         let module_nodes: Vec<&ModuleNode> = out
             .nodes
             .iter()
@@ -1434,7 +2104,7 @@ mod tests {
         handlers.extract.symbols = vec![sym("handle", SymKind::Function, 5, 8, true)];
         handlers.extract.call_sites = vec![call("parseOrder", 6)];
 
-        let out = resolve(vec![handlers, orders]);
+        let out = resolve(vec![handlers, orders], &ContractRules::builtin());
         assert!(
             find_symbol(&out.nodes, "handle")
                 .unresolved_calls
@@ -1466,7 +2136,7 @@ mod tests {
             path: "Acme.Orders".into(),
         }];
 
-        let out = resolve(vec![program, order, parser]);
+        let out = resolve(vec![program, order, parser], &ContractRules::builtin());
         let imports = imports_edges(&out.edges);
         assert_eq!(imports.len(), 2);
         for e in &imports {
@@ -1489,7 +2159,7 @@ mod tests {
             path: "Acme.Billing".into(),
         }];
 
-        let out = resolve(vec![program, order]);
+        let out = resolve(vec![program, order], &ContractRules::builtin());
         assert!(imports_edges(&out.edges).is_empty());
         assert!(
             out.nodes
@@ -1514,7 +2184,7 @@ mod tests {
             },
         ];
 
-        let out = resolve(vec![program]);
+        let out = resolve(vec![program], &ContractRules::builtin());
         let module_paths: Vec<&str> = out
             .nodes
             .iter()
@@ -1546,7 +2216,7 @@ mod tests {
         program.extract.symbols = vec![sym("Main", SymKind::Method, 1, 5, true)];
         program.extract.call_sites = vec![call("ParseOrder", 3)];
 
-        let out = resolve(vec![program, order]);
+        let out = resolve(vec![program, order], &ContractRules::builtin());
         assert!(find_symbol(&out.nodes, "Main").unresolved_calls.is_empty());
         assert_eq!(
             calls_edges(&out.edges)[0].evidence,
@@ -1574,7 +2244,7 @@ mod tests {
         program.extract.symbols = vec![sym("Main", SymKind::Method, 1, 5, true)];
         program.extract.call_sites = vec![call("Parser", 3)];
 
-        let out = resolve(vec![program, parser]);
+        let out = resolve(vec![program, parser], &ContractRules::builtin());
         let imports = imports_edges(&out.edges);
         assert_eq!(imports.len(), 1);
         assert_eq!(imports[0].evidence, vec!["namespace-import".to_string()]);
@@ -1605,7 +2275,7 @@ mod tests {
             path: "App.Orders".into(),
         }];
 
-        let out = resolve(vec![program, php, cs]);
+        let out = resolve(vec![program, php, cs], &ContractRules::builtin());
         let imports = imports_edges(&out.edges);
         // Exactly one edge — to the C# file, not the PHP one.
         assert_eq!(imports.len(), 1);
@@ -1628,7 +2298,7 @@ mod tests {
         let mut program = cs_file("Program.cs");
         program.extract.imports = vec![RawImport::NamespaceImport { path: "App".into() }];
 
-        let out = resolve(vec![program, php]);
+        let out = resolve(vec![program, php], &ContractRules::builtin());
         let imports = imports_edges(&out.edges);
         assert_eq!(imports.len(), 1, "must not silently match the PHP file");
         assert_eq!(imports[0].evidence, vec!["external-package".to_string()]);
@@ -1659,7 +2329,7 @@ mod tests {
             path: "System.Text".into(),
         }];
 
-        let out = resolve(vec![program, php]);
+        let out = resolve(vec![program, php], &ContractRules::builtin());
         let imports = imports_edges(&out.edges);
         assert_eq!(
             imports.len(),
@@ -1686,7 +2356,7 @@ mod tests {
             bound_name: "J".into(),
         }];
 
-        let out = resolve(vec![program]);
+        let out = resolve(vec![program], &ContractRules::builtin());
         let module_paths: Vec<&str> = out
             .nodes
             .iter()
@@ -1711,7 +2381,7 @@ mod tests {
             imported_names: vec![name("Serialize")],
         }];
 
-        let out = resolve(vec![a, b]);
+        let out = resolve(vec![a, b], &ContractRules::builtin());
         let module_nodes: Vec<&ModuleNode> = out
             .nodes
             .iter()
@@ -1737,7 +2407,7 @@ mod tests {
             imported_names: vec![name("parse_order")],
         }];
 
-        let out = resolve(vec![f]);
+        let out = resolve(vec![f], &ContractRules::builtin());
         assert!(
             out.nodes
                 .iter()
@@ -1760,7 +2430,7 @@ mod tests {
             imported_names: vec![name("parse_order")],
         }];
 
-        let out = resolve(vec![lib, handlers]);
+        let out = resolve(vec![lib, handlers], &ContractRules::builtin());
         assert!(
             out.nodes
                 .iter()
@@ -1768,12 +2438,69 @@ mod tests {
         );
     }
 
+    /// §ADR-0024: a bare reference (no `use`/`mod` at all) to a root
+    /// that's still a genuinely local module — e.g. `orders::helper()`
+    /// naming a local `mod orders;` declared elsewhere — must classify
+    /// internal exactly like a real `use` to the same root already
+    /// does, not fabricate an external `Module` node.
+    #[test]
+    fn bare_reference_to_a_known_local_module_does_not_produce_module_node() {
+        let mut lib = file("src/lib.rs");
+        lib.extract.imports = vec![RawImport::Relative {
+            levels_up: 0,
+            module_path: "orders".into(),
+            imported_names: vec![],
+        }];
+        let mut handlers = file("src/handlers.rs");
+        handlers.extract.imports = vec![RawImport::BareReference {
+            root: "orders".into(),
+        }];
+
+        let out = resolve(vec![lib, handlers], &ContractRules::builtin());
+        assert!(
+            out.nodes
+                .iter()
+                .all(|n| !matches!(n.data, NodeData::Module(_)))
+        );
+    }
+
+    /// §ADR-0024: an unknown root produces an external `Module` node
+    /// and a `certain`-confidence `imports` edge, same as a real `use`
+    /// would — but with a distinct evidence string, so a caller can
+    /// tell this heuristic detection apart from a verified declaration.
+    #[test]
+    fn bare_reference_to_an_unknown_root_produces_external_module_with_distinct_evidence() {
+        let mut f = file("src/main.rs");
+        f.extract.imports = vec![RawImport::BareReference {
+            root: "carto_core".into(),
+        }];
+
+        let out = resolve(vec![f], &ContractRules::builtin());
+        let module = out
+            .nodes
+            .iter()
+            .find_map(|n| match &n.data {
+                NodeData::Module(m) if m.path == "carto_core" => Some(m),
+                _ => None,
+            })
+            .expect("expected an external carto_core Module node");
+        assert!(module.external);
+
+        let edge = out
+            .edges
+            .iter()
+            .find(|e| e.kind == EdgeKind::Imports)
+            .expect("expected one imports edge");
+        assert_eq!(edge.confidence, Confidence::Certain);
+        assert_eq!(edge.evidence, vec!["external-package-bare-reference"]);
+    }
+
     #[test]
     fn every_symbol_gets_a_contains_edge_from_its_file() {
         let mut f = file("src/orders.rs");
         f.extract.symbols = vec![sym("parse_order", SymKind::Function, 1, 3, true)];
 
-        let out = resolve(vec![f]);
+        let out = resolve(vec![f], &ContractRules::builtin());
         let contains: Vec<&Edge> = out
             .edges
             .iter()
@@ -1781,6 +2508,51 @@ mod tests {
             .collect();
         assert_eq!(contains.len(), 1);
         assert_eq!(contains[0].confidence, Confidence::Certain);
+    }
+
+    /// ADR-0023, the outbound half of §1.1's honest-absence signal (T8):
+    /// a symbol's own `uncaptured_outbound_calls` counts uncaptured call
+    /// sites *inside its own body* — attributed by the same
+    /// innermost-containment rule `assign_calls_to_innermost_symbol`
+    /// already guarantees for real calls, not a repo-wide by-name count
+    /// (that's `uncaptured_inbound_calls`, a different question).
+    #[test]
+    fn uncaptured_call_sites_are_attributed_to_the_innermost_containing_symbol_only() {
+        let mut f = file("src/indexer.rs");
+        f.extract.symbols = vec![
+            sym("build_and_persist", SymKind::Function, 1, 10, true),
+            sym("other_fn", SymKind::Function, 20, 25, true),
+        ];
+        // Two uncaptured (path-qualified) call sites inside
+        // build_and_persist's own range, none inside other_fn's.
+        f.extract.uncaptured_call_sites = vec![call("PathGuard::new", 2), call("walk::walk", 3)];
+
+        let out = resolve(vec![f], &ContractRules::builtin());
+        let build_and_persist = find_symbol(&out.nodes, "build_and_persist");
+        let other_fn = find_symbol(&out.nodes, "other_fn");
+        assert_eq!(build_and_persist.uncaptured_outbound_calls, 2);
+        assert_eq!(other_fn.uncaptured_outbound_calls, 0);
+        // Never surfaced as a `calls` edge or `unresolved_calls` entry —
+        // a count of unattempted syntax, not a resolution attempt.
+        assert!(calls_edges(&out.edges).is_empty());
+        assert!(build_and_persist.unresolved_calls.is_empty());
+    }
+
+    #[test]
+    fn uncaptured_outbound_and_inbound_counts_are_independent() {
+        // `helper`'s own body has one uncaptured call (outbound); one
+        // uncaptured call site elsewhere spells `helper`'s own bare name
+        // (inbound) — the two counts must not bleed into each other.
+        let mut caller_file = file("src/caller.rs");
+        caller_file.extract.uncaptured_call_sites = vec![call("helper", 5)];
+        let mut helper_file = file("src/helper.rs");
+        helper_file.extract.symbols = vec![sym("helper", SymKind::Function, 1, 5, true)];
+        helper_file.extract.uncaptured_call_sites = vec![call("Type::method", 3)];
+
+        let out = resolve(vec![caller_file, helper_file], &ContractRules::builtin());
+        let helper = find_symbol(&out.nodes, "helper");
+        assert_eq!(helper.uncaptured_inbound_calls, 1);
+        assert_eq!(helper.uncaptured_outbound_calls, 1);
     }
 
     /// Test-only shorthand for a Go file (ADR-0015): `dir_scoped: true`,
@@ -1794,6 +2566,7 @@ mod tests {
         // (stays `false` — Go never emits `RawImport::Relative` at all),
         // unlike `file()`'s Rust default.
         f.declares_module = false;
+        f.lang = Lang::Go;
         f
     }
 
@@ -1808,7 +2581,7 @@ mod tests {
         let mut helpers = go_file("internal/orders/helpers.go");
         helpers.extract.symbols = vec![sym("normalize", SymKind::Function, 1, 2, false)];
 
-        let out = resolve(vec![order, helpers]);
+        let out = resolve(vec![order, helpers], &ContractRules::builtin());
         assert!(
             find_symbol(&out.nodes, "ParseOrder")
                 .unresolved_calls
@@ -1831,7 +2604,7 @@ mod tests {
         let mut c = go_file("pkg/c.go");
         c.extract.symbols = vec![sym("helper", SymKind::Function, 1, 2, false)];
 
-        let out = resolve(vec![caller, b, c]);
+        let out = resolve(vec![caller, b, c], &ContractRules::builtin());
         let run = find_symbol(&out.nodes, "run");
         assert_eq!(run.unresolved_calls.len(), 1);
         assert_eq!(run.unresolved_calls[0].name, "helper");
@@ -1851,7 +2624,7 @@ mod tests {
         let mut sibling = go_file("pkg/b.go");
         sibling.extract.symbols = vec![sym("helper", SymKind::Function, 1, 2, false)];
 
-        let out = resolve(vec![caller, sibling]);
+        let out = resolve(vec![caller, sibling], &ContractRules::builtin());
         let run = find_symbol(&out.nodes, "run");
         assert_eq!(run.unresolved_calls.len(), 1);
         assert_eq!(run.unresolved_calls[0].name, "helper");
@@ -1867,7 +2640,7 @@ mod tests {
         let order = go_file("internal/orders/order.go");
         let helpers = go_file("internal/orders/helpers.go");
 
-        let out = resolve(vec![main, order, helpers]);
+        let out = resolve(vec![main, order, helpers], &ContractRules::builtin());
         let imports = imports_edges(&out.edges);
         assert_eq!(imports.len(), 2, "one edge per file in the target dir");
         assert!(imports.iter().all(|e| e.confidence == Confidence::Certain));
@@ -1891,7 +2664,7 @@ mod tests {
         let deep = go_file("pkg/orders/order.go");
         let shallow = go_file("orders/order.go");
 
-        let out = resolve(vec![main, deep, shallow]);
+        let out = resolve(vec![main, deep, shallow], &ContractRules::builtin());
         let imports = imports_edges(&out.edges);
         assert_eq!(imports.len(), 1);
         assert_eq!(imports[0].to, graph::file_id("pkg/orders/order.go"));
@@ -1904,7 +2677,7 @@ mod tests {
             path: "github.com/lib/pq".into(),
         }];
 
-        let out = resolve(vec![main]);
+        let out = resolve(vec![main], &ContractRules::builtin());
         let module_nodes: Vec<&ModuleNode> = out
             .nodes
             .iter()
@@ -1936,7 +2709,470 @@ mod tests {
         }];
         let order = go_file("internal/orders/order.go");
 
-        let out = resolve(vec![main, order]);
+        let out = resolve(vec![main, order], &ContractRules::builtin());
         assert_eq!(imports_edges(&out.edges).len(), 1);
+    }
+
+    fn contract_nodes(nodes: &[Node]) -> Vec<&crate::graph::ContractNode> {
+        nodes
+            .iter()
+            .filter_map(|n| match &n.data {
+                NodeData::Contract(c) => Some(c),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// ADR-0026's end-to-end shape: an HCL file consuming a metric name
+    /// and a C# file producing the exact same one (same value, same
+    /// qualifier) must collapse onto one `Contract` node reached by both
+    /// a `produces` and a `consumes` edge — this is what makes "orphan"
+    /// well-defined (a `Contract` with only one side's edges).
+    #[test]
+    fn matching_producer_and_consumer_share_one_contract_node() {
+        let mut cs = cs_file("services/ingest/EmfMetricsExportService.cs");
+        cs.extract.literals = vec![RawLiteral {
+            position: "object-init:Name".to_string(),
+            value: "QuoteDropsPerSecond".to_string(),
+            qualifier: Some("SIDCloud/Ingest".to_string()),
+            line: 40,
+        }];
+
+        let mut tf = file("infra/terraform/alarms.tf");
+        tf.lang = Lang::Hcl;
+        tf.extract.literals = vec![RawLiteral {
+            position: "aws_cloudwatch_metric_alarm.metric_name".to_string(),
+            value: "QuoteDropsPerSecond".to_string(),
+            qualifier: Some("SIDCloud/Ingest".to_string()),
+            line: 12,
+        }];
+
+        let out = resolve(vec![cs, tf], &ContractRules::builtin());
+        // `resolve` itself may push the same (category, qualifier,
+        // value) Contract node's content more than once — real dedup
+        // happens where every other producer does too, at
+        // `Graph::insert_node` (indexer.rs folds `out.nodes` in the same
+        // way); mirror that here rather than asserting on the raw Vec.
+        let mut graph = crate::graph::Graph::new();
+        for node in out.nodes.clone() {
+            graph.insert_node(node);
+        }
+        let (deduped_nodes, _) = graph.into_sorted_parts();
+        let contracts = contract_nodes(&deduped_nodes);
+        assert_eq!(contracts.len(), 1, "one shared Contract node, not two");
+        assert_eq!(contracts[0].category, "metric_name");
+
+        let produces: Vec<&Edge> = out
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Produces)
+            .collect();
+        let consumes: Vec<&Edge> = out
+            .edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Consumes)
+            .collect();
+        assert_eq!(produces.len(), 1);
+        assert_eq!(consumes.len(), 1);
+        assert_eq!(produces[0].to, consumes[0].to, "same Contract node ID");
+        assert_eq!(produces[0].confidence, Confidence::Inferred);
+        assert_eq!(consumes[0].confidence, Confidence::Certain);
+    }
+
+    /// A dead alarm (ADR-0026's acceptance test shape): the HCL side
+    /// consumes a name no C# file produces — a real Contract node still
+    /// exists (from the consumer alone), with zero `produces` edges.
+    #[test]
+    fn consumer_with_no_matching_producer_still_creates_a_contract_node() {
+        let mut tf = file("infra/terraform/alarms.tf");
+        tf.lang = Lang::Hcl;
+        tf.extract.literals = vec![RawLiteral {
+            position: "aws_cloudwatch_metric_alarm.metric_name".to_string(),
+            value: "SequenceGapsTotal".to_string(),
+            qualifier: Some("SIDCloud/Ingest".to_string()),
+            line: 5,
+        }];
+
+        let out = resolve(vec![tf], &ContractRules::builtin());
+        let contracts = contract_nodes(&out.nodes);
+        assert_eq!(contracts.len(), 1);
+        assert_eq!(
+            out.edges
+                .iter()
+                .filter(|e| e.kind == EdgeKind::Produces)
+                .count(),
+            0
+        );
+        assert_eq!(
+            out.edges
+                .iter()
+                .filter(|e| e.kind == EdgeKind::Consumes)
+                .count(),
+            1
+        );
+    }
+
+    /// The same metric *name* emitted under two different namespaces
+    /// must not collapse onto one Contract node — the qualifier is part
+    /// of the node's identity (ADR-0026), guarding the exact
+    /// `CUSTOMER_SUBSCRIPTIONS_TABLE`-vs-`DYNAMO_CUSTOMER_SUBSCRIPTIONS_
+    /// TABLE`-style conflation the SID Cloud spec warns about.
+    #[test]
+    fn same_value_different_qualifier_is_two_distinct_contract_nodes() {
+        let mut a = file("infra/a.tf");
+        a.lang = Lang::Hcl;
+        a.extract.literals = vec![RawLiteral {
+            position: "aws_cloudwatch_metric_alarm.metric_name".to_string(),
+            value: "Errors".to_string(),
+            qualifier: Some("SIDCloud/Ingest".to_string()),
+            line: 1,
+        }];
+        let mut b = file("infra/b.tf");
+        b.lang = Lang::Hcl;
+        b.extract.literals = vec![RawLiteral {
+            position: "aws_cloudwatch_metric_alarm.metric_name".to_string(),
+            value: "Errors".to_string(),
+            qualifier: Some("SIDCloud/Streamer".to_string()),
+            line: 1,
+        }];
+
+        let out = resolve(vec![a, b], &ContractRules::builtin());
+        assert_eq!(contract_nodes(&out.nodes).len(), 2);
+    }
+
+    /// A literal at a position no rule classifies (a `.cartoignore`d
+    /// vocabulary miss, or simply an ordinary non-contract attribute) is
+    /// dropped entirely — no `Contract` node, no edge — same "unmapped
+    /// beats guessed" honesty `resolve_call` already applies to an
+    /// ambiguous call.
+    #[test]
+    fn unclassified_position_produces_nothing() {
+        let mut tf = file("infra/other.tf");
+        tf.lang = Lang::Hcl;
+        tf.extract.literals = vec![RawLiteral {
+            position: "aws_s3_bucket.bucket".to_string(),
+            value: "artifacts".to_string(),
+            qualifier: None,
+            line: 1,
+        }];
+
+        let out = resolve(vec![tf], &ContractRules::builtin());
+        assert!(contract_nodes(&out.nodes).is_empty());
+    }
+
+    /// A C# literal sitting inside a method body must attach its
+    /// `produces` edge to the enclosing symbol, not the file — the same
+    /// innermost-containment rule `assign_to_innermost_symbol` gives
+    /// `calls` edges.
+    #[test]
+    fn literal_inside_a_method_attaches_to_the_symbol_not_the_file() {
+        let mut cs = cs_file("services/ingest/Emitter.cs");
+        cs.extract.symbols = vec![sym("Emit", SymKind::Method, 3, 6, true)];
+        cs.extract.literals = vec![RawLiteral {
+            position: "object-init:Name".to_string(),
+            value: "QuoteDropsPerSecond".to_string(),
+            qualifier: None,
+            line: 4,
+        }];
+
+        let out = resolve(vec![cs], &ContractRules::builtin());
+        let produces = out
+            .edges
+            .iter()
+            .find(|e| e.kind == EdgeKind::Produces)
+            .expect("expected a produces edge");
+        let emit_id = graph::sym_id("services/ingest/Emitter.cs", "method", "Emit", 3);
+        assert_eq!(produces.from, emit_id);
+    }
+
+    // ADR-0029: type refs go through the same tier ladder `calls` does,
+    // and become `EdgeKind::References` edges instead — these mirror
+    // the shape of the `calls`-resolution tests above, one per tier,
+    // plus the self-reference-suppression case that has no `calls`
+    // equivalent (a call can't target its own call site the way a
+    // field can name its own enclosing type).
+
+    #[test]
+    fn same_file_type_ref_resolves_with_same_file_evidence() {
+        let mut f = file("src/orders.rs");
+        f.extract.symbols = vec![
+            sym("Handler", SymKind::Struct, 1, 5, true),
+            sym("Order", SymKind::Struct, 7, 9, false),
+        ];
+        f.extract.type_refs = vec![type_ref("Order", 3)];
+
+        let out = resolve(vec![f], &ContractRules::builtin());
+        let refs = references_edges(&out.edges);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].confidence, Confidence::Inferred);
+        assert_eq!(
+            refs[0].evidence,
+            vec!["type-reference:same-file".to_string()]
+        );
+    }
+
+    #[test]
+    fn imported_type_ref_resolves_via_use_when_unique() {
+        let mut handlers = file("src/handlers.rs");
+        handlers.extract.imports = vec![RawImport::Absolute {
+            root: "crate".into(),
+            imported_names: vec![name("Order")],
+        }];
+        handlers.extract.symbols = vec![sym("Handler", SymKind::Struct, 1, 5, true)];
+        handlers.extract.type_refs = vec![type_ref("Order", 3)];
+
+        let mut orders = file("src/orders.rs");
+        orders.extract.symbols = vec![sym("Order", SymKind::Struct, 1, 3, true)];
+
+        let out = resolve(vec![handlers, orders], &ContractRules::builtin());
+        assert_eq!(
+            references_edges(&out.edges)[0].evidence,
+            vec!["type-reference:imported".to_string()]
+        );
+    }
+
+    #[test]
+    fn same_package_type_ref_resolves_when_unimported_and_unique() {
+        let mut handlers = file("src/handlers.rs");
+        handlers.extract.symbols = vec![sym("Handler", SymKind::Struct, 1, 5, true)];
+        handlers.extract.type_refs = vec![type_ref("Order", 3)];
+
+        let mut orders = file("src/orders.rs");
+        orders.extract.symbols = vec![sym("Order", SymKind::Struct, 1, 3, true)];
+
+        let out = resolve(vec![handlers, orders], &ContractRules::builtin());
+        assert_eq!(
+            references_edges(&out.edges)[0].evidence,
+            vec!["type-reference:same-package".to_string()]
+        );
+    }
+
+    #[test]
+    fn ambiguous_type_ref_produces_no_reference_edge() {
+        let mut caller = file("src/a.rs");
+        caller.extract.symbols = vec![sym("Handler", SymKind::Struct, 1, 5, true)];
+        caller.extract.type_refs = vec![type_ref("Order", 3)];
+
+        let mut b = file("src/b.rs");
+        b.extract.symbols = vec![sym("Order", SymKind::Struct, 1, 2, true)];
+        let mut c = file("src/c.rs");
+        c.extract.symbols = vec![sym("Order", SymKind::Struct, 1, 2, true)];
+
+        let out = resolve(vec![caller, b, c], &ContractRules::builtin());
+        assert!(references_edges(&out.edges).is_empty());
+    }
+
+    #[test]
+    fn unresolved_type_ref_is_silently_dropped_not_recorded_anywhere() {
+        // No `unresolved_calls`-style list for type refs (ADR-0029,
+        // user-confirmed): unlike an unresolved call, an unresolved
+        // type ref is overwhelmingly stdlib/BCL noise, not a signal.
+        let mut f = file("src/a.rs");
+        f.extract.symbols = vec![sym("Handler", SymKind::Struct, 1, 5, true)];
+        f.extract.type_refs = vec![type_ref("SomeExternalType", 3)];
+
+        let out = resolve(vec![f], &ContractRules::builtin());
+        assert!(references_edges(&out.edges).is_empty());
+        assert!(
+            find_symbol(&out.nodes, "Handler")
+                .unresolved_calls
+                .is_empty()
+        );
+    }
+
+    /// A symbol referencing its own enclosing type — a field of its
+    /// own type, a recursive generic argument — must not produce a
+    /// self-edge. No `calls` equivalent exists for this case (a call
+    /// site can't be its own callee's definition the way a field can
+    /// name its own type), so type refs need their own coverage.
+    #[test]
+    fn self_referencing_type_ref_produces_no_edge() {
+        let mut f = file("src/tree.rs");
+        f.extract.symbols = vec![sym("Node", SymKind::Struct, 1, 5, true)];
+        // `struct Node { next: Option<Box<Node>> }` -- attributed to
+        // Node itself by innermost containment (the struct's own range
+        // contains its field declarations).
+        f.extract.type_refs = vec![type_ref("Node", 2)];
+
+        let out = resolve(vec![f], &ContractRules::builtin());
+        assert!(references_edges(&out.edges).is_empty());
+    }
+
+    /// The reported field case, reproduced directly against `resolve`:
+    /// `QueryJobService` references `IQueryJobStore` (constructor
+    /// injection — a type ref, tier (c) `same-package` since neither
+    /// file imports a symbol name from the other, only C#'s namespace
+    /// `using`), while `S3PresignedUrlProvider` — same namespace,
+    /// genuinely `using`s it, but never spells `IQueryJobStore` in a
+    /// type position at all — gets no `references` edge despite
+    /// sharing the `imports` fan-out. This is the precision `deps
+    /// IQueryJobStore --dir in --depth 1 --kinds references` needed
+    /// and didn't have before ADR-0029.
+    #[test]
+    fn csharp_field_reference_is_precise_where_namespace_import_fan_out_was_not() {
+        let mut store = cs_file("Ports/IQueryJobStore.cs");
+        store.extract.declared_namespace = Some("Acme.Ports".into());
+        store.extract.symbols = vec![sym("IQueryJobStore", SymKind::Interface, 1, 1, true)];
+
+        let mut url_provider = cs_file("Ports/IPresignedUrlProvider.cs");
+        url_provider.extract.declared_namespace = Some("Acme.Ports".into());
+        url_provider.extract.symbols =
+            vec![sym("IPresignedUrlProvider", SymKind::Interface, 1, 1, true)];
+
+        let mut service = cs_file("Services/QueryJobService.cs");
+        service.extract.declared_namespace = Some("Acme.Services".into());
+        service.extract.imports = vec![RawImport::NamespaceImport {
+            path: "Acme.Ports".into(),
+        }];
+        service.extract.symbols = vec![sym("QueryJobService", SymKind::Class, 1, 6, true)];
+        service.extract.type_refs = vec![type_ref("IQueryJobStore", 3)];
+
+        let mut s3_provider = cs_file("Services/S3PresignedUrlProvider.cs");
+        s3_provider.extract.declared_namespace = Some("Acme.Services".into());
+        s3_provider.extract.imports = vec![RawImport::NamespaceImport {
+            path: "Acme.Ports".into(),
+        }];
+        s3_provider.extract.symbols =
+            vec![sym("S3PresignedUrlProvider", SymKind::Class, 1, 6, true)];
+        s3_provider.extract.type_refs = vec![type_ref("IPresignedUrlProvider", 3)];
+
+        let out = resolve(
+            vec![store, url_provider, service, s3_provider],
+            &ContractRules::builtin(),
+        );
+
+        // Both service files import the namespace -- the pre-existing,
+        // honestly-broad signal.
+        let store_file_imports: Vec<&Edge> = imports_edges(&out.edges)
+            .into_iter()
+            .filter(|e| e.to == graph::file_id("Ports/IQueryJobStore.cs"))
+            .collect();
+        assert_eq!(store_file_imports.len(), 2);
+
+        // Only QueryJobService gets a references edge to IQueryJobStore.
+        let iqueryjobstore_id =
+            graph::sym_id("Ports/IQueryJobStore.cs", "interface", "IQueryJobStore", 1);
+        let refs_to_store: Vec<&Edge> = references_edges(&out.edges)
+            .into_iter()
+            .filter(|e| e.to == iqueryjobstore_id)
+            .collect();
+        assert_eq!(refs_to_store.len(), 1);
+        let queryjobservice_id =
+            graph::sym_id("Services/QueryJobService.cs", "class", "QueryJobService", 1);
+        assert_eq!(refs_to_store[0].from, queryjobservice_id);
+    }
+
+    // ADR-0031: `assign_to_innermost_symbol`'s leftover bucket, resolved
+    // at file scope — the retest fix for C# top-level-statement code
+    // (ASP.NET Core's minimal-API `Program.cs`, with no `Main` method
+    // at all) silently dropping every call/type-ref it contains.
+
+    #[test]
+    fn unattached_call_resolves_at_file_scope() {
+        // `top_level` has no symbols whatsoever — every line in it,
+        // including the call site's, is outside every symbol's range
+        // by construction, the same shape a real top-level-statements
+        // file has (nothing in `symbols.scm` captures the top level of
+        // a file as a container of anything).
+        let mut top_level = cs_file("Program.cs");
+        top_level.extract.call_sites = vec![call("Register", 3)];
+
+        let mut helper = cs_file("Registrar.cs");
+        helper.extract.symbols = vec![sym("Register", SymKind::Method, 1, 3, true)];
+
+        let out = resolve(vec![top_level, helper], &ContractRules::builtin());
+        let edges = calls_edges(&out.edges);
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].from, graph::file_id("Program.cs"));
+        assert_eq!(edges[0].confidence, Confidence::Inferred);
+        assert_eq!(edges[0].evidence, vec!["same-package".to_string()]);
+    }
+
+    #[test]
+    fn unattached_type_ref_resolves_at_file_scope() {
+        let mut top_level = cs_file("Program.cs");
+        top_level.extract.type_refs = vec![type_ref("IQueryJobStore", 3)];
+
+        let mut store = cs_file("IQueryJobStore.cs");
+        store.extract.symbols = vec![sym("IQueryJobStore", SymKind::Interface, 1, 1, true)];
+
+        let out = resolve(vec![top_level, store], &ContractRules::builtin());
+        let refs = references_edges(&out.edges);
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].from, graph::file_id("Program.cs"));
+        assert_eq!(refs[0].confidence, Confidence::Inferred);
+        assert_eq!(
+            refs[0].evidence,
+            vec!["type-reference:same-package".to_string()]
+        );
+    }
+
+    /// A file mixing top-level-statement code with an ordinary
+    /// function: the top-level call must resolve at file scope, the
+    /// in-function call must resolve at symbol scope as before, and
+    /// neither is double-counted or misattributed to the other.
+    #[test]
+    fn attached_and_unattached_calls_in_the_same_file_each_resolve_exactly_once() {
+        let mut f = file("src/mixed.rs");
+        f.extract.symbols = vec![sym("handle", SymKind::Function, 5, 8, true)];
+        f.extract.call_sites = vec![
+            call("top_level_helper", 1), // outside handle's range
+            call("inner_helper", 6),     // inside handle's range
+        ];
+
+        let mut helpers = file("src/helpers.rs");
+        helpers.extract.symbols = vec![
+            sym("top_level_helper", SymKind::Function, 1, 2, true),
+            sym("inner_helper", SymKind::Function, 1, 2, true),
+        ];
+
+        let out = resolve(vec![f, helpers], &ContractRules::builtin());
+        let edges = calls_edges(&out.edges);
+        assert_eq!(edges.len(), 2);
+
+        let file_sourced = edges
+            .iter()
+            .filter(|e| e.from == graph::file_id("src/mixed.rs"))
+            .count();
+        assert_eq!(file_sourced, 1);
+
+        let handle_id = graph::sym_id("src/mixed.rs", "function", "handle", 5);
+        let symbol_sourced = edges.iter().filter(|e| e.from == handle_id).count();
+        assert_eq!(symbol_sourced, 1);
+
+        assert!(
+            find_symbol(&out.nodes, "handle")
+                .unresolved_calls
+                .is_empty()
+        );
+    }
+
+    /// User-confirmed scope: an unattached call/type-ref that fails to
+    /// resolve stays fully invisible, the same as before ADR-0031 —
+    /// there's no `FileNode` equivalent of `unresolved_calls` to record
+    /// it in, and adding one is a separate, unscoped decision.
+    #[test]
+    fn unattached_call_that_fails_to_resolve_produces_no_edge_and_stays_invisible() {
+        let mut top_level = file("src/program.rs");
+        top_level.extract.call_sites = vec![call("mystery", 1)];
+
+        let out = resolve(vec![top_level], &ContractRules::builtin());
+        assert!(calls_edges(&out.edges).is_empty());
+        // No symbol exists in this file at all, so there's nowhere an
+        // `unresolved_calls` entry even could live for this miss.
+        assert!(
+            out.nodes
+                .iter()
+                .all(|n| !matches!(n.data, NodeData::Symbol(_)))
+        );
+    }
+
+    #[test]
+    fn unattached_type_ref_that_fails_to_resolve_produces_no_edge() {
+        let mut top_level = file("src/program.rs");
+        top_level.extract.type_refs = vec![type_ref("SomeExternalType", 1)];
+
+        let out = resolve(vec![top_level], &ContractRules::builtin());
+        assert!(references_edges(&out.edges).is_empty());
     }
 }

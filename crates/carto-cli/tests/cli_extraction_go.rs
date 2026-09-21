@@ -93,6 +93,41 @@ fn calls_edge<'a>(graph: &'a Value, from_name: &str, to_name: &str) -> &'a Value
         .unwrap_or_else(|| panic!("no calls edge {from_name} -> {to_name} in graph.json"))
 }
 
+fn references_edge<'a>(graph: &'a Value, from_name: &str, to_name: &str) -> &'a Value {
+    graph["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| {
+            e["kind"] == "references"
+                && id_to_name(graph, e["from"].as_str().unwrap()) == from_name
+                && id_to_name(graph, e["to"].as_str().unwrap()) == to_name
+        })
+        .unwrap_or_else(|| panic!("no references edge {from_name} -> {to_name} in graph.json"))
+}
+
+/// ADR-0029: `ParseOrder`'s own `*Order` return type and `Summary`'s
+/// own `*Order` receiver are type positions nothing captured before
+/// this — the receiver case also proves `parameter_declaration`'s
+/// unanchored capture reaches a method's `receiver:` parameter list,
+/// not just ordinary parameters.
+#[test]
+fn type_positions_produce_references_edges() {
+    let out = TempDir::new("references");
+    let graph = index(out.path());
+
+    for edge in [
+        references_edge(&graph, "ParseOrder", "Order"),
+        references_edge(&graph, "Summary", "Order"),
+    ] {
+        assert_eq!(edge["confidence"], "inferred");
+        assert_eq!(
+            edge["evidence"].as_array().unwrap(),
+            &[Value::String("type-reference:same-file".into())]
+        );
+    }
+}
+
 fn imports_edges_from<'a>(graph: &'a Value, from_path: &str) -> Vec<&'a Value> {
     graph["edges"]
         .as_array()

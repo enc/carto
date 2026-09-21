@@ -16,11 +16,11 @@ pub mod node;
 pub mod persist;
 
 pub use edge::{Confidence, Edge, EdgeKind, MAX_EVIDENCE_ENTRIES};
-pub use id::{EdgeId, NodeId, edge_id, file_id, module_id, sym_id};
+pub use id::{EdgeId, NodeId, contract_id, edge_id, file_id, module_id, sym_id};
 pub use load::load;
 pub use node::{
-    ExclusionReason, FileNode, ModuleNode, Node, NodeData, SkipReason, SymKind, SymbolNode,
-    UnresolvedCall,
+    ContractNode, ExclusionReason, FileNode, InboundCallSite, ModuleNode, Node, NodeData,
+    SkipReason, SymKind, SymbolNode, UnresolvedCall,
 };
 pub use persist::{GraphDocument, Manifest, PersistMeta, persist};
 

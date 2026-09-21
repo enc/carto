@@ -17,17 +17,21 @@
 //! "replacing `inferred` edges by ID") would need a `NodeId <-> NodeIndex`
 //! side map to use petgraph's index-addressed edges anyway.
 
+pub mod contract;
 pub mod deps;
 pub mod find;
 pub mod map;
+pub mod orphans;
 
 use crate::graph::{Edge, EdgeId, GraphDocument, Node, NodeData, NodeId, SymbolNode};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+pub use contract::{ContractMatch, ContractQuery, ContractResult, ContractSite, run as contract};
 pub use deps::{DepEdge, DepsQuery, DepsResult, Hop, NodeSummary, run as deps};
 pub use find::{FindQuery, FindResult, ModuleMatch, SymbolMatch, run as find};
 pub use map::{MapCounts, MapQuery, MapResult, MapSection, run as map};
+pub use orphans::{OrphanContract, OrphansQuery, OrphansResult, run as orphans};
 
 /// The spec §7.2 truncation contract every query result ends with:
 /// "Every response ends with `truncated: bool` and, if true, the exact
@@ -198,7 +202,10 @@ impl QueryGraph {
                 Some(f) => f.path.as_str(),
                 None => return false,
             },
-            Some(NodeData::Module(_)) => return true,
+            // Same "no directory of its own" reasoning as `Module`
+            // (ADR-0014) — a Contract is scoped by its `produces`/
+            // `consumes` edges' endpoints, not a path of its own.
+            Some(NodeData::Module(_)) | Some(NodeData::Contract(_)) => return true,
             None => return false,
         };
         path == prefix || path.starts_with(&format!("{prefix}/"))
@@ -242,6 +249,9 @@ mod tests {
                 signature: None,
                 unresolved_calls: vec![],
                 uncaptured_inbound_calls: 0,
+                uncaptured_outbound_calls: 0,
+                unresolved_inbound_calls: vec![],
+                unresolved_inbound_call_count: 0,
             },
         )
     }
@@ -308,6 +318,9 @@ mod tests {
             signature: None,
             unresolved_calls: vec![],
             uncaptured_inbound_calls: 0,
+            uncaptured_outbound_calls: 0,
+            unresolved_inbound_calls: vec![],
+            unresolved_inbound_call_count: 0,
         });
         assert_eq!(rendered, "src/orders.rs:1-3");
     }
@@ -324,6 +337,9 @@ mod tests {
             signature: None,
             unresolved_calls: vec![],
             uncaptured_inbound_calls: 0,
+            uncaptured_outbound_calls: 0,
+            unresolved_inbound_calls: vec![],
+            unresolved_inbound_call_count: 0,
         });
         assert_eq!(rendered, "<unknown-file>:1-1");
     }

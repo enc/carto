@@ -23,6 +23,7 @@ interpretation decisions this exercises):
 | `Handler::handle` calling `$order->refresh()` | `refresh` is `private` — not `is_pub`, so no tier (b)/(c) candidate exists — lands in `handle`'s `unresolved_calls` |
 | `Handler::handle` calling `$input->strip()` | a real call-site that never resolves — no symbol carto sees is named `strip` — `unresolved_calls`, same honesty principle as the Python fixture's `input.strip()` case |
 | `Handler::handle` calling `unknownExternalCall()` | the deliberate honesty-path case: no candidate anywhere ⇒ no edge, `unresolved_calls` |
+| `parseOrder`'s own `return new Order($input);` | ADR-0029's `references` edge: `object_creation_expression` — a shape `calls.scm` never captures at all for PHP (only the four call-expression kinds are), so this is genuinely new signal, not a duplicate of a `calls` edge — resolves tier (a) same-file, `EdgeKind::References`, evidence `type-reference:same-file` |
 
 Verify with:
 

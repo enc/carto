@@ -10,7 +10,7 @@
 //! Rust precedent of capturing static (`Foo::bar()`) calls — is
 //! recorded in `docs/adr/0012-php-resolution-policy-mapping.md`.
 
-use super::extractor::{ExtractOut, LangExtractor, RawCallSite, RawImport, RawSymbol};
+use super::extractor::{ExtractOut, LangExtractor, RawCallSite, RawImport, RawSymbol, RawTypeRef};
 use crate::graph::SymKind;
 use crate::lang::Lang;
 use streaming_iterator::StreamingIterator as _;
@@ -19,6 +19,7 @@ use tree_sitter::{Node, Parser, Query, QueryCursor};
 const SYMBOLS_QUERY: &str = include_str!("queries/php/symbols.scm");
 const IMPORTS_QUERY: &str = include_str!("queries/php/imports.scm");
 const CALLS_QUERY: &str = include_str!("queries/php/calls.scm");
+const TYPES_QUERY: &str = include_str!("queries/php/types.scm");
 
 pub struct PhpExtractor;
 
@@ -52,11 +53,13 @@ impl LangExtractor for PhpExtractor {
 
         ExtractOut {
             symbols: extract_symbols(root, src),
+            literals: Vec::new(),
             imports: extract_imports(root, src),
             call_sites: extract_call_sites(root, src),
             // PHP's path-qualified calls are captured, not excluded
             // (ADR-0012) — nothing to count here.
             uncaptured_call_sites: Vec::new(),
+            type_refs: extract_type_refs(root, src),
             declared_namespace: extract_namespace(root, src),
         }
     }
@@ -119,12 +122,16 @@ fn extract_symbols(root: Node, src: &[u8]) -> Vec<RawSymbol> {
         };
 
         let name = text(src, name_node);
+        // ADR-0032: `owner` reuses `class_name_node` — already computed
+        // for `qualified_name` below, and exactly "the class this
+        // symbol is declared in".
+        let owner = class_name_node.map(|c| text(src, c));
         // PHP's own separator ("Order::summary"), not Rust's "::"-as-
         // impl-path or Python's "." — coincidentally same spelling as
         // Rust's, since it's also PHP's own scope-resolution operator.
         // Spec §4.3 leaves qualified-name spelling to the extractor.
-        let qualified_name = match class_name_node {
-            Some(c) => format!("{}::{}", text(src, c), name),
+        let qualified_name = match &owner {
+            Some(c) => format!("{c}::{name}"),
             None => name.clone(),
         };
         let start_line = item_node.start_position().row as u32 + 1;
@@ -154,6 +161,7 @@ fn extract_symbols(root: Node, src: &[u8]) -> Vec<RawSymbol> {
             end_line,
             signature,
             is_pub,
+            owner,
         });
     }
     out
@@ -303,6 +311,70 @@ fn extract_call_sites(root: Node, src: &[u8]) -> Vec<RawCallSite> {
     out
 }
 
+/// ADR-0029: every identifier `types.scm` found in a type position,
+/// walked down to head identifiers by [`collect_type_names`]. See that
+/// function and `types.scm`'s own module comment for the position list
+/// — including `object_creation_expression` and trait `use_declaration`,
+/// two shapes nothing else in this extractor produces any edge for at
+/// all today.
+fn extract_type_refs(root: Node, src: &[u8]) -> Vec<RawTypeRef> {
+    let language = carto_grammars::php_language();
+    let query = Query::new(&language, TYPES_QUERY).expect("types.scm must compile");
+    let names = query.capture_names();
+    let mut cursor = QueryCursor::new();
+
+    let mut out = Vec::new();
+    let mut matches = cursor.matches(&query, root, src);
+    while let Some(m) = matches.next() {
+        for cap in m.captures {
+            if names[cap.index as usize] == "type.pos" {
+                collect_type_names(cap.node, src, &mut out);
+            }
+        }
+    }
+    out
+}
+
+/// Descends a captured type-position subtree down to the head
+/// identifier(s) it names, recursing through PHP's `named_type`/
+/// `optional_type`/`union_type`/`intersection_type` wrappers and the
+/// container shapes `types.scm` captures whole (`base_clause`,
+/// `class_interface_clause`, `use_declaration`'s own `use_list` for a
+/// multi-trait `use A, B;`). A qualified/relative name (`App\Orders\
+/// Order`, `namespace\Order`) yields only its *rightmost* segment via
+/// its own `name` child — the same policy every other extractor's
+/// qualified-reference capture already applies. `primitive_type`
+/// (`string`, `int`, `bool`, `array`, ...) has no symbol to reference
+/// and is silently skipped, like every other language's builtin-type
+/// exclusion; PHP 8.2's disjunctive-normal-form type (`(A&B)|C`) is a
+/// rare enough shape that descending into its own nested unions isn't
+/// captured this slice — documented, not silently dropped.
+fn collect_type_names(node: Node, src: &[u8], out: &mut Vec<RawTypeRef>) {
+    match node.kind() {
+        "name" => out.push(RawTypeRef {
+            name: text(src, node),
+            line: node.start_position().row as u32 + 1,
+        }),
+        "qualified_name"
+        | "relative_name"
+        | "named_type"
+        | "optional_type"
+        | "union_type"
+        | "intersection_type"
+        | "type_list"
+        | "use_list"
+        | "base_clause"
+        | "class_interface_clause"
+        | "use_declaration" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                collect_type_names(child, src, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn text(src: &[u8], node: Node) -> String {
     text_range(src, node.start_byte(), node.end_byte())
 }
@@ -323,6 +395,94 @@ mod tests {
 
     fn php(body: &str) -> String {
         format!("<?php\n{body}")
+    }
+
+    fn type_ref_names(out: &ExtractOut) -> Vec<&str> {
+        out.type_refs.iter().map(|t| t.name.as_str()).collect()
+    }
+
+    // ADR-0029: property/parameter/return-type positions — nothing in
+    // this extractor captured any of these before.
+    #[test]
+    fn extracts_type_refs_from_property_parameter_and_return_positions() {
+        let out = extract(&php(
+            "class Order {}\n\nclass Handler {\n    public Order $order;\n\n    public function take(Order $o): Order {\n        return $o;\n    }\n}\n",
+        ));
+        let names = type_ref_names(&out);
+        assert_eq!(
+            names.iter().filter(|&&n| n == "Order").count(),
+            3,
+            "property + parameter + return type, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn constructor_promoted_property_type_is_captured() {
+        let out = extract(&php(
+            "class Order {}\n\nclass Handler {\n    public function __construct(public Order $order) {}\n}\n",
+        ));
+        assert!(type_ref_names(&out).contains(&"Order"));
+    }
+
+    #[test]
+    fn extends_and_implements_are_both_captured() {
+        let out = extract(&php(
+            "interface Comparable {}\nclass Base {}\n\nclass Order extends Base implements Comparable {}\n",
+        ));
+        let names = type_ref_names(&out);
+        assert!(names.contains(&"Base"));
+        assert!(names.contains(&"Comparable"));
+    }
+
+    #[test]
+    fn new_foo_is_captured_where_calls_scm_never_looked() {
+        // Unlike every call shape calls.scm handles, object creation
+        // is not one of them for PHP -- verified against calls.scm
+        // itself, not assumed.
+        let out = extract(&php(
+            "class Order {}\n\nfunction make() {\n    return new Order();\n}\n",
+        ));
+        assert!(out.call_sites.iter().all(|c| c.callee_name != "Order"));
+        assert!(type_ref_names(&out).contains(&"Order"));
+    }
+
+    #[test]
+    fn qualified_and_relative_object_creation_yield_only_the_final_segment() {
+        let out = extract(&php(
+            "function make() {\n    return new App\\Orders\\Order();\n}\n",
+        ));
+        assert_eq!(type_ref_names(&out), vec!["Order"]);
+    }
+
+    #[test]
+    fn trait_use_is_captured_a_shape_imports_scm_never_looked_at_either() {
+        let out = extract(&php(
+            "trait Auditable {}\n\nclass Order {\n    use Auditable;\n}\n",
+        ));
+        assert!(type_ref_names(&out).contains(&"Auditable"));
+        assert!(
+            out.imports.is_empty(),
+            "trait use_declaration is a distinct node kind from namespace use, never an import"
+        );
+    }
+
+    #[test]
+    fn catch_clause_and_union_type_are_captured() {
+        let out = extract(&php(
+            "class OrderException {}\nclass ValidationException {}\n\nfunction take(int|null $x) {}\n\nfunction run() {\n    try {\n    } catch (OrderException|ValidationException $e) {\n    }\n}\n",
+        ));
+        let names = type_ref_names(&out);
+        assert!(names.contains(&"OrderException"));
+        assert!(names.contains(&"ValidationException"));
+        assert!(!names.contains(&"int"), "{names:?}"); // primitive_type, skip
+    }
+
+    #[test]
+    fn primitive_types_are_not_captured() {
+        let out = extract(&php(
+            "function take(string $a, int $b, ?bool $c): void {}\n",
+        ));
+        assert!(type_ref_names(&out).is_empty());
     }
 
     #[test]

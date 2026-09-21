@@ -5,9 +5,11 @@
 //! `carto_core::indexer::build_and_persist`) — no query logic lives in
 //! this crate.
 
+mod contract_tool;
 mod deps_tool;
 mod index_tool;
 mod map_tool;
+mod orphans_tool;
 mod selfcheck_tool;
 mod where_tool;
 
@@ -32,6 +34,8 @@ pub fn call(params: &Value) -> Result<Value, RpcError> {
         "where" => where_tool::call(&arguments),
         "deps" => deps_tool::call(&arguments),
         "map" => map_tool::call(&arguments),
+        "contract" => contract_tool::call(&arguments),
+        "orphans" => orphans_tool::call(&arguments),
         "selfcheck" => selfcheck_tool::call(&arguments),
         other => {
             return Err(RpcError::new(
@@ -67,6 +71,8 @@ mod tests {
             ("where", where_tool::PARAM_NAMES),
             ("deps", deps_tool::PARAM_NAMES),
             ("map", map_tool::PARAM_NAMES),
+            ("contract", contract_tool::PARAM_NAMES),
+            ("orphans", orphans_tool::PARAM_NAMES),
             ("selfcheck", selfcheck_tool::PARAM_NAMES),
         ];
 

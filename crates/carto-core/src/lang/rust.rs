@@ -4,17 +4,18 @@
 //! reviewable independently of this file (spec §5.2).
 
 use super::extractor::{
-    ExtractOut, ImportedName, LangExtractor, RawCallSite, RawImport, RawSymbol,
+    ExtractOut, ImportedName, LangExtractor, RawCallSite, RawImport, RawSymbol, RawTypeRef,
 };
 use crate::graph::SymKind;
 use crate::lang::Lang;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use streaming_iterator::StreamingIterator as _;
 use tree_sitter::{Node, Parser, Query, QueryCursor};
 
 const SYMBOLS_QUERY: &str = include_str!("queries/rust/symbols.scm");
 const IMPORTS_QUERY: &str = include_str!("queries/rust/imports.scm");
 const CALLS_QUERY: &str = include_str!("queries/rust/calls.scm");
+const TYPES_QUERY: &str = include_str!("queries/rust/types.scm");
 
 pub struct RustExtractor;
 
@@ -54,9 +55,11 @@ impl LangExtractor for RustExtractor {
         let (call_sites, uncaptured_call_sites) = extract_call_sites(root, src);
         ExtractOut {
             symbols: extract_symbols(root, src),
+            literals: Vec::new(),
             imports: extract_imports(root, src),
             call_sites,
             uncaptured_call_sites,
+            type_refs: extract_type_refs(root, src),
             declared_namespace: None,
         }
     }
@@ -125,8 +128,13 @@ fn extract_symbols(root: Node, src: &[u8]) -> Vec<RawSymbol> {
         };
 
         let name = text(src, name_node);
-        let qualified_name = match impl_type_node {
-            Some(t) => format!("{}::{}", text(src, t), name),
+        // ADR-0032: `owner` reuses `impl_type_node` — already computed
+        // for `qualified_name` below, and exactly "the type this symbol
+        // is declared in" that carto's owner-type disambiguation tier
+        // needs.
+        let owner = impl_type_node.map(|t| text(src, t));
+        let qualified_name = match &owner {
+            Some(t) => format!("{t}::{name}"),
             None => name.clone(),
         };
         let start_line = item_node.start_position().row as u32 + 1;
@@ -154,6 +162,7 @@ fn extract_symbols(root: Node, src: &[u8]) -> Vec<RawSymbol> {
                     end_line,
                     signature,
                     is_pub,
+                    owner,
                 },
             );
         }
@@ -178,6 +187,11 @@ fn extract_imports(root: Node, src: &[u8]) -> Vec<RawImport> {
     let mut cursor = QueryCursor::new();
 
     let mut out = Vec::new();
+    // Collected separately from `out`, since a bare reference's root
+    // needs to be deduped across the *whole file* (§ADR-0024) before
+    // becoming `RawImport`s — unlike `use.decl`, which already produces
+    // one dedup pass per declaration.
+    let mut bare_reference_roots: BTreeSet<String> = BTreeSet::new();
     let mut matches = cursor.matches(&query, root, src);
     while let Some(m) = matches.next() {
         for cap in m.captures {
@@ -204,7 +218,7 @@ fn extract_imports(root: Node, src: &[u8]) -> Vec<RawImport> {
                         // resulting pairs by root so the common case
                         // (`use a::{b, c};`, one shared root) still
                         // produces exactly one `RawImport`, same as a
-                        // single-path `use` always has (§1.3, ADR-0022).
+                        // single-path `use` already has (§1.3, ADR-0022).
                         let mut by_root: BTreeMap<String, Vec<ImportedName>> = BTreeMap::new();
                         for (root_seg, imported_name) in walk_use_clause(arg, src) {
                             by_root.entry(root_seg).or_default().push(ImportedName {
@@ -220,11 +234,98 @@ fn extract_imports(root: Node, src: &[u8]) -> Vec<RawImport> {
                         }
                     }
                 }
+                "path.ref" => {
+                    if let Some(root_seg) = bare_reference_root(cap.node, src) {
+                        bare_reference_roots.insert(root_seg);
+                    }
+                }
                 _ => {}
             }
         }
     }
+    for root_seg in bare_reference_roots {
+        out.push(RawImport::BareReference { root: root_seg });
+    }
     out
+}
+
+/// Whether `node` (a `scoped_identifier`/`scoped_type_identifier`
+/// captured by `path.ref`) is a genuine bare-reference candidate for
+/// §ADR-0024, and if so, its leftmost (root) segment. `None` for the
+/// three excluded shapes: already inside a `use_declaration` (handled,
+/// more precisely, by `walk_use_clause` above — capturing it here too
+/// would just produce a redundant, differently-evidenced duplicate of
+/// the same edge); a `call_expression`'s own callee (`Type::method()`,
+/// ADR-0008's existing exclusion — the identical node shape as a
+/// genuine crate-rooted path, so re-capturing it here would reintroduce
+/// the ambiguity that exclusion exists to avoid); or a root that isn't
+/// lowercase-leading (Rust's crate-naming convention — types/traits/
+/// generic parameters are conventionally PascalCase, e.g. `Order`,
+/// `Self`, `T` — the only signal available to separate a plausible
+/// crate name from a local associated-item path without
+/// cross-referencing the whole symbol table, which this extractor
+/// deliberately doesn't do here).
+fn bare_reference_root(node: Node, src: &[u8]) -> Option<String> {
+    if is_inside_use_declaration(node) || is_call_callee(node) {
+        return None;
+    }
+    let root_seg = leftmost_text(node, src);
+    let first = root_seg.chars().next()?;
+    if !first.is_lowercase() {
+        return None;
+    }
+    // `crate`/`self`/`super` are keywords, not identifiers, so
+    // `leftmost_text` already stops at them (see `walk_use_tree`'s own
+    // handling) rather than descending further — excluded here anyway,
+    // defensively, since they're internal by definition regardless.
+    if matches!(root_seg.as_str(), "crate" | "self" | "super") {
+        return None;
+    }
+    Some(root_seg)
+}
+
+/// Walks every ancestor of `node` (not just the immediate parent, since
+/// a grouped `use a::{b::Type};`'s member sits several nodes below the
+/// `use_declaration` itself — `use_list`, `scoped_use_list`, ...) —
+/// `true` if any of them is a `use_declaration`.
+fn is_inside_use_declaration(node: Node) -> bool {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if parent.kind() == "use_declaration" {
+            return true;
+        }
+        current = parent;
+    }
+    false
+}
+
+/// Whether `node` is (part of) a `call_expression`'s own callee.
+/// `scoped_identifier`/`scoped_type_identifier` nest for a
+/// multi-segment path (`std::mem::swap` contains `std::mem` as its own
+/// `path` field) — walks up through that same-kind chain to the
+/// outermost node representing the *whole* path expression first, then
+/// checks whether *that* node's real parent is the `call_expression`
+/// with it as the `function` field. Without this, `swap` in
+/// `std::mem::swap(...)` would exclude the outer node but miss the
+/// nested `std::mem` one, which would otherwise still pass every other
+/// filter (lowercase root `std`) and produce a spurious bare-reference
+/// import.
+fn is_call_callee(node: Node) -> bool {
+    let mut current = node;
+    loop {
+        let Some(parent) = current.parent() else {
+            return false;
+        };
+        if matches!(
+            parent.kind(),
+            "scoped_identifier" | "scoped_type_identifier"
+        ) {
+            current = parent;
+            continue;
+        }
+        return parent.kind() == "call_expression"
+            && parent.child_by_field_name("function") == Some(current);
+    }
 }
 
 /// Expands a `use` argument tree into zero or more `(root_segment,
@@ -400,7 +501,13 @@ fn last_path_segment(node: Node, src: &[u8]) -> String {
 }
 
 fn leftmost_text(node: Node, src: &[u8]) -> String {
-    if node.kind() == "scoped_identifier" {
+    // `scoped_type_identifier` (a type-position path, e.g. `carto_core::
+    // Result`, §ADR-0024's `bare_reference_root`) has the same `path`/
+    // `name` field shape as `scoped_identifier` — a multi-segment type
+    // path's own `path` field nests as a plain `scoped_identifier`
+    // (only the final segment is a "type"), which the existing arm
+    // below already recurses through.
+    if matches!(node.kind(), "scoped_identifier" | "scoped_type_identifier") {
         if let Some(path) = node.child_by_field_name("path") {
             return leftmost_text(path, src);
         }
@@ -438,6 +545,96 @@ fn extract_call_sites(root: Node, src: &[u8]) -> (Vec<RawCallSite>, Vec<RawCallS
     (out, uncaptured)
 }
 
+/// ADR-0029: every identifier `types.scm` found in a type position,
+/// walked down to head identifiers by [`collect_type_names`]. See that
+/// function and `types.scm`'s own module comment for the position list
+/// and why this is additive to, not a replacement for, ADR-0024's
+/// existing `path.ref`/`RawImport::BareReference` capture.
+fn extract_type_refs(root: Node, src: &[u8]) -> Vec<RawTypeRef> {
+    let language = carto_grammars::rust_language();
+    let query = Query::new(&language, TYPES_QUERY).expect("types.scm must compile");
+    let names = query.capture_names();
+    let mut cursor = QueryCursor::new();
+
+    let mut out = Vec::new();
+    let mut matches = cursor.matches(&query, root, src);
+    while let Some(m) = matches.next() {
+        for cap in m.captures {
+            if names[cap.index as usize] == "type.pos" {
+                collect_type_names(cap.node, src, &mut out);
+            }
+        }
+    }
+    out
+}
+
+/// Descends a captured type-position subtree down to the head
+/// identifier(s) it names, recursing through every wrapper Rust's
+/// hidden `_type` supertype has (reference/pointer/array/tuple/
+/// generic/bounded) and the container shapes `types.scm` captures
+/// whole (`trait_bounds`, `type_arguments`, `ordered_field_declaration_
+/// list`'s repeated `type:` field). A path type (`crate::orders::
+/// Order`, `Type::AssocItem`) yields only its *rightmost* segment via
+/// `scoped_type_identifier`'s own `name:` field — the same policy every
+/// other extractor's qualified-call/qualified-type capture already
+/// applies, so a type reference resolves through identical name-
+/// matching semantics to a call. `primitive_type` (`u64`, `str`, ...),
+/// `unit_type` (`()`), `never_type` (`!`), `metavariable`/
+/// `macro_invocation` (macro-generated types, unresolvable
+/// syntactically), `removed_trait_bound` (`?Sized`-family, obscure),
+/// and `function_type` (`fn(T) -> U`, a rare enough shape that
+/// descending into its own parameter/return types isn't worth the
+/// complexity) are silently skipped — documented exclusions, not
+/// oversights.
+fn collect_type_names(node: Node, src: &[u8], out: &mut Vec<RawTypeRef>) {
+    match node.kind() {
+        "type_identifier" => out.push(RawTypeRef {
+            name: text(src, node),
+            line: node.start_position().row as u32 + 1,
+        }),
+        "scoped_type_identifier" => {
+            if let Some(name) = node.child_by_field_name("name") {
+                collect_type_names(name, src, out);
+            }
+        }
+        "generic_type" => {
+            if let Some(t) = node.child_by_field_name("type") {
+                collect_type_names(t, src, out);
+            }
+            if let Some(args) = node.child_by_field_name("type_arguments") {
+                collect_type_names(args, src, out);
+            }
+        }
+        "reference_type" | "pointer_type" => {
+            if let Some(t) = node.child_by_field_name("type") {
+                collect_type_names(t, src, out);
+            }
+        }
+        "array_type" => {
+            if let Some(t) = node.child_by_field_name("element") {
+                collect_type_names(t, src, out);
+            }
+        }
+        "abstract_type" | "dynamic_type" => {
+            if let Some(t) = node.child_by_field_name("trait") {
+                collect_type_names(t, src, out);
+            }
+        }
+        "type_binding" => {
+            if let Some(t) = node.child_by_field_name("type") {
+                collect_type_names(t, src, out);
+            }
+        }
+        "tuple_type" | "type_arguments" | "trait_bounds" | "bounded_type" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                collect_type_names(child, src, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn text(src: &[u8], node: Node) -> String {
     text_range(src, node.start_byte(), node.end_byte())
 }
@@ -454,6 +651,120 @@ mod tests {
 
     fn extract(src: &str) -> ExtractOut {
         RustExtractor.extract(src.as_bytes(), "test.rs")
+    }
+
+    fn type_ref_names(out: &ExtractOut) -> Vec<&str> {
+        out.type_refs.iter().map(|t| t.name.as_str()).collect()
+    }
+
+    // ADR-0029: this crate's own first non-C# instance of the reported
+    // gap — nothing in `RustExtractor` captured a type position at all
+    // before this, so `deps SomeTrait --dir in` had no signal here
+    // either. `field: T`, `-> T`, `param: T`, and `let x: T` are the
+    // shapes every real Rust struct/impl leans on.
+    #[test]
+    fn extracts_type_refs_from_field_return_parameter_and_let_positions() {
+        let out = extract(
+            "struct Order;\n\nstruct Handler {\n    order: Order,\n}\n\nfn make() -> Order {\n    let x: Order = make_inner();\n    x\n}\n\nfn take(o: Order) {}\n\nfn make_inner() -> Order {\n    Order\n}\n",
+        );
+        let names = type_ref_names(&out);
+        assert_eq!(
+            names.iter().filter(|&&n| n == "Order").count(),
+            5,
+            "field + 2 return types + let annotation + parameter, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn tuple_struct_fields_are_captured() {
+        let out = extract("struct Order;\n\nstruct Wrapper(Order, i32);\n");
+        let names = type_ref_names(&out);
+        assert!(names.contains(&"Order"));
+        assert!(!names.contains(&"i32"), "{names:?}"); // primitive_type, skip
+    }
+
+    #[test]
+    fn generic_wrapper_yields_both_head_and_argument() {
+        let out = extract("struct Order;\n\nfn make() -> Vec<Order> {\n    Vec::new()\n}\n");
+        let names = type_ref_names(&out);
+        assert!(names.contains(&"Vec"));
+        assert!(names.contains(&"Order"));
+    }
+
+    #[test]
+    fn reference_and_pointer_wrappers_recurse_to_the_inner_type() {
+        let out = extract("struct Order;\n\nfn take(o: &Order, p: *const Order) {}\n");
+        let names = type_ref_names(&out);
+        assert_eq!(names.iter().filter(|&&n| n == "Order").count(), 2);
+    }
+
+    #[test]
+    fn qualified_path_type_yields_only_the_rightmost_segment() {
+        let out = extract(
+            "mod orders {\n    pub struct Order;\n}\n\nfn take(o: crate::orders::Order) {}\n",
+        );
+        let names = type_ref_names(&out);
+        assert_eq!(names, vec!["Order"]);
+    }
+
+    #[test]
+    fn impl_block_trait_and_self_type_are_both_captured() {
+        let out = extract("trait Greet {}\nstruct Order;\n\nimpl Greet for Order {}\n");
+        let names = type_ref_names(&out);
+        assert!(names.contains(&"Greet"));
+        assert!(names.contains(&"Order"));
+    }
+
+    #[test]
+    fn const_and_static_types_are_captured() {
+        let out = extract(
+            "struct Order;\n\nconst DEFAULT: Order = Order;\nstatic SHARED: Order = Order;\n",
+        );
+        let names = type_ref_names(&out);
+        assert_eq!(names.iter().filter(|&&n| n == "Order").count(), 2);
+    }
+
+    #[test]
+    fn generic_bound_and_where_clause_are_captured() {
+        let out = extract(
+            "trait Bound {}\n\nfn take<T: Bound>(t: T) {}\n\nfn take2<T>(t: T)\nwhere\n    T: Bound,\n{\n}\n",
+        );
+        let names = type_ref_names(&out);
+        assert_eq!(
+            names.iter().filter(|&&n| n == "Bound").count(),
+            2,
+            "<T: Bound> and where T: Bound, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn turbofish_generic_argument_is_captured() {
+        // `parse::<Order>(...)` -- the shape that's actually a
+        // `generic_function` node in this grammar (verified against
+        // the real parse tree, not assumed).
+        let out = extract("struct Order;\n\nfn make() {\n    let _ = parse::<Order>(\"x\");\n}\n");
+        let names = type_ref_names(&out);
+        assert!(names.contains(&"Order"));
+    }
+
+    #[test]
+    fn turbofish_on_a_path_segment_is_captured() {
+        // `Vec::<Order>::new()` -- a genuinely different parse shape:
+        // the turbofish sits on `Vec::<Order>` as a `generic_type`
+        // inside the outer `scoped_identifier`'s own `path:` field, not
+        // inside a `generic_function` node at all (this grammar reuses
+        // `scoped_identifier` for `Type::assoc_fn` regardless of
+        // whether `Type` itself carries generic arguments) — needs its
+        // own pattern, distinct from the plain-call turbofish above.
+        let out = extract("struct Order;\n\nfn make() {\n    let _ = Vec::<Order>::new();\n}\n");
+        let names = type_ref_names(&out);
+        assert!(names.contains(&"Order"));
+    }
+
+    #[test]
+    fn primitive_and_unit_types_are_not_captured() {
+        let out = extract("fn take(a: u64, b: &str, c: ()) {}\n");
+        assert!(type_ref_names(&out).is_empty());
     }
 
     #[test]
@@ -733,6 +1044,80 @@ mod tests {
             .collect();
         uses.sort();
         assert_eq!(uses, vec![("crate", vec!["a"]), ("std", vec!["b"])]);
+    }
+
+    fn bare_reference_roots(out: &ExtractOut) -> Vec<&str> {
+        out.imports
+            .iter()
+            .filter_map(|i| match i {
+                RawImport::BareReference { root } => Some(root.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn bare_reference_in_return_type_is_captured_with_no_use_statement() {
+        // §ADR-0024's motivating case: main.rs's `-> carto_core::
+        // Result<u8>` return type, no `use carto_core::...;` anywhere.
+        let out = extract("fn run() -> carto_core::Result<u8> {\n    todo!()\n}\n");
+        assert_eq!(bare_reference_roots(&out), vec!["carto_core"]);
+    }
+
+    #[test]
+    fn type_method_call_shape_is_not_captured_as_a_bare_reference() {
+        // `Order::new()` is the exact ambiguous shape ADR-0008 already
+        // excludes from call resolution — must not become a spurious
+        // "imports Order" edge either.
+        let out = extract("fn handle() {\n    Order::new();\n}\n");
+        assert!(bare_reference_roots(&out).is_empty());
+    }
+
+    #[test]
+    fn multi_segment_call_callee_excludes_every_nested_segment() {
+        // `std::mem::swap(...)` nests `std::mem` inside the outer
+        // `std::mem::swap` node — both must be excluded, not just the
+        // outermost one (the nested-ancestor-walk in `is_call_callee`).
+        let out = extract("fn f() {\n    std::mem::swap(&mut a, &mut b);\n}\n");
+        assert!(bare_reference_roots(&out).is_empty());
+    }
+
+    #[test]
+    fn pascal_case_root_is_not_captured_as_a_bare_reference() {
+        // `Self::Output`/`T::Item` — associated-type paths whose root
+        // is a local type/generic parameter, not a crate. Rust's
+        // crate-naming convention (lowercase) is the only signal
+        // available to tell these apart without a full symbol
+        // cross-reference.
+        let out = extract(
+            "trait Foo {\n    type Output;\n}\n\
+             fn f<T: Foo>() -> Self::Output {\n    todo!()\n}\n\
+             fn g<T: Foo>() -> T::Output {\n    todo!()\n}\n",
+        );
+        assert!(bare_reference_roots(&out).is_empty());
+    }
+
+    #[test]
+    fn bare_reference_inside_a_use_declaration_is_not_duplicated() {
+        // A real `use carto_core::Foo;` already produces an `Absolute`
+        // import — the same inner path must not also surface as a
+        // separate `BareReference` for the identical root.
+        let out = extract("use carto_core::Foo;\n");
+        assert!(bare_reference_roots(&out).is_empty());
+        assert!(
+            out.imports
+                .iter()
+                .any(|i| matches!(i, RawImport::Absolute { root, .. } if root == "carto_core"))
+        );
+    }
+
+    #[test]
+    fn bare_reference_root_is_deduped_across_the_whole_file() {
+        let out = extract(
+            "fn f() -> carto_core::Result<u8> {\n    todo!()\n}\n\
+             fn g() -> carto_core::Result<u16> {\n    todo!()\n}\n",
+        );
+        assert_eq!(bare_reference_roots(&out), vec!["carto_core"]);
     }
 
     #[test]

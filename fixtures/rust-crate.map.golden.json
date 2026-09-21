@@ -3,7 +3,8 @@
     "edges_by_kind": {
       "calls": 5,
       "contains": 7,
-      "imports": 2
+      "imports": 2,
+      "references": 2
     },
     "files": 4,
     "modules": 0,
@@ -11,7 +12,7 @@
   },
   "lines": [
     "files=4 symbols=7 modules=0",
-    "edges: calls=5 contains=7 imports=2",
+    "edges: calls=5 contains=7 imports=2 references=2",
     "## top modules (imports fan-in/out)",
     "  src/lib.rs  in=0 out=2",
     "  src/handlers.rs  in=1 out=0",

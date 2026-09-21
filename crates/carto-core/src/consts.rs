@@ -10,14 +10,46 @@ pub const BIN_NAME: &str = "carto";
 /// way ingest/tooling needs to know about. Spec §4.4, §8.3.
 ///
 /// 1 -> 2 (ADR-0020): `SymbolNode` gained `uncaptured_inbound_calls`.
-/// That field carries `#[serde(default)]` so a v1 `graph.json` still
-/// *parses* cleanly (rather than a raw missing-field error), but this
-/// bump ensures `graph::load`'s schema-version check still rejects it
-/// with a "re-run `carto index`" message before any query code can ever
-/// see a fabricated `0` for a repo that was never actually scanned for
-/// this — the version check runs immediately after parsing, so the
+/// 2 -> 3 (ADR-0023): `SymbolNode` gained `uncaptured_outbound_calls`,
+/// the same field's outbound counterpart. Both fields carry
+/// `#[serde(default)]` so an older `graph.json` still *parses* cleanly
+/// (rather than a raw missing-field error), but each bump ensures
+/// `graph::load`'s schema-version check still rejects it with a
+/// "re-run `carto index`" message before any query code can ever see a
+/// fabricated `0` for a repo that was never actually scanned for that
+/// field — the version check runs immediately after parsing, so the
 /// `#[serde(default)]` value never escapes `load`.
-pub const SCHEMA_VERSION: u32 = 2;
+/// 3 -> 4 (ADR-0026): new `NodeData::Contract` variant and `produces`/
+/// `consumes` edges. A v3 `graph.json` structurally cannot contain
+/// either — `orphans`/`contract` must be rejected with "re-run `carto
+/// index`" on it, not silently answer from a graph that never looked
+/// for contracts at all.
+/// 4 -> 5 (ADR-0029): the long-declared-but-never-produced
+/// `EdgeKind::References` variant gets its first producer (type-
+/// position capture). A v4 `graph.json` structurally cannot contain a
+/// `references` edge — `deps --kinds references` must be rejected with
+/// "re-run `carto index`" on it, not silently answer "nothing
+/// references this" from a graph that never looked for type refs at
+/// all.
+/// 5 -> 6 (ADR-0033): `SymbolNode` gained `unresolved_inbound_calls`/
+/// `unresolved_inbound_call_count` — a third honesty signal, distinct
+/// from `uncaptured_inbound_calls` (ADR-0020, never-attempted shapes)
+/// and `unresolved_calls` (outbound, on the caller): call sites
+/// elsewhere in the repo that were *attempted* and produced no edge
+/// (most often bare-name ambiguity — an interface method and its
+/// implementation). A v5 `graph.json` was built before this pass
+/// existed at all, so its absence must not be misread as "zero" — same
+/// "never let a fabricated default escape `load`" reasoning as every
+/// prior bump.
+pub const SCHEMA_VERSION: u32 = 6;
+
+/// Max entries kept in `SymbolNode::unresolved_inbound_calls` /
+/// `DepsResult::root_unresolved_inbound_calls`; `_count` fields carry the
+/// uncapped total so the signal stays honest above the cap. A common
+/// method name unresolved at many call sites would otherwise store one
+/// entry per site on every same-named symbol repo-wide — this bounds
+/// that against `MAX_GRAPH_BYTES`. ADR-0033.
+pub const UNRESOLVED_INBOUND_SITES_CAP: usize = 25;
 
 /// Opening fence marker wrapping tainted content in rendered output.
 /// Spec §8.4. The bracket characters here (`⟦`/`⟧`, U+27E6/U+27E7) are

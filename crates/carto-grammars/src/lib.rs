@@ -79,6 +79,16 @@ pub fn csharp_language() -> tree_sitter::Language {
     tree_sitter_c_sharp::LANGUAGE.into()
 }
 
+/// HCL grammar (ADR-0025 — the infra literal-contract slice). Same
+/// `LanguageFn -> Language` conversion as the others, no `unsafe` needed
+/// for the same reason. `tree-sitter-hcl`'s only normal dependency is
+/// `tree-sitter-language`, so this adds no second `tree-sitter` version
+/// for `deny.toml`'s `multiple-versions = "deny"` to object to.
+#[cfg(feature = "native-grammars")]
+pub fn hcl_language() -> tree_sitter::Language {
+    tree_sitter_hcl::LANGUAGE.into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
