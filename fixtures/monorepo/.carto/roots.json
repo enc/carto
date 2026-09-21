@@ -1,0 +1,6 @@
+{
+  "detect": true,
+  "roots": [
+    { "name": "ingest", "path": "lambdas/ingest", "kind": "python" }
+  ]
+}

@@ -1,6 +1,6 @@
 # carto — status / handoff
 
-**Milestone:** M1.b.2b done (Rust, Python, PHP, TS/TSX/JS, Go — spec §5.2's full v1 language set), plus C# added post-v1 on user request (ADR-0016). M2's first slice — real redaction (ADR-0017) — is also done. An MCP server slice (normally M4 scope) was pulled ahead on user request, to measure spec §11.4's S-1 benchmark before further capability work (ADR-0018). **The S-1 benchmark has now been run (ADR-0019): neither threshold is met on a one-trial measurement** (combined input tokens: carto uses 18.0% more, not ≥30% fewer; accuracy: carto is 6.2 points lower, not ≥20 higher) — full per-task result in [`bench/`](../bench/) and ADR-0019. **The post-S-1 improvement plan's slices 1–4 are now implemented** (`docs/post-s1-improvement-plan.md`, ADRs 0020–0022: the honest-absence signal, `map --section`, `Module`/`File` discovery plus the same-file caller flag, and Rust grouped-`use` extraction) — see the milestone entry below. **M3 still does not proceed automatically — spec §11.4 requires the user's decision, presented and pending; re-running S-1 against this slice (plan step 5) is a separate, not-yet-run step.** **Since then, a genuinely new capability — cross-language string-literal contracts (ADRs 0025–0027) — was pulled ahead on user request, independent of the M3 gate**, the same "pulled ahead on request" precedent MCP/C# already set; see the milestone entry below. **Most recently, real C# field feedback (`bench/field-log.md`) drove a fix (ADRs 0029–0030): type positions (fields, parameters, base clauses, generic arguments) were never captured by any extractor, so `deps --dir in` on a type/interface could only ever answer from the coarser `imports` edge — a new `EdgeKind::References` producer, across all six typed languages, closes that gap. A same-day retest then caught a real follow-on miss — top-level-statement code (modern ASP.NET Core `Program.cs`) has no enclosing symbol, so calls/type-refs inside it were silently dropped — fixed by ADR-0031's file-scope fallback; see the milestone entry below.** **Most recently (ADRs 0032–0033), a direct follow-up narrowed same-name ambiguity using the same `type_refs` channel (owner-type disambiguation) and added a third honesty signal, `unresolved_inbound_calls`, for call sites that were attempted and still produced no edge — see the milestone entry below.**
+**Milestone:** M1.b.2b done (Rust, Python, PHP, TS/TSX/JS, Go — spec §5.2's full v1 language set), plus C# added post-v1 on user request (ADR-0016). M2's first slice — real redaction (ADR-0017) — is also done. An MCP server slice (normally M4 scope) was pulled ahead on user request, to measure spec §11.4's S-1 benchmark before further capability work (ADR-0018). **The S-1 benchmark has now been run (ADR-0019): neither threshold is met on a one-trial measurement** (combined input tokens: carto uses 18.0% more, not ≥30% fewer; accuracy: carto is 6.2 points lower, not ≥20 higher) — full per-task result in [`bench/`](../bench/) and ADR-0019. **The post-S-1 improvement plan's slices 1–4 are now implemented** (`docs/post-s1-improvement-plan.md`, ADRs 0020–0022: the honest-absence signal, `map --section`, `Module`/`File` discovery plus the same-file caller flag, and Rust grouped-`use` extraction) — see the milestone entry below. **M3 still does not proceed automatically — spec §11.4 requires the user's decision, presented and pending; re-running S-1 against this slice (plan step 5) is a separate, not-yet-run step.** **Since then, a genuinely new capability — cross-language string-literal contracts (ADRs 0025–0027) — was pulled ahead on user request, independent of the M3 gate**, the same "pulled ahead on request" precedent MCP/C# already set; see the milestone entry below. **Most recently, real C# field feedback (`bench/field-log.md`) drove a fix (ADRs 0029–0030): type positions (fields, parameters, base clauses, generic arguments) were never captured by any extractor, so `deps --dir in` on a type/interface could only ever answer from the coarser `imports` edge — a new `EdgeKind::References` producer, across all six typed languages, closes that gap. A same-day retest then caught a real follow-on miss — top-level-statement code (modern ASP.NET Core `Program.cs`) has no enclosing symbol, so calls/type-refs inside it were silently dropped — fixed by ADR-0031's file-scope fallback; see the milestone entry below.** **Next (ADRs 0032–0033), a direct follow-up narrowed same-name ambiguity using the same `type_refs` channel (owner-type disambiguation) and added a third honesty signal, `unresolved_inbound_calls`, for call sites that were attempted and still produced no edge — see the milestone entry below.** **Most recently, another genuinely new capability — multi-root/component-aware indexing (ADRs 0034–0035) — was pulled ahead on user request, independent of the M3 gate: real monorepos put several projects (microservices, frontends, lambdas, infra) under one root, which carto's original single-scope resolution policy handled poorly (silently dropping real intra-component edges, producing false cross-component edges at up to `Certain` confidence); `resolve.rs` now recognizes component boundaries and prefers same-component matches before falling back to repo-wide behavior, and `--component` reaches every query command — see the milestone entry below.**
 
 Where the implementation is in the milestone sequence, what's deliberately
 absent, and what's next. Everything else lives elsewhere on purpose:
@@ -348,6 +348,68 @@ so they've been subdivided. Current state:
     (`fixtures/mixed.graph.golden.json`,
     `fixtures/rust-crate.{deps,map}.golden.json`); `bash scripts/
     gates.sh` green.
+- **Multi-root support (component-aware indexing)** (2026-09-21, ADRs
+  0034–0035) — another capability outside spec §4/§7's original scope,
+  pulled ahead on user request, the same "pulled ahead" precedent MCP
+  (ADR-0018), C# (ADR-0016), and the contracts slice (ADR-0025–0027)
+  already set. Real repos put several projects under one root
+  (microservices, frontends, lambdas, infra) — carto's original
+  "same-package = same walked repo" resolution policy (spec §5.3 rule
+  2c) treated the whole tree as one scope, silently dropping real
+  intra-component edges (two services each defining `Handler` made
+  either one unresolvable) and producing false cross-component edges
+  at up to `Certain` confidence. **One tree, N components, not N
+  filesystem roots.**
+  - **ADR-0034**: new `crates/carto-core/src/components/` module —
+    auto-detects project roots inside the walked tree from manifest
+    markers (`go.mod`/`package.json`/`Cargo.toml`/`pyproject.toml`/
+    `setup.py`/`composer.json`/`*.csproj`/`*.fsproj`, plus ≥1 HCL file
+    as the weakest signal for terraform), suppresses workspace/
+    monorepo aggregators by reading the marker file's own content, and
+    layers an optional `.carto/roots.json` on top (the exact
+    built-ins-plus-repo-file shape ADR-0027 established). `FileNode`
+    gains `component: Option<String>`; `GraphDocument` gains a
+    `components: Vec<Component>` table; `Manifest` gains
+    `roots_rule_digest` (closing, for this config file, the same
+    provenance gap ADR-0027 left open for `.carto/contracts.json`).
+    `SCHEMA_VERSION` bumped 6 → 7. Verified additive: a repo with no
+    nested components produces a graph diff that is exactly the new
+    `null`/empty-table fields, checked by diffing
+    `fixtures/mixed.graph.golden.json`, not assumed. Dogfooded against
+    carto's own 4-crate workspace — correctly detects all four crates,
+    correctly suppresses the workspace-only root `Cargo.toml`.
+  - **ADR-0035**: `resolve.rs`'s `CallResolver` gains two new
+    component-scoped tiers (imported/exported, caller's own
+    component), tried before their repo-wide counterparts and falling
+    through to them on ambiguity — provably safe, since a
+    component-scoped candidate set is always a subset of the repo-wide
+    one. The four `Certain`-confidence import indices each get their
+    own treatment rather than one uniform rule: `known_modules` (Rust
+    `mod` names) is a strict per-component partition (semantically
+    required — a `mod` in one crate is never visible to another);
+    `fqn_to_file`/`namespace_to_files` (PHP `use`/C# `using`) prefer
+    same-component with a repo-wide fallback; `known_namespace_roots`
+    is deliberately left unchanged (narrowing it risks misclassifying
+    a genuinely-internal-but-cross-component import as external). One
+    disclosed non-additive case, tested explicitly: component scoping
+    can retarget a call that used to resolve via cross-component
+    owner-type disambiguation (ADR-0032) to a different, same-component
+    candidate instead — the more precise answer, not silently folded
+    into "purely additive." `--component <name>` (repeatable) reaches
+    `where`/`deps`/`map`/`contract`/`orphans` on both front ends
+    (ADR-0014's "restricts what's listed" principle, a separate
+    concern from the resolution narrowing above); `deps`'s
+    `resolve_target` treats it as a tiebreaker only, exactly like
+    `--subpath`, not an unconditional filter (ADR-0014's own
+    real-bug-caught lesson, not re-made here — verified end to end:
+    `deps Handler --component billing` resolves cleanly on a
+    synthetic two-component fixture where the unscoped name alone is
+    ambiguous). `map` gains a `components` section. 11 new
+    `resolve.rs` tests (84 total) plus 13 new `QueryGraph` tests; all
+    429 pre-existing `resolve.rs` tests pass completely unchanged.
+    `fixtures/rust-crate.{where,deps,map}.golden.json` regenerated —
+    diffs are exactly the new fields.
+  - `bash scripts/gates.sh` green at each commit landing this work.
 - **M2+ remaining (infra graph proper, join, ingest)** — spec §10. The
   contract slice above is adjacent to, not a substitute for, this: no
   `IacResource`/`depends_on`/IAM extraction/§6.6 attribute allowlist
@@ -367,6 +429,18 @@ at all). See [ADR-0014](adr/0014-subpath-scoping.md).
 
 Do not "fix" these without checking the linked reasoning first:
 
+- **`known_namespace_roots` (C#/PHP) is not component-scoped**, unlike
+  its sibling indices `fqn_to_file`/`namespace_to_files` — a namespace
+  root declared anywhere in the repo is still evidence it's the
+  repo's own, regardless of which component declared it; narrowing
+  this risks the opposite failure (a genuinely-internal-but-cross-
+  component import misclassified as external). ADR-0035.
+- **No `go.work`/npm-nested-workspace-aware multi-level component
+  hierarchy** beyond simple innermost-directory-match nesting; no
+  per-component `.cartoignore`; `.carto/roots.json`'s digest goes into
+  `manifest.json` provenance but nothing reads it back (no query
+  command reads `Manifest` at all today — same reasoning ADR-0027 gave
+  for `.carto/contracts.json`'s own digest). ADR-0034.
 - **`Contract` categories beyond `metric_name`** — env vars, DynamoDB
   attributes, Kafka topics, WS wire-protocol fields, Parquet/Glue
   columns, SID-style subtype IDs, doc-mention edges, Terraform

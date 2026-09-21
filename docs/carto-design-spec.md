@@ -378,9 +378,9 @@ matchers fired/failed — essential for trust and debugging.
 | Command / MCP tool | Input | Output (JSON + human) |
 |---|---|---|
 | `index` | repo path, infra flags | manifest summary |
-| `map` | `--budget <lines>` (default 200), `--subpath <dir>` (ADR-0014) | layered overview: top modules by fan-in/out, entry points, infra summary, join stats; hard-capped at budget |
-| `where <name>` | symbol name (substring/exact), `--subpath <dir>` (ADR-0014) | matches: id, kind, `file:line`, signature |
-| `deps <id|name>` | `--dir in|out|both`, `--depth N` (≤5), `--kinds`, `--subpath <dir>` (ADR-0014) | adjacency listing with confidence |
+| `map` | `--budget <lines>` (default 200), `--subpath <dir>` (ADR-0014), `--component <name>` (repeatable, ADR-0034/0035) | layered overview: top modules by fan-in/out, entry points, infra summary, join stats, component structure; hard-capped at budget |
+| `where <name>` | symbol name (substring/exact), `--subpath <dir>` (ADR-0014), `--component <name>` (repeatable, ADR-0034/0035) | matches: id, kind, `file:line`, signature |
+| `deps <id|name>` | `--dir in|out|both`, `--depth N` (≤5), `--kinds`, `--subpath <dir>` (ADR-0014), `--component <name>` (repeatable, ADR-0034/0035) | adjacency listing with confidence |
 | `impact <id|name>` or `--diff <rev>` | | transitive dependents; with infra: affected resources + IAM stmts; weak matches sectioned separately |
 | `infra_of <id|name>` / `code_of <address>` | | join traversal both directions |
 | `unused_permissions` | | IamPolicyStmts whose parent resource has no code path referencing the service (heuristic, clearly labeled; v1: service-level match between `actions[]` prefixes and SDK import/usage strings) |

@@ -35,6 +35,7 @@ cargo run -p carto-cli -- index fixtures/go-svc --out /tmp/carto-out
 cargo run -p carto-cli -- index fixtures/csharp-app --out /tmp/carto-out
 cargo run -p carto-cli -- index fixtures/secrets-corpus --out /tmp/carto-out
 cargo run -p carto-cli -- index fixtures/sid-like --out /tmp/carto-out
+cargo run -p carto-cli -- index fixtures/monorepo --out /tmp/carto-out
 cargo run -p carto-cli -- index <repo> --json 2>/dev/null | python3 -m json.tool
 cargo run -p carto-cli -- where <name> <repo> --out /tmp/carto-out
 cargo run -p carto-cli -- deps <name|id> <repo> --out /tmp/carto-out --dir out --depth 2
@@ -302,6 +303,51 @@ each through the same tier ladder, pushing a `Calls`/`References` edge
 from the `File` node on success (resolved case only — an unattached
 miss still has no `unresolved_calls`-equivalent; ADR-0031, a same-day
 retest fix to ADR-0029/0030).
+
+### Multi-root support (component-aware indexing)
+
+Another capability outside spec §4/§7's original scope, added on user
+request (ADR-0034/0035): real repos put several projects that belong
+together — microservices, frontends, lambdas, infra — under one root,
+and carto's original "same-package = same walked repo" resolution
+policy (spec §5.3 rule 2c, every language ADR from 0008 onward) treats
+the whole tree as one scope, which both silently drops real
+intra-component edges (two services each defining `Handler` makes
+either one unresolvable) and produces false cross-component edges at
+up to `Certain` confidence (PHP `use`/C# `using`). **One tree, N
+components** — not N filesystem roots: `carto index <monorepo>` walks
+a single root exactly as before; a new `crates/carto-core/src/
+components/` module recognizes the project roots *inside* that tree
+from `walk`'s own output (manifest-file markers — `go.mod`,
+`package.json`, `Cargo.toml`, etc. — plus an optional
+`.carto/roots.json` override, the same built-ins-plus-repo-file shape
+ADR-0027 established for `.carto/contracts.json`), stamps each
+`FileNode.component` before extraction/resolution runs, and persists a
+`components: Vec<Component>` table in `graph.json` alongside it.
+`resolve.rs`'s bare-name tiers gain two new component-scoped tiers,
+tried *before* their repo-wide counterparts and falling through to
+them on ambiguity — provably safe to add, since a component-scoped
+candidate set is always a subset of the repo-wide one, so an ambiguous
+in-component result is provably still ambiguous on the full set. The
+four `Certain`-confidence import indices (`known_modules`/`fqn_to_
+file`/`namespace_to_files`/`known_namespace_roots`) each get their own
+component treatment, not a single uniform rule — `known_modules` is a
+strict per-component partition (semantically required: a Rust `mod`
+in one crate is never visible to another), the two PHP/C# FQN indices
+prefer same-component with a repo-wide fallback, and
+`known_namespace_roots` is deliberately left unchanged (narrowing it
+risks misclassifying a genuinely-internal-but-cross-component import
+as external). `--component <name>` (repeatable) reaches `where`/
+`deps`/`map`/`contract`/`orphans` on both front ends, following
+ADR-0014's "restricts what's listed, never what's computed" principle
+for the query layer's own dimension — a separate concern from the
+index-time resolution narrowing above. `map` gains a `components`
+section (per-component file/symbol counts plus a cross-component edge
+summary). Verified additive: a repo with no nested components produces
+a graph/query diff that is exactly the new `null`/empty-collection
+fields, nothing else — checked by diffing goldens, not assumed — and
+all 429 pre-existing `resolve.rs` tests pass completely unchanged,
+since none of them ever sets a file's component.
 
 ## Conventions
 

@@ -14,6 +14,14 @@ but by traversing a pre-built graph instead of reading files, which is
 usually fewer tokens for the same answer, and gives an answer with an
 explicit confidence attached rather than an implicit guess.
 
+A repo that's actually several projects under one root — microservices,
+frontends, lambdas, infra — gets that structure recognized
+automatically: carto detects each project's own root (a `go.mod`,
+`package.json`, `Cargo.toml`, …, or one declared in
+`.carto/roots.json`) as a **component**, and every tool below accepts a
+repeatable `component` param to scope its answer to one or more of
+them.
+
 carto is a separate MCP server (`carto serve`), not a bash tool. If it's
 connected for this session, its tools appear alongside the built-in
 ones, named `index`/`where`/`deps`/`map`/`contract`/`orphans`/
@@ -29,6 +37,7 @@ namespace, not just a function or type.
 
     where(repo_path=".", needle="parseOrder")
     where(repo_path=".", needle="parseOrder", exact=true, limit=10, subpath="src/orders")
+    where(repo_path=".", needle="Handler", component="orders")
 
 **"What does this depend on, or what depends on it?"** — `deps` walks the
 call/import graph from a symbol, file, or module, in either direction, to
@@ -37,6 +46,20 @@ ID, an exact symbol name, or a `Module.path`/`File.path`.
 
     deps(repo_path=".", target="parseOrder", dir="in", depth=2)
     deps(repo_path=".", target="src/orders/mod.rs", dir="both", depth=1, kinds="imports,calls", subpath="src")
+
+In a multi-component repo, a same-named symbol in two different
+components (two services each defining `Handler`) is genuinely
+ambiguous by name alone — `target` becomes unresolvable without
+narrowing. `component` on a `deps` call is a *tiebreaker* the same way
+`subpath` already is: it only kicks in once the plain name is already
+ambiguous, so it never overrides an otherwise-unambiguous match:
+
+    deps(repo_path=".", target="Handler", component="billing", dir="out")
+
+Each row in the response also carries its own `component` (via `node`),
+and `same_component_as_root` flags whether a given edge crosses a
+component boundary — rendered as `[cross-component]` next to the
+existing `[same file as root]` marker.
 
 **"What imports this module?"** — same `deps` tool, `dir="in"` on a file
 or module target instead of a symbol.
@@ -65,15 +88,25 @@ TS/JS/Python module-level setup code the same shape). carto resolves
 those at file scope rather than dropping them.
 
 **"Give me an orientation of this repo"** — `map` returns a budget-capped
-overview: top modules by import fan-in/out, structural entry points, and
-counts by node/edge kind — meant to answer "what is this repo, roughly"
-in far fewer tokens than reading a directory tree and a handful of files.
-`sections` (repeatable: `counts`, `modules`, `entry-points`, `infra`)
-lets a question that only needs one section skip paying for the rest;
-the structured `counts` field is always exact regardless of this filter.
+overview: top modules by import fan-in/out, structural entry points,
+component structure, and counts by node/edge kind — meant to answer
+"what is this repo, roughly" in far fewer tokens than reading a
+directory tree and a handful of files.
+`sections` (repeatable: `counts`, `modules`, `entry-points`, `infra`,
+`components`) lets a question that only needs one section skip paying
+for the rest; the structured `counts` field is always exact regardless
+of this filter.
 
     map(repo_path=".", budget=100)
     map(repo_path=".", sections="entry-points", subpath="crates/carto-core")
+    map(repo_path=".", sections="components")
+
+The `components` section is the fastest way to learn a monorepo's
+top-level shape: one row per detected project (name, path, kind,
+file/symbol counts) plus a summary of edges crossing between two
+different components — e.g. `orders -> shared: 12 calls, 3 imports`.
+`sections="components"` alone, before reading anything else, is often
+enough to know whether a question needs one component or several.
 
 **"Do this repo's string-literal contracts line up?"** — a capability
 outside the original design (ADR-0026), for values no compiler checks
@@ -88,6 +121,7 @@ produced (a dead alarm that can never fire) and the mirror, produced but
 never consumed:
 
     orphans(repo_path=".", category="metric_name")
+    orphans(repo_path=".", category="metric_name", component="ingest")
 
 `contract` answers "who else touches this exact value" — every producer
 and consumer site for one literal:
@@ -193,6 +227,18 @@ knowing before trusting a result at face value:
   disjunctive-normal-form types (`(A&B)|C`) are all shapes no extractor
   attempts. Worth a grep when the answer looks surprisingly empty and
   the question matters.
+- `component` filters *what's listed*, never what a traversal computes
+  — `deps`'s BFS still crosses component boundaries and back, `map`'s
+  fan-in/out numbers stay whole-repo-accurate. An unknown component
+  name is a hard error listing the real ones (unlike `subpath`, which
+  has no enumerable list to check against and just returns fewer
+  rows). `contract`'s `component` filters producer/consumer *sites*
+  within a match — a match can come back with empty lists rather than
+  disappearing, which is itself the answer for a cross-component
+  question. `orphans`'s `component` filters the *report* instead — an
+  orphan's defining fact (no producer, or no consumer, anywhere) is
+  repo-wide, not a per-site thing, so a contract with no site in the
+  requested component is dropped entirely rather than shown empty.
 - A call or type reference in top-level-statement code (C#'s
   `Program.cs`-with-no-`Main` style, TS/JS/Python module-level setup
   code) resolves at file scope when it succeeds, but — unlike a
