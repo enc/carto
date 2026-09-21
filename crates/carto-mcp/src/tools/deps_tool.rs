@@ -206,17 +206,7 @@ fn render_text(result: &query::DepsResult, dir: Direction) -> String {
             } else {
                 ""
             };
-            // ADR-0034/0035: the component analogue — only worth stating
-            // when there's a real component dimension at all (both root
-            // and this node have one); `same_file_as_root`/
-            // `same_component_as_root` are independently `false` for a
-            // Module/Contract endpoint, so this stays silent there too.
-            let cross_component_note =
-                if edge.node.component.is_some() && !edge.same_component_as_root {
-                    "  [cross-component]"
-                } else {
-                    ""
-                };
+            let cross_component_note = cross_component_note(edge);
             out.push_str(&format!(
                 "  [{}] {} {} {} ({})  {}{same_file_note}{cross_component_note}\n",
                 hop.depth,
@@ -240,9 +230,23 @@ fn render_text(result: &query::DepsResult, dir: Direction) -> String {
     out
 }
 
+/// ADR-0034/0035: the `[cross-component]` marker text, or `""` — see
+/// `carto-cli/src/deps_cmd.rs`'s own copy of this function for the full
+/// reasoning (only worth stating for a File/Symbol target; a
+/// Module/Contract node has no component concept at all).
+fn cross_component_note(edge: &query::DepEdge) -> &'static str {
+    if matches!(edge.node.kind.as_str(), "file" | "symbol") && !edge.same_component_as_root {
+        "  [cross-component]"
+    } else {
+        ""
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use carto_core::graph::Confidence;
+    use carto_core::query::NodeSummary;
 
     #[test]
     fn missing_target_is_a_tool_error() {
@@ -257,5 +261,40 @@ mod tests {
         }))
         .unwrap_err();
         assert!(err.contains("dir"));
+    }
+
+    fn edge(kind: &str, component: Option<&str>, same_component_as_root: bool) -> query::DepEdge {
+        query::DepEdge {
+            kind: EdgeKind::Calls,
+            confidence: Confidence::Inferred,
+            evidence: vec![],
+            direction: Direction::Out,
+            node: NodeSummary {
+                id: carto_core::graph::file_id("x"),
+                kind: kind.to_string(),
+                label: "x".to_string(),
+                location: None,
+                component: component.map(str::to_string),
+            },
+            same_file_as_root: false,
+            same_component_as_root,
+        }
+    }
+
+    #[test]
+    fn marker_for_a_crossing_into_the_none_bucket() {
+        // The exact bug this regression guards: a File/Symbol target
+        // with no component at all is still a real crossing when the
+        // root has one.
+        assert_eq!(
+            cross_component_note(&edge("file", None, false)),
+            "  [cross-component]"
+        );
+    }
+
+    #[test]
+    fn no_marker_for_module_or_contract_targets() {
+        assert_eq!(cross_component_note(&edge("module", None, false)), "");
+        assert_eq!(cross_component_note(&edge("contract", None, false)), "");
     }
 }

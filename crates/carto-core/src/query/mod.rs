@@ -152,6 +152,23 @@ impl QueryGraph {
         self.components.iter().map(|c| c.name.as_str()).collect()
     }
 
+    /// Renders a `--component` filter as a `" --component X --component
+    /// Y"` suffix for a `Truncation::next_call` hint — shared by every
+    /// command that carries this filter forward, so the formatting rule
+    /// (an absent or empty filter contributes nothing) lives in one
+    /// place rather than five copies of the same `.filter(...).map(...)
+    /// .unwrap_or_default()`.
+    pub fn component_flags(component: Option<&BTreeSet<String>>) -> String {
+        component
+            .filter(|c| !c.is_empty())
+            .map(|c| {
+                c.iter()
+                    .map(|name| format!(" --component {name}"))
+                    .collect::<String>()
+            })
+            .unwrap_or_default()
+    }
+
     /// Validates a `--component` filter's names against what this index
     /// actually knows about (`known_component_names`) — an unknown name
     /// is a typo, not a legitimately-empty-result query, unlike
@@ -316,14 +333,16 @@ impl QueryGraph {
         if filter.is_empty() {
             return true;
         }
+        // Module/Contract are always in scope (see this method's own
+        // doc comment for why that's a deliberate divergence from what
+        // `component_of` reports for them); everything else defers to
+        // `component_of`'s own File/Symbol-via-owning-file lookup
+        // rather than repeating it here.
         match self.node(id).map(|n| &n.data) {
-            Some(NodeData::File(f)) => f.component.as_deref().is_some_and(|c| filter.contains(c)),
-            Some(NodeData::Symbol(s)) => self
-                .node(&s.file)
-                .and_then(|n| n.data.as_file())
-                .and_then(|f| f.component.as_deref())
-                .is_some_and(|c| filter.contains(c)),
             Some(NodeData::Module(_)) | Some(NodeData::Contract(_)) => true,
+            Some(NodeData::File(_)) | Some(NodeData::Symbol(_)) => {
+                self.component_of(id).is_some_and(|c| filter.contains(c))
+            }
             None => false,
         }
     }

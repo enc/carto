@@ -188,8 +188,9 @@ pub fn run(qg: &QueryGraph, query: &FindQuery) -> FindResult {
     module_matches.truncate(remaining);
 
     let truncation = if truncated {
+        let component_flags = QueryGraph::component_flags(query.component.as_ref());
         Truncation::more(format!(
-            "carto where {} --limit {}",
+            "carto where {} --limit {}{component_flags}",
             query.needle,
             query.limit * 2
         ))

@@ -138,7 +138,11 @@ pub fn run(qg: &QueryGraph, query: &OrphansQuery) -> OrphansResult {
     produced_never_consumed.truncate(query.limit);
 
     let truncation = if a_truncated || b_truncated {
-        Truncation::more(format!("carto orphans --limit {}", query.limit * 2))
+        let component_flags = QueryGraph::component_flags(query.component.as_ref());
+        Truncation::more(format!(
+            "carto orphans --limit {}{component_flags}",
+            query.limit * 2
+        ))
     } else {
         Truncation::none()
     };

@@ -125,7 +125,9 @@ impl ComponentSet {
         self.components
             .iter()
             .find(|c| {
-                file_path == c.path.as_str() || file_path.starts_with(&format!("{}/", c.path))
+                file_path
+                    .strip_prefix(c.path.as_str())
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
             })
             .map(|c| c.name.as_str())
     }
@@ -426,9 +428,13 @@ fn apply_declared_roots(
             )));
         }
         let path = root.path.trim_matches('/');
-        if path.is_empty() || path.contains("..") || root.path.starts_with('/') {
+        // `..` is only a traversal attempt as a whole path *segment* —
+        // `contains("..")` alone would also reject a legitimately named
+        // directory like `services/my..lib`.
+        let is_dotdot_segment = path.split('/').any(|seg| seg == "..");
+        if path.is_empty() || is_dotdot_segment || root.path.starts_with('/') {
             return Err(Error::user(format!(
-                "`{}`: invalid component path `{}` (must be repo-relative, non-empty, no `..`)",
+                "`{}`: invalid component path `{}` (must be repo-relative, non-empty, no `..` segment)",
                 config_path.display(),
                 root.path
             )));
@@ -457,6 +463,24 @@ fn apply_declared_roots(
                     root.name
                 )));
             }
+        }
+        // A declared name must also not collide with a *different*
+        // auto-detected component's name (one whose path this same
+        // declaration isn't about to replace) — otherwise two unrelated
+        // directories would silently share one name downstream
+        // (map.rs's per-name BTreeMap merges their counts;
+        // resolve.rs's component-scoped tiers cross-match calls between
+        // them).
+        if let Some(other) = detected
+            .iter()
+            .find(|c| c.name == root.name && c.path != path)
+        {
+            return Err(Error::user(format!(
+                "`{}`: component name `{}` collides with an auto-detected component at `{}` — rename one or add it to `roots` explicitly",
+                config_path.display(),
+                root.name,
+                other.path
+            )));
         }
         seen_names.insert(root.name.as_str(), path);
         seen_paths.insert(path, root.name.as_str());

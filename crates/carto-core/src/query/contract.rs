@@ -116,8 +116,9 @@ pub fn run(qg: &QueryGraph, query: &ContractQuery) -> ContractResult {
     let truncated = matches.len() > query.limit;
     matches.truncate(query.limit);
     let truncation = if truncated {
+        let component_flags = QueryGraph::component_flags(query.component.as_ref());
         Truncation::more(format!(
-            "carto contract {} --limit {}",
+            "carto contract {} --limit {}{component_flags}",
             query.value,
             query.limit * 2
         ))

@@ -208,16 +208,7 @@ pub fn run(qg: &QueryGraph, query: &MapQuery) -> MapResult {
                     .collect::<String>()
             })
             .unwrap_or_default();
-        let component_flags = query
-            .component
-            .as_ref()
-            .filter(|c| !c.is_empty())
-            .map(|c| {
-                c.iter()
-                    .map(|name| format!(" --component {name}"))
-                    .collect::<String>()
-            })
-            .unwrap_or_default();
+        let component_flags = QueryGraph::component_flags(query.component.as_ref());
         Truncation::more(format!(
             "carto map --budget {next_budget}{section_flags}{component_flags}"
         ))
@@ -239,7 +230,26 @@ fn compute_counts(
 ) -> MapCounts {
     let mut files = 0;
     let mut symbols = 0;
+    let mut components = seed_component_counts(qg, subpath, component);
     for node in qg.nodes() {
+        // Per-component tallying is independent of the overall
+        // files/symbols counters just below -- a component's own
+        // counts are scoped by whether *the component itself* passed
+        // --subpath/--component (`seed_component_counts` already
+        // decided that; `components.get_mut` is the only gate here),
+        // not by re-applying those filters per node. Folded into this
+        // same loop rather than a second pass over `qg.nodes()`, since
+        // both need the identical `component_of` lookup per node.
+        if let Some(name) = qg.component_of(&node.id) {
+            if let Some(entry) = components.get_mut(name) {
+                match &node.data {
+                    NodeData::File(_) => entry.files += 1,
+                    NodeData::Symbol(_) => entry.symbols += 1,
+                    NodeData::Module(_) | NodeData::Contract(_) => {}
+                }
+            }
+        }
+
         if !qg.path_in_scope(&node.id, subpath) || !qg.component_in_scope(&node.id, component) {
             continue;
         }
@@ -286,19 +296,21 @@ fn compute_counts(
         symbols,
         modules: touched_modules.len(),
         edges_by_kind,
-        components: compute_component_counts(qg, subpath, component),
+        components,
     }
 }
 
-/// ADR-0034/0035: per in-scope component, its own file/symbol counts —
-/// the structured data both `MapCounts.components` and
-/// [`components_lines`]'s rendering share. A component is in scope iff
-/// its own `path` passes `--subpath` and its `name` passes
-/// `--component` — the same two filters every other section already
-/// applies to individual nodes, applied here to the component entry
-/// itself since a `Component` isn't a graph node `path_in_scope`/
-/// `component_in_scope` can look up directly.
-fn compute_component_counts(
+/// ADR-0034/0035: seeds one zeroed `ComponentCounts` entry per in-scope
+/// component — a component is in scope iff its own `path` passes
+/// `--subpath` and its `name` passes `--component`, the same two
+/// filters every other section already applies to individual nodes,
+/// applied here to the component entry itself since a `Component` isn't
+/// a graph node `path_in_scope`/`component_in_scope` can look up
+/// directly. The actual file/symbol tallying happens in
+/// `compute_counts`'s own node loop, not here — folding the two into
+/// one pass over `qg.nodes()` avoids re-deriving each node's
+/// `component_of` twice.
+fn seed_component_counts(
     qg: &QueryGraph,
     subpath: Option<&str>,
     component: Option<&BTreeSet<String>>,
@@ -322,19 +334,6 @@ fn compute_component_counts(
                 symbols: 0,
             },
         );
-    }
-    for node in qg.nodes() {
-        let Some(name) = qg.component_of(&node.id) else {
-            continue;
-        };
-        let Some(entry) = out.get_mut(name) else {
-            continue;
-        };
-        match &node.data {
-            NodeData::File(_) => entry.files += 1,
-            NodeData::Symbol(_) => entry.symbols += 1,
-            NodeData::Module(_) | NodeData::Contract(_) => {}
-        }
     }
     out
 }

@@ -278,6 +278,31 @@ fn declared_root_overrides_a_detected_component_at_the_same_path() {
 }
 
 #[test]
+fn declared_root_name_colliding_with_a_different_detected_component_is_a_user_error() {
+    // A declared root that does NOT share the detected component's
+    // path (unlike the "override" test above) must not silently
+    // produce two distinct components under the same name -- map.rs's
+    // per-name BTreeMap would merge their counts, and resolve.rs's
+    // component-scoped tiers would cross-match calls between two
+    // unrelated directories.
+    let dir = TempDir::new("declared-name-collides-with-detected");
+    std::fs::create_dir_all(dir.path().join(".carto")).unwrap();
+    std::fs::write(
+        dir.path().join(".carto/roots.json"),
+        r#"{"detect": true, "roots": [{"name": "billing", "path": "lambdas/legacy-billing"}]}"#,
+    )
+    .unwrap();
+    let files = vec![
+        file_node("services/billing/go.mod", Lang::Other),
+        file_node("services/billing/main.go", Lang::Go),
+        file_node("lambdas/legacy-billing/handler.py", Lang::Python),
+    ];
+    let err = ComponentSet::discover(dir.path(), &files).unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::UserError);
+    assert!(err.to_string().contains("billing"));
+}
+
+#[test]
 fn declared_root_path_with_no_walked_file_is_a_user_error() {
     let dir = TempDir::new("declared-empty-path");
     std::fs::create_dir_all(dir.path().join(".carto")).unwrap();
@@ -317,6 +342,25 @@ fn declared_root_leading_dotdot_is_a_user_error() {
     let files = vec![file_node("src/main.rs", Lang::Rust)];
     let err = ComponentSet::discover(dir.path(), &files).unwrap_err();
     assert_eq!(err.kind(), ErrorKind::UserError);
+}
+
+#[test]
+fn declared_root_path_containing_dotdot_only_as_a_substring_is_accepted() {
+    // `path.contains("..")` alone would also reject a legitimately
+    // named directory like `services/my..lib` even though it never
+    // leaves the repo root -- only a real `..` *segment* is a
+    // traversal attempt.
+    let dir = TempDir::new("declared-dotdot-substring");
+    std::fs::create_dir_all(dir.path().join(".carto")).unwrap();
+    std::fs::write(
+        dir.path().join(".carto/roots.json"),
+        r#"{"roots": [{"name": "mylib", "path": "services/my..lib"}]}"#,
+    )
+    .unwrap();
+    let files = vec![file_node("services/my..lib/main.go", Lang::Go)];
+    let set = ComponentSet::discover(dir.path(), &files).unwrap();
+    assert_eq!(set.components().len(), 1);
+    assert_eq!(set.components()[0].path, "services/my..lib");
 }
 
 #[test]

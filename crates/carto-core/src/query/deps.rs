@@ -302,16 +302,7 @@ pub fn run(qg: &QueryGraph, query: &DepsQuery) -> Result<DepsResult> {
                 .as_deref()
                 .map(|s| format!(" --subpath {s}"))
                 .unwrap_or_default();
-            let component_flag = query
-                .component
-                .as_ref()
-                .filter(|c| !c.is_empty())
-                .map(|c| {
-                    c.iter()
-                        .map(|name| format!(" --component {name}"))
-                        .collect::<String>()
-                })
-                .unwrap_or_default();
+            let component_flag = QueryGraph::component_flags(query.component.as_ref());
             Truncation::more(format!(
                 "carto deps {} --dir {} --depth {}{subpath_flag}{component_flag}",
                 query.target,

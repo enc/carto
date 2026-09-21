@@ -4,6 +4,7 @@
 //! isn't itself a Rust keyword — keeping both command files named
 //! `<name>_cmd` avoids a `where`-only special case.
 
+use crate::component_arg::parse_component_arg;
 use carto_core::error::{Error, ErrorKind, Result};
 use carto_core::graph::EdgeKind;
 use carto_core::query::{self, DepsQuery, Direction, QueryGraph};
@@ -83,12 +84,7 @@ pub fn run(args: &DepsArgs) -> Result<query::DepsResult> {
         None => None,
         Some(s) => Some(parse_kinds(s)?),
     };
-    let component = if args.component.is_empty() {
-        None
-    } else {
-        Some(args.component.iter().cloned().collect::<BTreeSet<_>>())
-    };
-    qg.validate_component_filter(component.as_ref())?;
+    let component = parse_component_arg(&qg, &args.component)?;
 
     let deps_query = DepsQuery {
         target: args.target.clone(),
@@ -232,14 +228,7 @@ pub fn print_human(result: &query::DepsResult, dir: Direction) {
             } else {
                 ""
             };
-            // ADR-0034/0035: the component analogue — only worth
-            // stating when there's a real component dimension at all.
-            let cross_component_note =
-                if edge.node.component.is_some() && !edge.same_component_as_root {
-                    "  [cross-component]"
-                } else {
-                    ""
-                };
+            let cross_component_note = cross_component_note(edge);
             println!(
                 "  [{}] {} {} {} ({})  {}{same_file_note}{cross_component_note}",
                 hop.depth,
@@ -259,5 +248,88 @@ pub fn print_human(result: &query::DepsResult, dir: Direction) {
                 consts::MAX_DEPS_DEPTH
             ),
         }
+    }
+}
+
+/// ADR-0034/0035: the `[cross-component]` marker text, or `""`. Only
+/// worth stating for a File/Symbol target — a Module/Contract node has
+/// no component *concept* at all, not merely a missing one, so
+/// `same_component_as_root`'s own `false` there isn't "crossing a
+/// boundary," it's "no boundary to cross." Checking the target's own
+/// *kind* rather than whether it happens to carry a component keeps a
+/// genuine crossing into the `None` bucket (a File/Symbol with no
+/// component, reached from one that has one) correctly flagged too.
+fn cross_component_note(edge: &query::DepEdge) -> &'static str {
+    if matches!(edge.node.kind.as_str(), "file" | "symbol") && !edge.same_component_as_root {
+        "  [cross-component]"
+    } else {
+        ""
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use carto_core::graph::{Confidence, EdgeKind};
+    use carto_core::query::NodeSummary;
+
+    fn edge(kind: &str, component: Option<&str>, same_component_as_root: bool) -> query::DepEdge {
+        query::DepEdge {
+            kind: EdgeKind::Calls,
+            confidence: Confidence::Inferred,
+            evidence: vec![],
+            direction: Direction::Out,
+            node: NodeSummary {
+                id: carto_core::graph::file_id("x"),
+                kind: kind.to_string(),
+                label: "x".to_string(),
+                location: None,
+                component: component.map(str::to_string),
+            },
+            same_file_as_root: false,
+            same_component_as_root,
+        }
+    }
+
+    #[test]
+    fn no_marker_when_same_component() {
+        assert_eq!(
+            cross_component_note(&edge("symbol", Some("orders"), true)),
+            ""
+        );
+    }
+
+    #[test]
+    fn marker_for_a_real_cross_component_symbol() {
+        assert_eq!(
+            cross_component_note(&edge("symbol", Some("shared"), false)),
+            "  [cross-component]"
+        );
+    }
+
+    #[test]
+    fn marker_for_a_crossing_into_the_none_bucket() {
+        // The exact bug this regression guards: a File/Symbol target
+        // with no component at all is still a real crossing when the
+        // root has one -- `same_component_as_root` is correctly
+        // `false`, and the marker must not be suppressed just because
+        // `node.component` itself happens to be `None`.
+        assert_eq!(
+            cross_component_note(&edge("file", None, false)),
+            "  [cross-component]"
+        );
+        assert_eq!(
+            cross_component_note(&edge("symbol", None, false)),
+            "  [cross-component]"
+        );
+    }
+
+    #[test]
+    fn no_marker_for_module_or_contract_targets() {
+        // A Module/Contract node has no component concept at all --
+        // `same_component_as_root` is always `false` for them (deps.rs's
+        // own gating), which must not be read as "crossing a boundary."
+        assert_eq!(cross_component_note(&edge("module", None, false)), "");
+        assert_eq!(cross_component_note(&edge("contract", None, false)), "");
     }
 }

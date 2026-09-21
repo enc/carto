@@ -3,6 +3,7 @@
 //! `where`/`deps`/`map` (M1.b.3), and `serve` (the MCP stdio server,
 //! spec §7.3, mounted from `carto-mcp`) exist.
 
+mod component_arg;
 mod contract_cmd;
 mod deps_cmd;
 mod index;

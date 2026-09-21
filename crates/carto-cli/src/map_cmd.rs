@@ -3,6 +3,7 @@
 //! module doc explains why); this file is the CLI wrapper: args, load,
 //! print.
 
+use crate::component_arg::parse_component_arg;
 use carto_core::consts;
 use carto_core::error::Result;
 use carto_core::graph;
@@ -89,12 +90,7 @@ pub fn run(args: &MapArgs) -> Result<query::MapResult> {
                 .collect::<BTreeSet<_>>(),
         )
     };
-    let component = if args.component.is_empty() {
-        None
-    } else {
-        Some(args.component.iter().cloned().collect::<BTreeSet<_>>())
-    };
-    qg.validate_component_filter(component.as_ref())?;
+    let component = parse_component_arg(&qg, &args.component)?;
     let map_query = MapQuery {
         budget: args.budget,
         subpath: args.subpath.clone(),

@@ -2,11 +2,11 @@
 //! Core lookup lives in `carto_core::query::contract`; this file is the
 //! thin CLI wrapper: args, load, print.
 
+use crate::component_arg::parse_component_arg;
 use carto_core::error::Result;
 use carto_core::query::{self, ContractQuery, QueryGraph};
 use carto_core::{graph, target};
 use clap::Args;
-use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 #[derive(Args)]
@@ -44,12 +44,7 @@ pub fn run(args: &ContractArgs) -> Result<query::ContractResult> {
     let target = target::resolve(&args.path, &args.out)?;
     let doc = graph::load(&target.out_root)?;
     let qg = QueryGraph::from_document(doc);
-    let component = if args.component.is_empty() {
-        None
-    } else {
-        Some(args.component.iter().cloned().collect::<BTreeSet<_>>())
-    };
-    qg.validate_component_filter(component.as_ref())?;
+    let component = parse_component_arg(&qg, &args.component)?;
     let contract_query = ContractQuery {
         value: args.value.clone(),
         category: args.category.clone(),
