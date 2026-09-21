@@ -105,7 +105,14 @@ pub fn run(qg: &QueryGraph, query: &OrphansQuery) -> OrphansResult {
             .filter_map(|e| qg.component_of(&e.from).map(str::to_string))
             .collect();
         if let Some(filter) = &query.component {
-            if !filter.is_empty() && components.is_disjoint(filter) {
+            // ADR-0038: descendant-aware — a plain `is_disjoint` check
+            // would miss a touching component that's nested *under* a
+            // filter entry rather than named by it exactly.
+            if !filter.is_empty()
+                && !components
+                    .iter()
+                    .any(|c| qg.component_matches_filter(c, filter))
+            {
                 continue;
             }
         }
@@ -272,6 +279,64 @@ mod tests {
 
         assert_eq!(result.produced_never_consumed.len(), 1);
         assert_eq!(result.produced_never_consumed[0].value, "UnwatchedMetric");
+    }
+
+    fn file_with_component(path: &str, lang: Lang, component: &str) -> Node {
+        let mut n = file(path, lang);
+        if let crate::graph::NodeData::File(f) = &mut n.data {
+            f.component = Some(component.to_string());
+        }
+        n
+    }
+
+    #[test]
+    fn component_filter_includes_a_site_whose_component_is_nested_under_the_filtered_one() {
+        // ADR-0038: `prod` is nested under `infra` (the same
+        // scattered-then-rolled-up shape ADR-0037's terraform rollup
+        // avoids for auto-detection, reproduced here as a *declared*
+        // nesting to exercise the query-layer side independently).
+        // `--component infra` must still surface a contract whose only
+        // consumer site's own component is the nested `prod`.
+        let tf = file_with_component("infra/envs/prod/alarms.tf", Lang::Hcl, "prod");
+        let (metric_id, metric_node) = contract("metric_name", None, "OrdersLag");
+        let edges = vec![Edge::new(
+            EdgeKind::Consumes,
+            tf.id.clone(),
+            metric_id,
+            Confidence::Certain,
+            "hcl-attr".to_string(),
+        )];
+        let doc = GraphDocument {
+            carto_version: "0.1.0".to_string(),
+            schema_version: crate::consts::SCHEMA_VERSION,
+            components: vec![
+                crate::components::Component {
+                    name: "infra".to_string(),
+                    path: "infra".to_string(),
+                    kind: "terraform".to_string(),
+                },
+                crate::components::Component {
+                    name: "prod".to_string(),
+                    path: "infra/envs/prod".to_string(),
+                    kind: "terraform".to_string(),
+                },
+            ],
+            nodes: vec![tf, metric_node],
+            edges,
+        };
+        let qg = QueryGraph::from_document(doc);
+        let filter: std::collections::BTreeSet<String> =
+            ["infra".to_string()].into_iter().collect();
+        let result = run(
+            &qg,
+            &OrphansQuery {
+                category: Some("metric_name".to_string()),
+                limit: DEFAULT_LIMIT,
+                component: Some(filter),
+            },
+        );
+        assert_eq!(result.consumed_never_produced.len(), 1);
+        assert_eq!(result.consumed_never_produced[0].value, "OrdersLag");
     }
 
     #[test]

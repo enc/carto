@@ -321,7 +321,11 @@ fn seed_component_counts(
             continue;
         }
         if let Some(filter) = component {
-            if !filter.is_empty() && !filter.contains(&c.name) {
+            // ADR-0038: descendant-aware, not a bare name-set membership
+            // check — `--component infra` must still seed `infra`'s own
+            // nested components (if any), not just an exact `"infra"`
+            // row.
+            if !filter.is_empty() && !qg.component_matches_filter(&c.name, filter) {
                 continue;
             }
         }
@@ -1150,6 +1154,67 @@ mod tests {
         let joined = result.lines.join("\n");
         assert!(joined.contains("services/orders/main.go"));
         assert!(!joined.contains("services/billing/main.go  in="));
+    }
+
+    /// ADR-0038: `api` and a nested `internal` component (a second
+    /// manifest marker inside `api`'s own directory — the same shape
+    /// `components::tests::innermost_component_wins_for_nested_markers`
+    /// covers at the discovery layer), each with one file.
+    fn nested_component_doc() -> GraphDocument {
+        let api = file_with_component("services/api/main.go", "api");
+        let internal = file_with_component("services/api/internal/x.go", "internal");
+        GraphDocument {
+            components: vec![
+                component("api", "services/api", "go"),
+                component("internal", "services/api/internal", "go"),
+            ],
+            ..doc(vec![api, internal], vec![])
+        }
+    }
+
+    #[test]
+    fn component_filter_seeds_a_component_nested_under_the_filtered_one() {
+        let qg = QueryGraph::from_document(nested_component_doc());
+        let mut filter = BTreeSet::new();
+        filter.insert("api".to_string());
+        let result = run(
+            &qg,
+            &MapQuery {
+                budget: consts::DEFAULT_MAP_BUDGET,
+                subpath: None,
+                sections: None,
+                component: Some(filter),
+            },
+        );
+        assert_eq!(
+            result.counts.components.len(),
+            2,
+            "`--component api` must also seed the nested `internal` component, not just `api` itself: {:?}",
+            result.counts.components.keys().collect::<Vec<_>>()
+        );
+        assert!(result.counts.components.contains_key("api"));
+        assert!(result.counts.components.contains_key("internal"));
+        assert_eq!(result.counts.files, 2);
+    }
+
+    #[test]
+    fn component_filter_on_the_nested_component_does_not_seed_its_ancestor() {
+        let qg = QueryGraph::from_document(nested_component_doc());
+        let mut filter = BTreeSet::new();
+        filter.insert("internal".to_string());
+        let result = run(
+            &qg,
+            &MapQuery {
+                budget: consts::DEFAULT_MAP_BUDGET,
+                subpath: None,
+                sections: None,
+                component: Some(filter),
+            },
+        );
+        assert_eq!(result.counts.components.len(), 1);
+        assert!(result.counts.components.contains_key("internal"));
+        assert!(!result.counts.components.contains_key("api"));
+        assert_eq!(result.counts.files, 1);
     }
 
     #[test]

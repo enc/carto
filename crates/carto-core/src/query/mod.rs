@@ -340,11 +340,51 @@ impl QueryGraph {
         // rather than repeating it here.
         match self.node(id).map(|n| &n.data) {
             Some(NodeData::Module(_)) | Some(NodeData::Contract(_)) => true,
-            Some(NodeData::File(_)) | Some(NodeData::Symbol(_)) => {
-                self.component_of(id).is_some_and(|c| filter.contains(c))
-            }
+            Some(NodeData::File(_)) | Some(NodeData::Symbol(_)) => self
+                .component_of(id)
+                .is_some_and(|c| self.component_matches_filter(c, filter)),
             None => false,
         }
+    }
+
+    /// ADR-0038: whether component `name` is one of `filter`'s own
+    /// entries, or nested *under* one of them — `--component <name>`
+    /// scopes to `name` and everything nested under it, not just
+    /// components whose own name equals it exactly. Nesting is real
+    /// today even without a dedicated "parent" field: a component
+    /// discovered from a manifest marker inside another component's own
+    /// directory (`services/api/go.mod` and `services/api/internal/
+    /// go.mod`, `components::tests::
+    /// innermost_component_wins_for_nested_markers`) is a second,
+    /// separate `Component` whose `path` happens to be a subdirectory
+    /// of the first's — exactly the shape this method detects.
+    ///
+    /// Falls back to `filter.contains(name)` alone for a `name` this
+    /// index has no `Component` table entry for (should not happen for
+    /// a filter value that passed `validate_component_filter`, or for a
+    /// `name` read from a real `FileNode.component`, but stays
+    /// conservative rather than panicking on a hand-edited `graph.json`
+    /// where the two could disagree).
+    pub fn component_matches_filter(&self, name: &str, filter: &BTreeSet<String>) -> bool {
+        if filter.contains(name) {
+            return true;
+        }
+        let Some(path) = self.component_path(name) else {
+            return false;
+        };
+        filter.iter().any(|f| {
+            self.component_path(f).is_some_and(|ancestor_path| {
+                path.strip_prefix(ancestor_path)
+                    .is_some_and(|rest| rest.starts_with('/'))
+            })
+        })
+    }
+
+    fn component_path(&self, name: &str) -> Option<&str> {
+        self.components
+            .iter()
+            .find(|c| c.name == name)
+            .map(|c| c.path.as_str())
     }
 }
 
@@ -591,6 +631,94 @@ mod tests {
         let qg = QueryGraph::from_document(doc(vec![module], vec![]));
         let filter: BTreeSet<String> = ["orders".to_string()].into_iter().collect();
         assert!(qg.component_in_scope(&module_id, Some(&filter)));
+    }
+
+    #[test]
+    fn component_in_scope_includes_a_component_nested_under_the_filtered_one() {
+        // ADR-0038: `services/api/internal` is its own component
+        // (innermost-marker-wins, `components::tests::
+        // innermost_component_wins_for_nested_markers`), nested inside
+        // `services/api`'s own directory. `--component api` must still
+        // include a file whose own component is the nested
+        // `internal` one, not just files labeled `api` exactly.
+        let components = vec![
+            crate::components::Component {
+                name: "api".to_string(),
+                path: "services/api".to_string(),
+                kind: "go".to_string(),
+            },
+            crate::components::Component {
+                name: "internal".to_string(),
+                path: "services/api/internal".to_string(),
+                kind: "go".to_string(),
+            },
+        ];
+        let qg = QueryGraph::from_document(doc_with_components(
+            vec![
+                file_node_with_component("services/api/main.go", Some("api")),
+                file_node_with_component("services/api/internal/x.go", Some("internal")),
+            ],
+            vec![],
+            components,
+        ));
+        let filter: BTreeSet<String> = ["api".to_string()].into_iter().collect();
+        assert!(qg.component_in_scope(
+            &crate::graph::file_id("services/api/main.go"),
+            Some(&filter)
+        ));
+        assert!(qg.component_in_scope(
+            &crate::graph::file_id("services/api/internal/x.go"),
+            Some(&filter)
+        ));
+    }
+
+    #[test]
+    fn component_in_scope_does_not_include_the_ancestor_when_filtering_on_the_nested_one() {
+        // The reverse direction is *not* symmetric: `--component
+        // internal` must not pull in `api`'s own top-level files —
+        // descendant scoping only ever widens outward from the
+        // requested name, never inward.
+        let components = vec![
+            crate::components::Component {
+                name: "api".to_string(),
+                path: "services/api".to_string(),
+                kind: "go".to_string(),
+            },
+            crate::components::Component {
+                name: "internal".to_string(),
+                path: "services/api/internal".to_string(),
+                kind: "go".to_string(),
+            },
+        ];
+        let qg = QueryGraph::from_document(doc_with_components(
+            vec![
+                file_node_with_component("services/api/main.go", Some("api")),
+                file_node_with_component("services/api/internal/x.go", Some("internal")),
+            ],
+            vec![],
+            components,
+        ));
+        let filter: BTreeSet<String> = ["internal".to_string()].into_iter().collect();
+        assert!(!qg.component_in_scope(
+            &crate::graph::file_id("services/api/main.go"),
+            Some(&filter)
+        ));
+        assert!(qg.component_in_scope(
+            &crate::graph::file_id("services/api/internal/x.go"),
+            Some(&filter)
+        ));
+    }
+
+    #[test]
+    fn component_matches_filter_falls_back_to_exact_match_with_no_component_table_entry() {
+        // A name with no corresponding `Component` table row (shouldn't
+        // happen for anything that passed `validate_component_filter`,
+        // but the method stays conservative rather than panicking) only
+        // ever matches itself, never expands.
+        let qg = QueryGraph::from_document(doc(vec![], vec![]));
+        let filter: BTreeSet<String> = ["orders".to_string()].into_iter().collect();
+        assert!(qg.component_matches_filter("orders", &filter));
+        assert!(!qg.component_matches_filter("billing", &filter));
     }
 
     #[test]

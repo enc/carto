@@ -381,6 +381,23 @@ instead of substring-matching, and also recognizes a sibling
 `.carto/roots.json` gains `exclude: Vec<String>`, applied before
 `roots` so a declared root can still re-add an excluded path.
 
+**Follow-up (ADR-0038):** `--component <name>` matched a node's own
+`component` field by exact name only, missing a real case ADR-0034's
+own innermost-match rule already permits — a component nested inside
+another's directory (`services/api/go.mod` +
+`services/api/internal/go.mod` producing two `Component` rows, one
+nested in the other). `QueryGraph::component_matches_filter` now scopes
+`--component api` to `api` and everything nested under it — one-
+directional, `--component internal` never pulls in `api`'s own files —
+reaching `find`/`deps`/`contract` via the shared `component_in_scope`
+predicate, plus direct updates to `map`'s `seed_component_counts` and
+`orphans`' touching-components check. No schema change: purely a
+query-layer read of `Component::path`/`FileNode.component`, both
+already persisted. Multi-directory components (one component spanning
+two *disjoint* subtrees) is a separate, larger, not-yet-attempted
+capability — would need `Component::path: String` to become `paths:
+Vec<String>`, a breaking schema change.
+
 ## Conventions
 
 - **ADRs for every deviation and judgment call.** `docs/adr/NNNN-*.md`.
