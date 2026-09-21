@@ -23,7 +23,7 @@
 use crate::error::{Error, ErrorKind, Result};
 use crate::graph::Node;
 use crate::lang::Lang;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -31,7 +31,12 @@ use std::path::Path;
 const CONFIG_RELPATH: &str = ".carto/roots.json";
 
 /// One discovered or declared project root inside the walked tree.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `Serialize`/`Deserialize`: persisted verbatim as `GraphDocument::
+/// components` (sorted by `path`, INV-7) — this is the on-disk shape,
+/// not an internal detail either front end reshapes freely, the same
+/// compatibility-surface status every other `graph.json`-visible type
+/// already has.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Component {
     /// Sanitized to `^[A-Za-z0-9][A-Za-z0-9_.-]*$` — a plain `String`,
     /// not `TaintedString`: like `FileNode::path`, this is an
@@ -92,6 +97,18 @@ impl ComponentSet {
 
     pub fn config_digest(&self) -> &str {
         &self.config_digest
+    }
+
+    /// Components sorted by `path` ascending — the shape persisted into
+    /// `GraphDocument::components` (INV-7: on-disk order must be a pure
+    /// function of content; `path` is each component's own natural sort
+    /// key, the same role `id` plays for nodes/edges elsewhere in
+    /// `graph.json`). Deliberately not the order `components` is stored
+    /// in internally (deepest-first, for `component_of_path`'s lookup).
+    pub fn components_sorted_by_path(&self) -> Vec<Component> {
+        let mut v = self.components.clone();
+        v.sort_by(|a, b| a.path.cmp(&b.path));
+        v
     }
 
     /// The innermost component whose `path` is a prefix of `file_path`

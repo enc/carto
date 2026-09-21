@@ -126,6 +126,7 @@ mod tests {
                 sha256: None,
                 skipped: None,
                 excluded: None,
+                component: None,
             },
         )
     }
@@ -135,6 +136,7 @@ mod tests {
             commit_sha: None,
             ignore_rule_digest: "test-digest".to_string(),
             file_sha256: BTreeMap::new(),
+            roots_rule_digest: "test-roots-digest".to_string(),
         }
     }
 
@@ -186,7 +188,7 @@ mod tests {
             "mod-declaration".to_string(),
         ));
 
-        let persisted = crate::graph::persist(graph, empty_meta(), &g).unwrap();
+        let persisted = crate::graph::persist(graph, empty_meta(), Vec::new(), &g).unwrap();
         let loaded = load(g.out_root()).unwrap();
 
         assert_eq!(loaded.nodes.len(), persisted.node_count);
@@ -251,6 +253,7 @@ mod tests {
         let doc = GraphDocument {
             carto_version: "0.1.0".to_string(),
             schema_version: consts::SCHEMA_VERSION + 1,
+            components: vec![],
             nodes: vec![],
             edges: vec![],
         };

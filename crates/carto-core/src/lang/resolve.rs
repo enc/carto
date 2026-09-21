@@ -60,6 +60,13 @@ pub struct FileExtraction {
     /// carries a version suffix `contracts::ContractRules` has no reason
     /// to key on).
     pub lang: Lang,
+    /// This file's [`crate::components::Component::name`] — mirrors
+    /// `FileNode::component` exactly (set by `indexer::build_and_persist`
+    /// before `extract_and_resolve` runs; `lang/mod.rs` just copies it
+    /// across). `None` for a file under no recognized project root, the
+    /// same real, meaningful bucket `FileNode::component`'s own doc
+    /// comment describes. ADR-0035.
+    pub component: Option<String>,
 }
 
 pub struct ResolvedExtraction {
@@ -1308,6 +1315,7 @@ mod tests {
             // explicitly (see `ts_relative_import_...` below).
             declares_module: true,
             lang: Lang::Rust,
+            component: None,
         }
     }
 

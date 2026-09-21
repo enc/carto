@@ -36,6 +36,7 @@ fn file_node(path: &str, lang: Lang) -> Node {
             sha256: None,
             skipped: None,
             excluded: None,
+            component: None,
         },
     )
 }

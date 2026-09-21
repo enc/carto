@@ -159,6 +159,20 @@ pub struct FileNode {
     pub sha256: Option<String>,
     pub skipped: Option<SkipReason>,
     pub excluded: Option<ExclusionReason>,
+    /// The innermost [`crate::components::Component`] this file belongs
+    /// to (its `name`), or `None` if it's under no recognized project
+    /// root — a real, meaningful bucket (repo-root scripts, top-level
+    /// docs), not a missing value. Set by `indexer::build_and_persist`
+    /// between `walk` and `lang::extract_and_resolve` — `walk` itself
+    /// has no component concept, only `FileNode::path`; every `FileNode`
+    /// literal built before that assignment step (including every one
+    /// `walk` constructs) starts `None`. `#[serde(default)]` so a v6
+    /// `graph.json` (built before components existed) still parses —
+    /// its absent `component` must not be misread as "confirmed no
+    /// components", which is why `SCHEMA_VERSION` still bumps alongside
+    /// this field (see `consts.rs`). ADR-0034.
+    #[serde(default)]
+    pub component: Option<String>,
 }
 
 /// Spec §4.1's `Symbol.sym_kind` enum, verbatim. Extractors only ever

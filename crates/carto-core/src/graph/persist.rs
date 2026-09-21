@@ -7,6 +7,7 @@
 //! nodes/edges in ID order.
 
 use super::{Edge, Graph, Node, NodeId};
+use crate::components::Component;
 use crate::consts;
 use crate::error::{Error, ErrorKind, Result};
 use crate::pathguard::PathGuard;
@@ -24,6 +25,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub struct GraphDocument {
     pub carto_version: String,
     pub schema_version: u32,
+    /// Multi-root support (ADR-0034/0035) — sorted by `path` ascending
+    /// (INV-7). `#[serde(default)]` so a stale pre-components
+    /// `graph.json` still *parses* (letting the explicit
+    /// `schema_version` check below reject it with "re-run `carto
+    /// index`" instead of a raw missing-field parse error) — the same
+    /// reasoning every prior `SCHEMA_VERSION` bump's new field has used.
+    #[serde(default)]
+    pub components: Vec<Component>,
     pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
 }
@@ -55,6 +64,18 @@ pub struct Manifest {
     /// Only covers files whose contents were actually read (excludes
     /// `excluded: sensitive` and `skipped: binary`/`too_large` files).
     pub file_sha256: BTreeMap<String, String>,
+    /// blake3 digest of `.carto/roots.json`'s presence/content
+    /// (`components::ComponentSet::config_digest`) — lets an operator
+    /// tell whether two indexes were built under the same root
+    /// configuration, mirroring `ignore_rule_digest`'s role for
+    /// `.cartoignore`. `#[serde(default)]`: a pre-components manifest
+    /// simply predates this field; `Manifest` isn't schema-versioned or
+    /// read back by any query command today (unlike `graph.json`), so
+    /// there's no rejection to gate here — an empty-string default on
+    /// an old manifest is a fact about that manifest's age, not a
+    /// fabricated claim about what config was used.
+    #[serde(default)]
+    pub roots_rule_digest: String,
 }
 
 /// Everything [`persist`] needs beyond the graph itself — values only the
@@ -63,6 +84,7 @@ pub struct PersistMeta {
     pub commit_sha: Option<String>,
     pub ignore_rule_digest: String,
     pub file_sha256: BTreeMap<String, String>,
+    pub roots_rule_digest: String,
 }
 
 /// The spec §6.5 choke-point. Consumes `graph` (persisting is the last
@@ -74,7 +96,23 @@ pub struct PersistMeta {
 ///    (`DataError` otherwise);
 /// 3. enforce `consts::MAX_NODES` / `consts::MAX_GRAPH_BYTES` (§4.4);
 /// 4. write atomically via [`PathGuard::writer`].
-pub fn persist(mut graph: Graph, meta: PersistMeta, guard: &PathGuard) -> Result<Manifest> {
+///
+/// `components` (ADR-0034/0035) is a separate table, not `Graph` nodes —
+/// a `Component` has no place in spec §4.1's node vocabulary and no
+/// edges of its own; every `File`/`Symbol` node's own `component` field
+/// already carries the membership relationship, so this is purely a
+/// lookup table for query-time convenience (`QueryGraph::component_of`,
+/// step 4). Sorted by `path` here (not left to the caller) so every
+/// `persist` call site gets INV-7 determinism for free, the same reason
+/// `into_sorted_parts` sorts nodes/edges internally rather than trusting
+/// callers to.
+pub fn persist(
+    mut graph: Graph,
+    meta: PersistMeta,
+    mut components: Vec<Component>,
+    guard: &PathGuard,
+) -> Result<Manifest> {
+    components.sort_by(|a, b| a.path.cmp(&b.path));
     let redaction = redact::redact(&mut graph);
     let (nodes, edges) = graph.into_sorted_parts();
 
@@ -98,6 +136,7 @@ pub fn persist(mut graph: Graph, meta: PersistMeta, guard: &PathGuard) -> Result
     let doc = GraphDocument {
         carto_version: env!("CARGO_PKG_VERSION").to_string(),
         schema_version: consts::SCHEMA_VERSION,
+        components,
         nodes,
         edges,
     };
@@ -136,6 +175,7 @@ pub fn persist(mut graph: Graph, meta: PersistMeta, guard: &PathGuard) -> Result
         redaction,
         ignore_rule_digest: meta.ignore_rule_digest,
         file_sha256: meta.file_sha256,
+        roots_rule_digest: meta.roots_rule_digest,
     };
     let manifest_bytes = serde_json::to_vec_pretty(&manifest).map_err(|e| {
         Error::with_source(ErrorKind::DataError, "failed to serialize manifest.json", e)
@@ -211,6 +251,7 @@ mod tests {
                 sha256: None,
                 skipped: None,
                 excluded: None,
+                component: None,
             },
         )
     }
@@ -220,6 +261,7 @@ mod tests {
             commit_sha: None,
             ignore_rule_digest: "test-digest".to_string(),
             file_sha256: BTreeMap::new(),
+            roots_rule_digest: "test-roots-digest".to_string(),
         }
     }
 
@@ -230,7 +272,7 @@ mod tests {
         let mut graph = Graph::new();
         graph.insert_node(file_node("a.rs"));
 
-        let manifest = persist(graph, empty_meta(), &g).unwrap();
+        let manifest = persist(graph, empty_meta(), Vec::new(), &g).unwrap();
         assert_eq!(manifest.node_count, 1);
         assert_eq!(manifest.edge_count, 0);
         assert!(manifest.dirty.is_none());
@@ -268,7 +310,7 @@ mod tests {
             },
         ));
 
-        let manifest = persist(graph, empty_meta(), &g).unwrap();
+        let manifest = persist(graph, empty_meta(), Vec::new(), &g).unwrap();
         assert_eq!(manifest.node_count, 2);
         assert_eq!(
             manifest.file_count, 1,
@@ -291,7 +333,7 @@ mod tests {
             "test".into(),
         ));
 
-        let err = persist(graph, empty_meta(), &g).unwrap_err();
+        let err = persist(graph, empty_meta(), Vec::new(), &g).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::DataError);
     }
 
@@ -309,11 +351,11 @@ mod tests {
             graph
         };
 
-        persist(build(), empty_meta(), &g_a).unwrap();
+        persist(build(), empty_meta(), Vec::new(), &g_a).unwrap();
         // Real-world determinism runs are further apart in time than this
         // test can be, but graph.json must not depend on created_at
         // anyway (INV-7) — sleeping isn't needed to prove that here.
-        persist(build(), empty_meta(), &g_b).unwrap();
+        persist(build(), empty_meta(), Vec::new(), &g_b).unwrap();
 
         let a = std::fs::read(g_a.out_root().join("graph.json")).unwrap();
         let b = std::fs::read(g_b.out_root().join("graph.json")).unwrap();

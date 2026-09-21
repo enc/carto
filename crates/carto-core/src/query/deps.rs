@@ -471,6 +471,7 @@ mod tests {
                 sha256: None,
                 skipped: None,
                 excluded: None,
+                component: None,
             },
         )
     }
@@ -565,6 +566,7 @@ mod tests {
         GraphDocument {
             carto_version: "0.1.0".to_string(),
             schema_version: crate::consts::SCHEMA_VERSION,
+            components: vec![],
             nodes,
             edges,
         }

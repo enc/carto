@@ -192,6 +192,7 @@ fn classify(root: &Path, abs_path: &Path) -> Option<WalkedFile> {
             sha256: None,
             skipped: None,
             excluded: Some(ExclusionReason::Sensitive),
+            component: None,
         };
         return Some(WalkedFile {
             node: Node::file(graph::file_id(&path), Provenance::Syntactic, "walk@1", file),
@@ -208,6 +209,7 @@ fn classify(root: &Path, abs_path: &Path) -> Option<WalkedFile> {
             sha256: None,
             skipped: Some(SkipReason::TooLarge),
             excluded: None,
+            component: None,
         };
         return Some(WalkedFile {
             node: Node::file(graph::file_id(&path), Provenance::Syntactic, "walk@1", file),
@@ -243,6 +245,7 @@ fn classify(root: &Path, abs_path: &Path) -> Option<WalkedFile> {
         sha256: Some(sha256_hex.clone()),
         skipped,
         excluded: None,
+        component: None,
     };
     Some(WalkedFile {
         node: Node::file(graph::file_id(&path), Provenance::Syntactic, "walk@1", file),

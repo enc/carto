@@ -196,6 +196,7 @@ mod tests {
                 sha256: None,
                 skipped: None,
                 excluded: None,
+                component: None,
             },
         );
         let mut nodes = vec![file.clone()];
@@ -222,6 +223,7 @@ mod tests {
         GraphDocument {
             carto_version: "0.1.0".to_string(),
             schema_version: crate::consts::SCHEMA_VERSION,
+            components: vec![],
             nodes,
             edges: vec![],
         }
@@ -243,6 +245,7 @@ mod tests {
                 sha256: None,
                 skipped: None,
                 excluded: None,
+                component: None,
             },
         );
         let dead = Node::file(
@@ -256,6 +259,7 @@ mod tests {
                 sha256: None,
                 skipped: None,
                 excluded: None,
+                component: None,
             },
         );
         let live_sym = Node::symbol(
@@ -297,6 +301,7 @@ mod tests {
         GraphDocument {
             carto_version: "0.1.0".to_string(),
             schema_version: crate::consts::SCHEMA_VERSION,
+            components: vec![],
             nodes: vec![live, dead, live_sym, dead_sym],
             edges: vec![],
         }
@@ -405,6 +410,7 @@ mod tests {
         GraphDocument {
             carto_version: "0.1.0".to_string(),
             schema_version: crate::consts::SCHEMA_VERSION,
+            components: vec![],
             nodes: vec![Node::module(
                 crate::graph::module_id(path, external),
                 Provenance::Syntactic,

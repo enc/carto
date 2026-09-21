@@ -163,6 +163,7 @@ mod tests {
                 sha256: None,
                 skipped: None,
                 excluded: None,
+                component: None,
             },
         );
         let tf_file = Node::file(
@@ -176,6 +177,7 @@ mod tests {
                 sha256: None,
                 skipped: None,
                 excluded: None,
+                component: None,
             },
         );
         let contract_id = crate::graph::contract_id(
@@ -210,6 +212,7 @@ mod tests {
         GraphDocument {
             carto_version: "0.1.0".to_string(),
             schema_version: crate::consts::SCHEMA_VERSION,
+            components: vec![],
             nodes: vec![cs_file, tf_file, contract],
             edges: vec![produces, consumes],
         }

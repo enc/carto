@@ -10,6 +10,7 @@
 //! output and the MCP tool's `structuredContent` are the same struct, not
 //! two shapes that could drift.
 
+use crate::components::ComponentSet;
 use crate::error::Result;
 use crate::graph::Graph;
 use crate::{gitinfo, graph, lang, pathguard, walk};
@@ -41,8 +42,22 @@ pub fn build_and_persist(
 ) -> Result<IndexReport> {
     let guard = pathguard::PathGuard::new(repo_root, out_root, allow_writes_in_repo)?;
 
-    let walked = walk::walk(repo_root, respect_gitignore)?;
+    let mut walked = walk::walk(repo_root, respect_gitignore)?;
     let file_count = walked.nodes.len();
+
+    // Multi-root support (ADR-0034/0035): recognizes the project roots
+    // inside this walked tree from `walked.nodes` itself — no second
+    // traversal — then stamps each `FileNode::component` before
+    // extraction/resolution runs, so `lang::extract_and_resolve` (and,
+    // downstream, `resolve.rs`'s component-scoped tiers) see it on every
+    // file from the start rather than needing `ComponentSet` threaded
+    // through separately.
+    let components = ComponentSet::discover(repo_root, &walked.nodes)?;
+    for node in &mut walked.nodes {
+        if let crate::graph::NodeData::File(file) = &mut node.data {
+            file.component = components.component_of_path(&file.path).map(str::to_string);
+        }
+    }
 
     let resolved = lang::extract_and_resolve(repo_root, &walked.nodes)?;
 
@@ -62,9 +77,10 @@ pub fn build_and_persist(
         commit_sha: commit_sha.clone(),
         ignore_rule_digest: walked.ignore_rule_digest,
         file_sha256: walked.file_sha256,
+        roots_rule_digest: components.config_digest().to_string(),
     };
 
-    let manifest = graph::persist(g, meta, &guard)?;
+    let manifest = graph::persist(g, meta, components.components_sorted_by_path(), &guard)?;
 
     Ok(IndexReport {
         out_dir: guard.out_root().to_path_buf(),

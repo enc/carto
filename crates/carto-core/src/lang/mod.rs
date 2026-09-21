@@ -147,6 +147,7 @@ pub fn extract_and_resolve(
             qualified_external_is_full_fqn: extractor.qualified_external_is_full_fqn(),
             declares_module: extractor.relative_import_declares_module(),
             lang: extractor.lang(),
+            component: file.component.clone(),
         });
     }
 
