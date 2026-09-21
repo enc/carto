@@ -9,7 +9,14 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 #[cfg(test)]
-pub(crate) const PARAM_NAMES: &[&str] = &["repo_path", "value", "out", "category", "limit"];
+pub(crate) const PARAM_NAMES: &[&str] = &[
+    "repo_path",
+    "value",
+    "out",
+    "category",
+    "limit",
+    "component",
+];
 
 pub fn call(args: &Value) -> Result<Value, String> {
     let repo_path = args
@@ -30,14 +37,18 @@ pub fn call(args: &Value) -> Result<Value, String> {
         .and_then(Value::as_u64)
         .map(|v| v as usize)
         .unwrap_or(query::contract::DEFAULT_LIMIT);
+    let component = crate::render::parse_component_list(args);
 
     let t = target::resolve(Path::new(repo_path), &out).map_err(|e| e.to_string())?;
     let doc = graph::load(&t.out_root).map_err(|e| e.to_string())?;
     let qg = QueryGraph::from_document(doc);
+    qg.validate_component_filter(component.as_ref())
+        .map_err(|e| e.to_string())?;
     let contract_query = ContractQuery {
         value: value.to_string(),
         category,
         limit,
+        component,
     };
     let result = query::contract(&qg, &contract_query);
 
@@ -77,8 +88,13 @@ fn render_sites(out: &mut String, sites: &[query::ContractSite]) {
         return;
     }
     for s in sites {
+        let component = s
+            .component
+            .as_deref()
+            .map(|c| format!("  [{c}]"))
+            .unwrap_or_default();
         out.push_str(&format!(
-            "    {}  ({})  {}\n",
+            "    {}  ({})  {}{component}\n",
             s.label,
             s.confidence.as_str(),
             s.location.as_deref().unwrap_or(""),

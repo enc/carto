@@ -65,6 +65,13 @@ pub struct DepsArgs {
     /// which only locates the index.
     #[arg(long)]
     subpath: Option<String>,
+
+    /// Restrict reported rows to one of these components (repeatable,
+    /// e.g. `--component orders --component billing`) — see
+    /// `carto map --section components`. Independent of `--subpath`;
+    /// both given means both apply.
+    #[arg(long)]
+    component: Vec<String>,
 }
 
 pub fn run(args: &DepsArgs) -> Result<query::DepsResult> {
@@ -76,6 +83,12 @@ pub fn run(args: &DepsArgs) -> Result<query::DepsResult> {
         None => None,
         Some(s) => Some(parse_kinds(s)?),
     };
+    let component = if args.component.is_empty() {
+        None
+    } else {
+        Some(args.component.iter().cloned().collect::<BTreeSet<_>>())
+    };
+    qg.validate_component_filter(component.as_ref())?;
 
     let deps_query = DepsQuery {
         target: args.target.clone(),
@@ -83,6 +96,7 @@ pub fn run(args: &DepsArgs) -> Result<query::DepsResult> {
         depth: args.depth,
         kinds,
         subpath: args.subpath.clone(),
+        component,
     };
     query::deps(&qg, &deps_query)
 }
@@ -218,8 +232,16 @@ pub fn print_human(result: &query::DepsResult, dir: Direction) {
             } else {
                 ""
             };
+            // ADR-0034/0035: the component analogue — only worth
+            // stating when there's a real component dimension at all.
+            let cross_component_note =
+                if edge.node.component.is_some() && !edge.same_component_as_root {
+                    "  [cross-component]"
+                } else {
+                    ""
+                };
             println!(
-                "  [{}] {} {} {} ({})  {}{same_file_note}",
+                "  [{}] {} {} {} ({})  {}{same_file_note}{cross_component_note}",
                 hop.depth,
                 arrow,
                 edge.kind.as_str(),

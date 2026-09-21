@@ -487,6 +487,7 @@ pub fn resolve(
                     .push(InboundCallSite {
                         file: fe.relpath.clone(),
                         line: call.line,
+                        component: fe.component.clone(),
                     });
             }
         }
@@ -2116,6 +2117,7 @@ mod tests {
             vec![InboundCallSite {
                 file: "src/a.rs".to_string(),
                 line: 3,
+                component: None,
             }]
         );
     }

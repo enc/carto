@@ -19,6 +19,7 @@ enum SectionArg {
     #[value(name = "entry-points")]
     EntryPoints,
     Infra,
+    Components,
 }
 
 impl From<SectionArg> for MapSection {
@@ -28,6 +29,7 @@ impl From<SectionArg> for MapSection {
             SectionArg::Modules => MapSection::Modules,
             SectionArg::EntryPoints => MapSection::EntryPoints,
             SectionArg::Infra => MapSection::Infra,
+            SectionArg::Components => MapSection::Components,
         }
     }
 }
@@ -63,6 +65,13 @@ pub struct MapArgs {
     /// this filter.
     #[arg(long, value_enum)]
     section: Vec<SectionArg>,
+
+    /// Restrict rendering to these components (repeatable, e.g.
+    /// `--component orders --component billing`). Independent of
+    /// `--subpath`; both given means both apply. See the `components`
+    /// section for the full list of what this repo has.
+    #[arg(long)]
+    component: Vec<String>,
 }
 
 pub fn run(args: &MapArgs) -> Result<query::MapResult> {
@@ -80,10 +89,17 @@ pub fn run(args: &MapArgs) -> Result<query::MapResult> {
                 .collect::<BTreeSet<_>>(),
         )
     };
+    let component = if args.component.is_empty() {
+        None
+    } else {
+        Some(args.component.iter().cloned().collect::<BTreeSet<_>>())
+    };
+    qg.validate_component_filter(component.as_ref())?;
     let map_query = MapQuery {
         budget: args.budget,
         subpath: args.subpath.clone(),
         sections,
+        component,
     };
     Ok(query::map(&qg, &map_query))
 }

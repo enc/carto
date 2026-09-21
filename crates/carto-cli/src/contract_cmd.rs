@@ -6,6 +6,7 @@ use carto_core::error::Result;
 use carto_core::query::{self, ContractQuery, QueryGraph};
 use carto_core::{graph, target};
 use clap::Args;
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 #[derive(Args)]
@@ -30,16 +31,30 @@ pub struct ContractArgs {
     /// Max matches to return.
     #[arg(long, default_value_t = query::contract::DEFAULT_LIMIT)]
     limit: usize,
+
+    /// Restrict listed producer/consumer sites to one of these
+    /// components (repeatable). A match with no in-scope sites left
+    /// still appears, with empty producer/consumer lists — that's
+    /// itself informative for a cross-component contract.
+    #[arg(long)]
+    component: Vec<String>,
 }
 
 pub fn run(args: &ContractArgs) -> Result<query::ContractResult> {
     let target = target::resolve(&args.path, &args.out)?;
     let doc = graph::load(&target.out_root)?;
     let qg = QueryGraph::from_document(doc);
+    let component = if args.component.is_empty() {
+        None
+    } else {
+        Some(args.component.iter().cloned().collect::<BTreeSet<_>>())
+    };
+    qg.validate_component_filter(component.as_ref())?;
     let contract_query = ContractQuery {
         value: args.value.clone(),
         category: args.category.clone(),
         limit: args.limit,
+        component,
     };
     Ok(query::contract(&qg, &contract_query))
 }
@@ -74,8 +89,13 @@ fn print_sites(sites: &[query::ContractSite]) {
         return;
     }
     for s in sites {
+        let component = s
+            .component
+            .as_deref()
+            .map(|c| format!("  [{c}]"))
+            .unwrap_or_default();
         println!(
-            "    {}  ({})  {}",
+            "    {}  ({})  {}{component}",
             s.label,
             s.confidence.as_str(),
             s.location.as_deref().unwrap_or(""),

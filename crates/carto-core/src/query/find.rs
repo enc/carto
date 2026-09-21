@@ -18,6 +18,7 @@ use super::{QueryGraph, Truncation};
 use crate::graph::{NodeData, NodeId, SymKind};
 use crate::taint::{Provenance, TaintedString};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 /// Default `--limit` when the caller doesn't specify one.
 pub const DEFAULT_LIMIT: usize = 50;
@@ -35,6 +36,12 @@ pub struct FindQuery {
     /// (spec §7.1's `--subpath`) — see
     /// [`QueryGraph::path_in_scope`]. `None` means no restriction.
     pub subpath: Option<String>,
+    /// Restrict matches to one of these components (ADR-0034/0035,
+    /// `--component`, repeatable) — see
+    /// [`QueryGraph::component_in_scope`]. `None` or empty means no
+    /// restriction. Independent of `subpath`: both given means both
+    /// apply.
+    pub component: Option<BTreeSet<String>>,
 }
 
 impl FindQuery {
@@ -44,6 +51,7 @@ impl FindQuery {
             exact: false,
             limit: DEFAULT_LIMIT,
             subpath: None,
+            component: None,
         }
     }
 }
@@ -64,6 +72,9 @@ pub struct SymbolMatch {
     /// re-tagged-on-deserialize) provenance — see
     /// `crate::graph::load`'s round-trip test for why those can differ.
     pub provenance: Provenance,
+    /// The component (ADR-0034/0035) this symbol's owning file belongs
+    /// to, `None` if it's under no recognized project root.
+    pub component: Option<String>,
 }
 
 /// One matched module (ADR-0021) — a separate row shape from
@@ -79,6 +90,12 @@ pub struct ModuleMatch {
     /// with the ID (an internal module has real edges to traverse via
     /// `deps`; an external one is a leaf).
     pub external: bool,
+    /// Always `None` today — a `Module` node has no component of its
+    /// own (ADR-0034/0035, same "no directory of its own" reasoning
+    /// `path_in_scope` already applies to it). Kept on the struct so
+    /// `ModuleMatch`'s row shape stays uniform with `SymbolMatch`'s
+    /// rather than silently omitting the field.
+    pub component: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -107,7 +124,10 @@ pub fn run(qg: &QueryGraph, query: &FindQuery) -> FindResult {
                 } else {
                     sym.name.to_lowercase().contains(&needle_lower)
                 };
-                if !is_match || !qg.path_in_scope(&node.id, query.subpath.as_deref()) {
+                if !is_match
+                    || !qg.path_in_scope(&node.id, query.subpath.as_deref())
+                    || !qg.component_in_scope(&node.id, query.component.as_ref())
+                {
                     continue;
                 }
                 matches.push(SymbolMatch {
@@ -117,6 +137,7 @@ pub fn run(qg: &QueryGraph, query: &FindQuery) -> FindResult {
                     location: qg.location(sym),
                     signature: sym.signature.clone(),
                     provenance: node.provenance,
+                    component: qg.component_of(&node.id).map(str::to_string),
                 });
             }
             NodeData::Module(m) => {
@@ -125,17 +146,22 @@ pub fn run(qg: &QueryGraph, query: &FindQuery) -> FindResult {
                 } else {
                     m.path.to_lowercase().contains(&needle_lower)
                 };
-                // `path_in_scope` always returns `true` for a `Module`
-                // node (ADR-0014: packages have no directory) — called
-                // anyway for symmetry with the symbol arm above, not
-                // because it can filter anything here.
-                if !is_match || !qg.path_in_scope(&node.id, query.subpath.as_deref()) {
+                // `path_in_scope`/`component_in_scope` always return
+                // `true` for a `Module` node (ADR-0014/ADR-0034:
+                // packages have no directory or component of their
+                // own) — called anyway for symmetry with the symbol arm
+                // above, not because either can filter anything here.
+                if !is_match
+                    || !qg.path_in_scope(&node.id, query.subpath.as_deref())
+                    || !qg.component_in_scope(&node.id, query.component.as_ref())
+                {
                     continue;
                 }
                 module_matches.push(ModuleMatch {
                     id: node.id.clone(),
                     path: m.path.clone(),
                     external: m.external,
+                    component: None,
                 });
             }
             // Contract nodes have their own lookup surface (`carto
@@ -315,6 +341,7 @@ mod tests {
             exact: true,
             limit: DEFAULT_LIMIT,
             subpath: Some("mg_site".to_string()),
+            component: None,
         };
         let result = run(&qg, &query);
         assert_eq!(result.matches.len(), 1);
@@ -339,6 +366,7 @@ mod tests {
             exact: true,
             limit: DEFAULT_LIMIT,
             subpath: Some("mg_site".to_string()),
+            component: None,
         };
         let result = run(&qg, &query);
         assert_eq!(result.matches.len(), 1);
@@ -371,6 +399,7 @@ mod tests {
             exact: true,
             limit: DEFAULT_LIMIT,
             subpath: None,
+            component: None,
         };
         assert_eq!(run(&qg, &query).matches.len(), 1);
     }
@@ -391,6 +420,7 @@ mod tests {
             exact: false,
             limit: 2,
             subpath: None,
+            component: None,
         };
         let result = run(&qg, &query);
         assert_eq!(result.matches.len(), 2);
@@ -446,6 +476,7 @@ mod tests {
             exact: true,
             limit: DEFAULT_LIMIT,
             subpath: None,
+            component: None,
         };
         assert_eq!(run(&qg, &query).module_matches.len(), 1);
     }
@@ -460,6 +491,7 @@ mod tests {
             exact: true,
             limit: DEFAULT_LIMIT,
             subpath: Some("some/unrelated/dir".to_string()),
+            component: None,
         };
         assert_eq!(run(&qg, &query).module_matches.len(), 1);
     }
@@ -478,6 +510,7 @@ mod tests {
             exact: false,
             limit: 2,
             subpath: None,
+            component: None,
         };
         let result = run(&qg, &query);
         assert_eq!(result.matches.len(), 2);

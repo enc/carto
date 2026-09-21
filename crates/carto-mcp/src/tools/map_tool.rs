@@ -14,7 +14,14 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 #[cfg(test)]
-pub(crate) const PARAM_NAMES: &[&str] = &["repo_path", "out", "budget", "subpath", "sections"];
+pub(crate) const PARAM_NAMES: &[&str] = &[
+    "repo_path",
+    "out",
+    "budget",
+    "subpath",
+    "sections",
+    "component",
+];
 
 pub fn call(args: &Value) -> Result<Value, String> {
     let repo_path = args
@@ -35,16 +42,20 @@ pub fn call(args: &Value) -> Result<Value, String> {
         None => None,
         Some(s) => Some(parse_sections(s)?),
     };
+    let component = crate::render::parse_component_list(args);
 
     let t = target::resolve(Path::new(repo_path), &out).map_err(|e| e.to_string())?;
     let doc = graph::load(&t.out_root).map_err(|e| e.to_string())?;
     let qg = QueryGraph::from_document(doc);
+    qg.validate_component_filter(component.as_ref())
+        .map_err(|e| e.to_string())?;
     let result = query::map(
         &qg,
         &MapQuery {
             budget,
             subpath,
             sections,
+            component,
         },
     );
 

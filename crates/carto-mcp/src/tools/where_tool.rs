@@ -15,8 +15,15 @@ use std::path::{Path, PathBuf};
 /// `schema.rs`'s `where` inputSchema. Test-only: not part of this
 /// module's real behavior, so it doesn't exist in a non-test build.
 #[cfg(test)]
-pub(crate) const PARAM_NAMES: &[&str] =
-    &["repo_path", "needle", "out", "exact", "limit", "subpath"];
+pub(crate) const PARAM_NAMES: &[&str] = &[
+    "repo_path",
+    "needle",
+    "out",
+    "exact",
+    "limit",
+    "subpath",
+    "component",
+];
 
 pub fn call(args: &Value) -> Result<Value, String> {
     let repo_path = args
@@ -38,15 +45,19 @@ pub fn call(args: &Value) -> Result<Value, String> {
         .get("subpath")
         .and_then(Value::as_str)
         .map(str::to_string);
+    let component = crate::render::parse_component_list(args);
 
     let t = target::resolve(Path::new(repo_path), &out).map_err(|e| e.to_string())?;
     let doc = graph::load(&t.out_root).map_err(|e| e.to_string())?;
     let qg = QueryGraph::from_document(doc);
+    qg.validate_component_filter(component.as_ref())
+        .map_err(|e| e.to_string())?;
     let find_query = FindQuery {
         needle: needle.to_string(),
         exact,
         limit,
         subpath,
+        component,
     };
     let result = query::find(&qg, &find_query);
 
@@ -144,6 +155,7 @@ mod tests {
                     carto_core::taint::Provenance::Syntactic,
                 )),
                 provenance: carto_core::taint::Provenance::Syntactic,
+                component: None,
             }],
             module_matches: vec![],
             truncation: query::Truncation::none(),
@@ -168,6 +180,7 @@ mod tests {
                 location: "src/lib.rs:1-3".to_string(),
                 signature: None,
                 provenance: carto_core::taint::Provenance::Syntactic,
+                component: None,
             }],
             module_matches: vec![],
             truncation: query::Truncation::none(),

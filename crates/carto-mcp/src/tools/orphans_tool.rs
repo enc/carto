@@ -9,7 +9,7 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 #[cfg(test)]
-pub(crate) const PARAM_NAMES: &[&str] = &["repo_path", "out", "category", "limit"];
+pub(crate) const PARAM_NAMES: &[&str] = &["repo_path", "out", "category", "limit", "component"];
 
 pub fn call(args: &Value) -> Result<Value, String> {
     let repo_path = args
@@ -26,11 +26,18 @@ pub fn call(args: &Value) -> Result<Value, String> {
         .and_then(Value::as_u64)
         .map(|v| v as usize)
         .unwrap_or(query::orphans::DEFAULT_LIMIT);
+    let component = crate::render::parse_component_list(args);
 
     let t = target::resolve(Path::new(repo_path), &out).map_err(|e| e.to_string())?;
     let doc = graph::load(&t.out_root).map_err(|e| e.to_string())?;
     let qg = QueryGraph::from_document(doc);
-    let orphans_query = OrphansQuery { category, limit };
+    qg.validate_component_filter(component.as_ref())
+        .map_err(|e| e.to_string())?;
+    let orphans_query = OrphansQuery {
+        category,
+        limit,
+        component,
+    };
     let result = query::orphans(&qg, &orphans_query);
 
     let text = render_text(&result);
@@ -74,7 +81,15 @@ fn render_row(out: &mut String, c: &query::OrphanContract) {
         .as_deref()
         .map(|q| format!(" [{q}]"))
         .unwrap_or_default();
-    out.push_str(&format!("  {}  ({}){qualifier}\n", c.value, c.category));
+    let components = if c.components.is_empty() {
+        String::new()
+    } else {
+        format!("  [{}]", c.components.join(", "))
+    };
+    out.push_str(&format!(
+        "  {}  ({}){qualifier}{components}\n",
+        c.value, c.category
+    ));
 }
 
 #[cfg(test)]

@@ -6,6 +6,7 @@ use carto_core::error::Result;
 use carto_core::query::{self, OrphansQuery, QueryGraph};
 use carto_core::{graph, target};
 use clap::Args;
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 #[derive(Args)]
@@ -28,15 +29,28 @@ pub struct OrphansArgs {
     /// `produced_never_consumed` are each capped independently).
     #[arg(long, default_value_t = query::orphans::DEFAULT_LIMIT)]
     limit: usize,
+
+    /// Restrict the report to orphan contracts with at least one
+    /// producer/consumer site in one of these components (repeatable)
+    /// — "which of my component's contracts are orphaned."
+    #[arg(long)]
+    component: Vec<String>,
 }
 
 pub fn run(args: &OrphansArgs) -> Result<query::OrphansResult> {
     let target = target::resolve(&args.path, &args.out)?;
     let doc = graph::load(&target.out_root)?;
     let qg = QueryGraph::from_document(doc);
+    let component = if args.component.is_empty() {
+        None
+    } else {
+        Some(args.component.iter().cloned().collect::<BTreeSet<_>>())
+    };
+    qg.validate_component_filter(component.as_ref())?;
     let orphans_query = OrphansQuery {
         category: args.category.clone(),
         limit: args.limit,
+        component,
     };
     Ok(query::orphans(&qg, &orphans_query))
 }
@@ -77,5 +91,10 @@ fn print_row(c: &query::OrphanContract) {
         .as_deref()
         .map(|q| format!(" [{q}]"))
         .unwrap_or_default();
-    println!("  {}  ({}){qualifier}", c.value, c.category);
+    let components = if c.components.is_empty() {
+        String::new()
+    } else {
+        format!("  [{}]", c.components.join(", "))
+    };
+    println!("  {}  ({}){qualifier}{components}", c.value, c.category);
 }

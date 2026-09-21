@@ -21,6 +21,7 @@ pub(crate) const PARAM_NAMES: &[&str] = &[
     "depth",
     "kinds",
     "subpath",
+    "component",
 ];
 
 /// How many unresolved-call names the *text* rendering shows — mirrors
@@ -61,16 +62,20 @@ pub fn call(args: &Value) -> Result<Value, String> {
         .get("subpath")
         .and_then(Value::as_str)
         .map(str::to_string);
+    let component = crate::render::parse_component_list(args);
 
     let t = target::resolve(Path::new(repo_path), &out).map_err(|e| e.to_string())?;
     let doc = graph::load(&t.out_root).map_err(|e| e.to_string())?;
     let qg = QueryGraph::from_document(doc);
+    qg.validate_component_filter(component.as_ref())
+        .map_err(|e| e.to_string())?;
     let deps_query = DepsQuery {
         target: target_name.to_string(),
         dir,
         depth,
         kinds,
         subpath,
+        component,
     };
     let result = query::deps(&qg, &deps_query).map_err(|e| e.to_string())?;
 
@@ -201,8 +206,19 @@ fn render_text(result: &query::DepsResult, dir: Direction) -> String {
             } else {
                 ""
             };
+            // ADR-0034/0035: the component analogue — only worth stating
+            // when there's a real component dimension at all (both root
+            // and this node have one); `same_file_as_root`/
+            // `same_component_as_root` are independently `false` for a
+            // Module/Contract endpoint, so this stays silent there too.
+            let cross_component_note =
+                if edge.node.component.is_some() && !edge.same_component_as_root {
+                    "  [cross-component]"
+                } else {
+                    ""
+                };
             out.push_str(&format!(
-                "  [{}] {} {} {} ({})  {}{same_file_note}\n",
+                "  [{}] {} {} {} ({})  {}{same_file_note}{cross_component_note}\n",
                 hop.depth,
                 arrow,
                 edge.kind.as_str(),

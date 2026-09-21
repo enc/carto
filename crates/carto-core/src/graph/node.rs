@@ -241,6 +241,14 @@ pub struct UnresolvedCall {
 pub struct InboundCallSite {
     pub file: String,
     pub line: u32,
+    /// The calling site's own component (mirrors `FileNode::component`)
+    /// — without this, these rows silently mix components: a symbol's
+    /// `unresolved_inbound_calls` could otherwise list a same-named
+    /// call site from a *different* component as if it were plausibly
+    /// this symbol's own caller. `#[serde(default)]`: same reasoning as
+    /// `FileNode::component`. ADR-0034/0035.
+    #[serde(default)]
+    pub component: Option<String>,
 }
 
 /// `Symbol` node (spec §4.1). `name` is the bare declared identifier —

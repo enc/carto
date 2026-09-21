@@ -42,13 +42,17 @@ pub const BIN_NAME: &str = "carto";
 /// "never let a fabricated default escape `load`" reasoning as every
 /// prior bump.
 /// 6 -> 7 (ADR-0034/0035): multi-root/component support. `GraphDocument`
-/// gained a `components: Vec<Component>` table and `FileNode` gained
-/// `component: Option<String>`. A v6 `graph.json` predates component
-/// discovery entirely — every file's absent `component` must not be
-/// misread as "confirmed not in any component" (a real, meaningful
-/// value this slice introduces) versus "never looked for one," the
-/// same absence-vs-zero distinction every prior bump in this family
-/// protects.
+/// gained a `components: Vec<Component>` table, `FileNode` gained
+/// `component: Option<String>`, and `InboundCallSite` (nested inside
+/// `SymbolNode::unresolved_inbound_calls`) gained the same field, for
+/// the same reason — without it, an honesty-signal row could silently
+/// mix components, listing a same-named call site from a *different*
+/// component as if it were plausibly this symbol's own caller. A v6
+/// `graph.json` predates component discovery entirely — every file's
+/// absent `component` must not be misread as "confirmed not in any
+/// component" (a real, meaningful value this slice introduces) versus
+/// "never looked for one," the same absence-vs-zero distinction every
+/// prior bump in this family protects.
 pub const SCHEMA_VERSION: u32 = 7;
 
 /// Max entries kept in `SymbolNode::unresolved_inbound_calls` /

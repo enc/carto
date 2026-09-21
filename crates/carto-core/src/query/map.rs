@@ -37,6 +37,11 @@ pub enum MapSection {
     Modules,
     EntryPoints,
     Infra,
+    /// ADR-0034/0035: the repo's top-level component structure — one
+    /// row per component plus a cross-component edge summary. Placed
+    /// last in spec §7.1's original section order (which predates this
+    /// section entirely) rather than reordering the other four.
+    Components,
 }
 
 impl MapSection {
@@ -49,6 +54,7 @@ impl MapSection {
             MapSection::Modules => "modules",
             MapSection::EntryPoints => "entry-points",
             MapSection::Infra => "infra",
+            MapSection::Components => "components",
         }
     }
 
@@ -59,6 +65,7 @@ impl MapSection {
             "modules" => Some(MapSection::Modules),
             "entry-points" => Some(MapSection::EntryPoints),
             "infra" => Some(MapSection::Infra),
+            "components" => Some(MapSection::Components),
             _ => None,
         }
     }
@@ -83,6 +90,12 @@ pub struct MapQuery {
     /// structured field) is always computed and returned regardless of
     /// this filter; only which `lines` render is affected.
     pub sections: Option<BTreeSet<MapSection>>,
+    /// Restrict rendering to these components (ADR-0034/0035,
+    /// `--component`, repeatable) — same "restricts what's listed,
+    /// never what's computed" principle as `subpath`, applied alongside
+    /// it (independent dimensions; both given means both apply). `None`
+    /// or empty means no restriction.
+    pub component: Option<BTreeSet<String>>,
 }
 
 impl MapQuery {
@@ -91,6 +104,7 @@ impl MapQuery {
             budget: consts::DEFAULT_MAP_BUDGET,
             subpath: None,
             sections: None,
+            component: None,
         }
     }
 }
@@ -111,6 +125,20 @@ pub struct MapCounts {
     /// a field that has no need to round-trip as anything but display
     /// data.
     pub edges_by_kind: BTreeMap<String, usize>,
+    /// ADR-0034/0035: per in-scope component (subject to `--subpath`/
+    /// `--component`), keyed by name. Empty for a repo with no
+    /// components — a real, meaningful fact (this is a single-project
+    /// repo, or `.carto/roots.json`/marker detection found nothing),
+    /// not an unfilled placeholder.
+    pub components: BTreeMap<String, ComponentCounts>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComponentCounts {
+    pub path: String,
+    pub kind: String,
+    pub files: usize,
+    pub symbols: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -123,18 +151,26 @@ pub struct MapResult {
 
 pub fn run(qg: &QueryGraph, query: &MapQuery) -> MapResult {
     let subpath = query.subpath.as_deref();
-    let counts = compute_counts(qg, subpath);
+    let component = query.component.as_ref();
+    let counts = compute_counts(qg, subpath, component);
 
     // `counts` (the structured field) stays exact and whole regardless
     // of `--section` (§2.2: the machine payload is never trimmed, only
     // `--section` lets a caller ask for less of the rendered text) —
-    // this filter only decides which of these four blocks contribute to
+    // this filter only decides which of these five blocks contribute to
     // `lines`.
     let all_sections: Vec<(MapSection, Vec<String>)> = vec![
         (MapSection::Counts, counts_lines(&counts)),
-        (MapSection::Modules, top_modules_lines(qg, subpath)),
-        (MapSection::EntryPoints, entry_points_lines(qg, subpath)),
+        (
+            MapSection::Modules,
+            top_modules_lines(qg, subpath, component),
+        ),
+        (
+            MapSection::EntryPoints,
+            entry_points_lines(qg, subpath, component),
+        ),
         (MapSection::Infra, infra_lines()),
+        (MapSection::Components, components_lines(&counts, qg)),
     ];
     let sections: Vec<Vec<String>> = all_sections
         .into_iter()
@@ -172,7 +208,19 @@ pub fn run(qg: &QueryGraph, query: &MapQuery) -> MapResult {
                     .collect::<String>()
             })
             .unwrap_or_default();
-        Truncation::more(format!("carto map --budget {next_budget}{section_flags}"))
+        let component_flags = query
+            .component
+            .as_ref()
+            .filter(|c| !c.is_empty())
+            .map(|c| {
+                c.iter()
+                    .map(|name| format!(" --component {name}"))
+                    .collect::<String>()
+            })
+            .unwrap_or_default();
+        Truncation::more(format!(
+            "carto map --budget {next_budget}{section_flags}{component_flags}"
+        ))
     } else {
         Truncation::none()
     };
@@ -184,11 +232,15 @@ pub fn run(qg: &QueryGraph, query: &MapQuery) -> MapResult {
     }
 }
 
-fn compute_counts(qg: &QueryGraph, subpath: Option<&str>) -> MapCounts {
+fn compute_counts(
+    qg: &QueryGraph,
+    subpath: Option<&str>,
+    component: Option<&BTreeSet<String>>,
+) -> MapCounts {
     let mut files = 0;
     let mut symbols = 0;
     for node in qg.nodes() {
-        if !qg.path_in_scope(&node.id, subpath) {
+        if !qg.path_in_scope(&node.id, subpath) || !qg.component_in_scope(&node.id, component) {
             continue;
         }
         match &node.data {
@@ -211,8 +263,10 @@ fn compute_counts(qg: &QueryGraph, subpath: Option<&str>) -> MapCounts {
     let mut touched_modules: BTreeSet<NodeId> = BTreeSet::new();
     let mut edges_by_kind: BTreeMap<String, usize> = BTreeMap::new();
     for edge in qg.edges() {
-        let from_in = qg.path_in_scope(&edge.from, subpath);
-        let to_in = qg.path_in_scope(&edge.to, subpath);
+        let from_in =
+            qg.path_in_scope(&edge.from, subpath) && qg.component_in_scope(&edge.from, component);
+        let to_in =
+            qg.path_in_scope(&edge.to, subpath) && qg.component_in_scope(&edge.to, component);
         if !from_in && !to_in {
             continue;
         }
@@ -232,7 +286,68 @@ fn compute_counts(qg: &QueryGraph, subpath: Option<&str>) -> MapCounts {
         symbols,
         modules: touched_modules.len(),
         edges_by_kind,
+        components: compute_component_counts(qg, subpath, component),
     }
+}
+
+/// ADR-0034/0035: per in-scope component, its own file/symbol counts —
+/// the structured data both `MapCounts.components` and
+/// [`components_lines`]'s rendering share. A component is in scope iff
+/// its own `path` passes `--subpath` and its `name` passes
+/// `--component` — the same two filters every other section already
+/// applies to individual nodes, applied here to the component entry
+/// itself since a `Component` isn't a graph node `path_in_scope`/
+/// `component_in_scope` can look up directly.
+fn compute_component_counts(
+    qg: &QueryGraph,
+    subpath: Option<&str>,
+    component: Option<&BTreeSet<String>>,
+) -> BTreeMap<String, ComponentCounts> {
+    let mut out: BTreeMap<String, ComponentCounts> = BTreeMap::new();
+    for c in qg.components() {
+        if !subpath_matches(&c.path, subpath) {
+            continue;
+        }
+        if let Some(filter) = component {
+            if !filter.is_empty() && !filter.contains(&c.name) {
+                continue;
+            }
+        }
+        out.insert(
+            c.name.clone(),
+            ComponentCounts {
+                path: c.path.clone(),
+                kind: c.kind.clone(),
+                files: 0,
+                symbols: 0,
+            },
+        );
+    }
+    for node in qg.nodes() {
+        let Some(name) = qg.component_of(&node.id) else {
+            continue;
+        };
+        let Some(entry) = out.get_mut(name) else {
+            continue;
+        };
+        match &node.data {
+            NodeData::File(_) => entry.files += 1,
+            NodeData::Symbol(_) => entry.symbols += 1,
+            NodeData::Module(_) | NodeData::Contract(_) => {}
+        }
+    }
+    out
+}
+
+/// [`QueryGraph::path_in_scope`]'s exact segment-boundary rule, applied
+/// to a plain path string rather than a `NodeId` — needed for a
+/// `Component`'s own `path`, which isn't itself a graph node.
+fn subpath_matches(path: &str, subpath: Option<&str>) -> bool {
+    let prefix = match subpath.map(str::trim) {
+        None | Some("") => return true,
+        Some(p) => p,
+    };
+    path == prefix || path.starts_with(&format!("{prefix}/"))
 }
 
 fn counts_lines(counts: &MapCounts) -> Vec<String> {
@@ -254,7 +369,11 @@ fn counts_lines(counts: &MapCounts) -> Vec<String> {
 /// `File` nodes ranked by `imports` fan-in + fan-out, plus external
 /// `Module` nodes ranked by fan-in ("which third-party packages this
 /// repo leans on"). Spec §7.1: "top modules by fan-in/out".
-fn top_modules_lines(qg: &QueryGraph, subpath: Option<&str>) -> Vec<String> {
+fn top_modules_lines(
+    qg: &QueryGraph,
+    subpath: Option<&str>,
+    component: Option<&BTreeSet<String>>,
+) -> Vec<String> {
     let mut file_fan: BTreeMap<NodeId, (usize, usize)> = BTreeMap::new(); // (in, out)
     for node in qg.nodes() {
         if matches!(node.data, NodeData::File(_)) {
@@ -287,8 +406,9 @@ fn top_modules_lines(qg: &QueryGraph, subpath: Option<&str>) -> Vec<String> {
         // External-package fan-in, deliberately different: only count
         // an edge whose *source* file is in scope — "what does this
         // subtree depend on externally" is the useful question here,
-        // not a whole-repo number (ADR-0014).
-        if qg.path_in_scope(&edge.from, subpath) {
+        // not a whole-repo number (ADR-0014, extended to `--component`
+        // the same way for ADR-0034/0035).
+        if qg.path_in_scope(&edge.from, subpath) && qg.component_in_scope(&edge.from, component) {
             if let Some(entry) = module_fan_in.get_mut(&edge.to) {
                 *entry += 1;
             }
@@ -299,7 +419,11 @@ fn top_modules_lines(qg: &QueryGraph, subpath: Option<&str>) -> Vec<String> {
 
     let mut ranked_files: Vec<(String, usize, usize)> = file_fan
         .into_iter()
-        .filter(|(id, (inn, out))| (*inn > 0 || *out > 0) && qg.path_in_scope(id, subpath))
+        .filter(|(id, (inn, out))| {
+            (*inn > 0 || *out > 0)
+                && qg.path_in_scope(id, subpath)
+                && qg.component_in_scope(id, component)
+        })
         .filter_map(|(id, (inn, out))| {
             let path = qg.node(&id).and_then(|n| n.data.as_file())?.path.clone();
             Some((path, inn, out))
@@ -344,7 +468,11 @@ fn top_modules_lines(qg: &QueryGraph, subpath: Option<&str>) -> Vec<String> {
 /// that carto doesn't have in v1); this is the same-spirit "honest
 /// heuristic, clearly labeled" pattern spec §7.1 uses for
 /// `unused_permissions`.
-fn entry_points_lines(qg: &QueryGraph, subpath: Option<&str>) -> Vec<String> {
+fn entry_points_lines(
+    qg: &QueryGraph,
+    subpath: Option<&str>,
+    component: Option<&BTreeSet<String>>,
+) -> Vec<String> {
     // Stays whole-graph: a file imported only from *outside* the
     // subtree must not look like a false entry point just because
     // that importer isn't listed.
@@ -361,7 +489,10 @@ fn entry_points_lines(qg: &QueryGraph, subpath: Option<&str>) -> Vec<String> {
     let mut candidates: Vec<String> = Vec::new();
     for node in qg.nodes() {
         if let NodeData::File(f) = &node.data {
-            if !has_incoming_import.contains(&node.id) && qg.path_in_scope(&node.id, subpath) {
+            if !has_incoming_import.contains(&node.id)
+                && qg.path_in_scope(&node.id, subpath)
+                && qg.component_in_scope(&node.id, component)
+            {
                 candidates.push(f.path.clone());
             }
         }
@@ -371,7 +502,10 @@ fn entry_points_lines(qg: &QueryGraph, subpath: Option<&str>) -> Vec<String> {
     let mut main_fns: Vec<String> = Vec::new();
     for node in qg.nodes() {
         if let NodeData::Symbol(s) = &node.data {
-            if s.name == "main" && qg.path_in_scope(&node.id, subpath) {
+            if s.name == "main"
+                && qg.path_in_scope(&node.id, subpath)
+                && qg.component_in_scope(&node.id, component)
+            {
                 main_fns.push(qg.location(s));
             }
         }
@@ -403,6 +537,60 @@ fn infra_lines() -> Vec<String> {
         "## join".to_string(),
         "  none — requires M3 (code<->infra join)".to_string(),
     ]
+}
+
+/// ADR-0034/0035: one row per in-scope component (from `counts.components`,
+/// already filtered by `--subpath`/`--component`), plus a summary of
+/// edges crossing between two *different* components — always printing
+/// the header, matching every other section's "(none)"-when-empty
+/// convention (`top_modules_lines`/`entry_points_lines` above) rather
+/// than omitting the section, so a repo with no components reports that
+/// honestly instead of looking like the question was never asked.
+fn components_lines(counts: &MapCounts, qg: &QueryGraph) -> Vec<String> {
+    let mut lines = vec!["## components".to_string()];
+    if counts.components.is_empty() {
+        lines.push("  (none)".to_string());
+        return lines;
+    }
+    for (name, c) in &counts.components {
+        lines.push(format!(
+            "  {name}  path={} kind={} files={} symbols={}",
+            c.path, c.kind, c.files, c.symbols
+        ));
+    }
+
+    // Edges whose endpoints sit in two *different* components, tallied
+    // by (from-component, to-component, kind) — restricted to pairs
+    // touching at least one in-scope component (`counts.components`'
+    // own keys), the same "restrict what's listed" principle every
+    // other section applies, not a second independent filter.
+    let mut cross: BTreeMap<(String, String), BTreeMap<&'static str, usize>> = BTreeMap::new();
+    for edge in qg.edges() {
+        let (Some(from_c), Some(to_c)) = (qg.component_of(&edge.from), qg.component_of(&edge.to))
+        else {
+            continue;
+        };
+        if from_c == to_c {
+            continue;
+        }
+        if !counts.components.contains_key(from_c) && !counts.components.contains_key(to_c) {
+            continue;
+        }
+        *cross
+            .entry((from_c.to_string(), to_c.to_string()))
+            .or_default()
+            .entry(edge.kind.as_str())
+            .or_insert(0) += 1;
+    }
+    if !cross.is_empty() {
+        lines.push("## cross-component edges".to_string());
+        for ((from_c, to_c), kinds) in &cross {
+            let parts: Vec<String> = kinds.iter().map(|(k, v)| format!("{v} {k}")).collect();
+            lines.push(format!("  {from_c} -> {to_c}: {}", parts.join(", ")));
+        }
+    }
+
+    lines
 }
 
 #[cfg(test)]
@@ -569,6 +757,7 @@ mod tests {
                 budget: consts::DEFAULT_MAP_BUDGET,
                 subpath: Some("mg_site".to_string()),
                 sections: None,
+                component: None,
             },
         );
         // handlers.rs + orders.rs, not vendor/legacy.rs.
@@ -584,6 +773,7 @@ mod tests {
                 budget: consts::DEFAULT_MAP_BUDGET,
                 subpath: Some("mg_site".to_string()),
                 sections: None,
+                component: None,
             },
         );
         let joined = result.lines.join("\n");
@@ -605,6 +795,7 @@ mod tests {
                 budget: consts::DEFAULT_MAP_BUDGET,
                 subpath: Some("mg_site".to_string()),
                 sections: None,
+                component: None,
             },
         );
         let joined = result.lines.join("\n");
@@ -626,6 +817,7 @@ mod tests {
                 budget: consts::DEFAULT_MAP_BUDGET,
                 subpath: Some("mg_site".to_string()),
                 sections: None,
+                component: None,
             },
         );
         let joined = result.lines.join("\n");
@@ -687,6 +879,7 @@ mod tests {
                 budget: 3,
                 subpath: None,
                 sections: None,
+                component: None,
             },
         );
         assert!(result.lines.len() <= 3);
@@ -709,6 +902,7 @@ mod tests {
                 budget: 0,
                 subpath: None,
                 sections: None,
+                component: None,
             },
         );
         assert!(result.lines.is_empty());
@@ -741,6 +935,7 @@ mod tests {
                 budget: consts::DEFAULT_MAP_BUDGET,
                 subpath: None,
                 sections: Some(sections),
+                component: None,
             },
         );
         let joined = result.lines.join("\n");
@@ -763,6 +958,7 @@ mod tests {
                 budget: consts::DEFAULT_MAP_BUDGET,
                 subpath: None,
                 sections: Some(sections),
+                component: None,
             },
         );
         let full = run(&qg, &MapQuery::new());
@@ -779,6 +975,7 @@ mod tests {
                 budget: consts::DEFAULT_MAP_BUDGET,
                 subpath: None,
                 sections: None,
+                component: None,
             },
         );
         let with_default = run(&qg, &MapQuery::new());
@@ -797,6 +994,7 @@ mod tests {
                 budget: 1,
                 subpath: None,
                 sections: Some(sections),
+                component: None,
             },
         );
         assert!(result.truncation.truncated);
@@ -813,9 +1011,155 @@ mod tests {
             MapSection::Modules,
             MapSection::EntryPoints,
             MapSection::Infra,
+            MapSection::Components,
         ] {
             assert_eq!(MapSection::parse(section.as_str()), Some(section));
         }
         assert_eq!(MapSection::parse("not-a-section"), None);
+    }
+
+    // --- ADR-0034/0035: the components section -----------------------
+
+    fn component(name: &str, path: &str, kind: &str) -> crate::components::Component {
+        crate::components::Component {
+            name: name.to_string(),
+            path: path.to_string(),
+            kind: kind.to_string(),
+        }
+    }
+
+    fn file_with_component(path: &str, component: &str) -> Node {
+        let mut n = file(path);
+        if let NodeData::File(f) = &mut n.data {
+            f.component = Some(component.to_string());
+        }
+        n
+    }
+
+    /// Two Go components, `orders` and `billing`, each with one file;
+    /// `orders`'s file imports `billing`'s file — a real cross-component
+    /// edge to exercise the summary.
+    fn two_component_doc() -> GraphDocument {
+        let orders = file_with_component("services/orders/main.go", "orders");
+        let billing = file_with_component("services/billing/main.go", "billing");
+        let cross_edge = Edge::new(
+            EdgeKind::Imports,
+            orders.id.clone(),
+            billing.id.clone(),
+            Confidence::Certain,
+            "package-import".to_string(),
+        );
+        GraphDocument {
+            components: vec![
+                component("orders", "services/orders", "go"),
+                component("billing", "services/billing", "go"),
+            ],
+            ..doc(vec![orders, billing], vec![cross_edge])
+        }
+    }
+
+    #[test]
+    fn components_section_lists_each_component_with_its_own_counts() {
+        let qg = QueryGraph::from_document(two_component_doc());
+        let result = run(&qg, &MapQuery::new());
+        assert_eq!(result.counts.components.len(), 2);
+        let orders = &result.counts.components["orders"];
+        assert_eq!(orders.path, "services/orders");
+        assert_eq!(orders.kind, "go");
+        assert_eq!(orders.files, 1);
+        let joined = result.lines.join("\n");
+        assert!(joined.contains("## components"));
+        assert!(
+            joined.contains("orders  path=services/orders kind=go files=1"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("billing  path=services/billing kind=go files=1"),
+            "{joined}"
+        );
+    }
+
+    #[test]
+    fn components_section_summarizes_cross_component_edges() {
+        let qg = QueryGraph::from_document(two_component_doc());
+        let result = run(&qg, &MapQuery::new());
+        let joined = result.lines.join("\n");
+        assert!(joined.contains("## cross-component edges"));
+        assert!(joined.contains("orders -> billing: 1 imports"), "{joined}");
+    }
+
+    #[test]
+    fn a_repo_with_no_components_still_prints_the_header_and_none() {
+        let qg = QueryGraph::from_document(small_repo_doc());
+        let result = run(&qg, &MapQuery::new());
+        assert!(result.counts.components.is_empty());
+        let joined = result.lines.join("\n");
+        assert!(joined.contains("## components"));
+        let components_section = joined.split("## components").nth(1).unwrap();
+        assert!(components_section.trim_start().starts_with("(none)"));
+        assert!(!joined.contains("## cross-component edges"));
+    }
+
+    #[test]
+    fn component_filter_restricts_the_components_section_and_counts() {
+        let qg = QueryGraph::from_document(two_component_doc());
+        let mut filter = BTreeSet::new();
+        filter.insert("orders".to_string());
+        let result = run(
+            &qg,
+            &MapQuery {
+                budget: consts::DEFAULT_MAP_BUDGET,
+                subpath: None,
+                sections: None,
+                component: Some(filter),
+            },
+        );
+        assert_eq!(result.counts.components.len(), 1);
+        assert!(result.counts.components.contains_key("orders"));
+        let joined = result.lines.join("\n");
+        assert!(joined.contains("orders  path="));
+        assert!(!joined.contains("billing  path="));
+        // The cross-component edge still shows since `orders` (one of
+        // its two endpoints) is in scope.
+        assert!(joined.contains("orders -> billing"));
+    }
+
+    #[test]
+    fn component_filter_also_restricts_file_counts_and_top_modules() {
+        let qg = QueryGraph::from_document(two_component_doc());
+        let mut filter = BTreeSet::new();
+        filter.insert("orders".to_string());
+        let result = run(
+            &qg,
+            &MapQuery {
+                budget: consts::DEFAULT_MAP_BUDGET,
+                subpath: None,
+                sections: None,
+                component: Some(filter),
+            },
+        );
+        assert_eq!(result.counts.files, 1);
+        let joined = result.lines.join("\n");
+        assert!(joined.contains("services/orders/main.go"));
+        assert!(!joined.contains("services/billing/main.go  in="));
+    }
+
+    #[test]
+    fn truncation_carries_the_component_filter_forward() {
+        let qg = QueryGraph::from_document(two_component_doc());
+        let mut filter = BTreeSet::new();
+        filter.insert("orders".to_string());
+        let result = run(
+            &qg,
+            &MapQuery {
+                budget: 1,
+                subpath: None,
+                sections: None,
+                component: Some(filter),
+            },
+        );
+        assert!(result.truncation.truncated);
+        let next = result.truncation.next_call.unwrap();
+        assert!(next.contains("--component orders"), "{next}");
     }
 }

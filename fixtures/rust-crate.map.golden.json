@@ -1,5 +1,6 @@
 {
   "counts": {
+    "components": {},
     "edges_by_kind": {
       "calls": 5,
       "contains": 7,
@@ -23,7 +24,9 @@
     "## infra",
     "  none — requires M2 (infrastructure graph)",
     "## join",
-    "  none — requires M3 (code<->infra join)"
+    "  none — requires M3 (code<->infra join)",
+    "## components",
+    "  (none)"
   ],
   "truncation": {
     "next_call": null,

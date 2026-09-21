@@ -23,9 +23,11 @@ pub mod find;
 pub mod map;
 pub mod orphans;
 
+use crate::components::Component;
+use crate::error::{Error, Result};
 use crate::graph::{Edge, EdgeId, GraphDocument, Node, NodeData, NodeId, SymbolNode};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub use contract::{ContractMatch, ContractQuery, ContractResult, ContractSite, run as contract};
 pub use deps::{DepEdge, DepsQuery, DepsResult, Hop, NodeSummary, run as deps};
@@ -96,6 +98,13 @@ pub struct QueryGraph {
     out_edges: BTreeMap<NodeId, Vec<EdgeId>>,
     /// `NodeId` -> incoming edge IDs, same ordering guarantee.
     in_edges: BTreeMap<NodeId, Vec<EdgeId>>,
+    /// `GraphDocument::components` verbatim, sorted by path (INV-7) as
+    /// persisted — ADR-0034/0035. Small (repo-scale, not node-scale), so
+    /// a plain `Vec` scanned linearly by `known_component_names` is
+    /// fine; per-node lookups go through `File`/`Symbol` nodes' own
+    /// `component` field instead (`component_of`/`component_in_scope`
+    /// below), not this table.
+    components: Vec<Component>,
 }
 
 impl QueryGraph {
@@ -124,7 +133,61 @@ impl QueryGraph {
             edges,
             out_edges,
             in_edges,
+            components: doc.components,
         }
+    }
+
+    /// Every component this index knows about (ADR-0034/0035), in the
+    /// order persisted (path-sorted). Used to render `map`'s components
+    /// section and to validate a `--component` flag's value, listing the
+    /// known names in a `UserError` when it doesn't match any of them.
+    pub fn components(&self) -> &[Component] {
+        &self.components
+    }
+
+    /// The set of every known component's `name`, for `--component`
+    /// validation — a name that isn't in this set is a typo, not a
+    /// legitimately-empty-result query.
+    pub fn known_component_names(&self) -> BTreeSet<&str> {
+        self.components.iter().map(|c| c.name.as_str()).collect()
+    }
+
+    /// Validates a `--component` filter's names against what this index
+    /// actually knows about (`known_component_names`) — an unknown name
+    /// is a typo, not a legitimately-empty-result query, unlike
+    /// `--subpath`, which has no enumerable "known directories" list to
+    /// check a value against. Called once at the front-end layer (each
+    /// CLI command/MCP tool, right after building `qg` and before
+    /// constructing its query struct) rather than inside the core query
+    /// functions themselves, which stay infallible — the same reason
+    /// `deps::run`'s own `--depth` cap check lives in that fallible
+    /// wrapper rather than being duplicated everywhere `depth` is used.
+    pub fn validate_component_filter(&self, filter: Option<&BTreeSet<String>>) -> Result<()> {
+        let Some(filter) = filter else {
+            return Ok(());
+        };
+        let known = self.known_component_names();
+        let mut unknown: Vec<&String> = filter
+            .iter()
+            .filter(|n| !known.contains(n.as_str()))
+            .collect();
+        if unknown.is_empty() {
+            return Ok(());
+        }
+        unknown.sort();
+        let unknown_list = unknown
+            .iter()
+            .map(|s| format!("`{s}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let known_list = if known.is_empty() {
+            "(none in this index)".to_string()
+        } else {
+            known.into_iter().collect::<Vec<_>>().join(", ")
+        };
+        Err(Error::user(format!(
+            "unknown --component value(s): {unknown_list} — known components: {known_list}"
+        )))
     }
 
     pub fn node(&self, id: &NodeId) -> Option<&Node> {
@@ -209,6 +272,60 @@ impl QueryGraph {
             None => return false,
         };
         path == prefix || path.starts_with(&format!("{prefix}/"))
+    }
+
+    /// The component (ADR-0034/0035) `id`'s node belongs to, for
+    /// *display* — a `Symbol`'s component is its owning file's; a
+    /// `File`'s is its own; a `Module`/`Contract`/dangling reference has
+    /// none, `None`, the honest answer (neither has a directory of its
+    /// own, mirroring `path_in_scope`'s treatment of the same two
+    /// kinds — but see [`Self::component_in_scope`] below for why
+    /// *scope-filtering* those two kinds is a different question with a
+    /// different answer than this accessor gives).
+    pub fn component_of(&self, id: &NodeId) -> Option<&str> {
+        match self.node(id).map(|n| &n.data) {
+            Some(NodeData::File(f)) => f.component.as_deref(),
+            Some(NodeData::Symbol(s)) => self
+                .node(&s.file)
+                .and_then(|n| n.data.as_file())
+                .and_then(|f| f.component.as_deref()),
+            _ => None,
+        }
+    }
+
+    /// Whether `id` is in scope for a `--component <NAME>` filter
+    /// (repeatable — `filter` is the resulting name set), the exact
+    /// component analogue of [`Self::path_in_scope`] for `--subpath`,
+    /// including its governing principle (ADR-0014): restricts which
+    /// rows get *listed*, never what a traversal/aggregation actually
+    /// computes. `filter: None` or an empty set means "no restriction" —
+    /// always `true`, the same tolerance `path_in_scope` gives an
+    /// empty/whitespace-only `--subpath`.
+    ///
+    /// `Module`/`Contract` nodes are **always** in scope here, unlike
+    /// what [`Self::component_of`] would report for them (`None`) — the
+    /// same "no directory/component of its own, so never excluded by
+    /// this kind of filter" rule `path_in_scope` already applies to
+    /// them, deliberately kept even though it means this predicate and
+    /// `component_of` disagree for these two kinds on purpose: one
+    /// answers "what component is this," the other "should this be
+    /// hidden by a component filter," and for `Module`/`Contract` those
+    /// are different questions with different honest answers.
+    pub fn component_in_scope(&self, id: &NodeId, filter: Option<&BTreeSet<String>>) -> bool {
+        let Some(filter) = filter else { return true };
+        if filter.is_empty() {
+            return true;
+        }
+        match self.node(id).map(|n| &n.data) {
+            Some(NodeData::File(f)) => f.component.as_deref().is_some_and(|c| filter.contains(c)),
+            Some(NodeData::Symbol(s)) => self
+                .node(&s.file)
+                .and_then(|n| n.data.as_file())
+                .and_then(|f| f.component.as_deref())
+                .is_some_and(|c| filter.contains(c)),
+            Some(NodeData::Module(_)) | Some(NodeData::Contract(_)) => true,
+            None => false,
+        }
     }
 }
 
@@ -344,5 +461,173 @@ mod tests {
             unresolved_inbound_call_count: 0,
         });
         assert_eq!(rendered, "<unknown-file>:1-1");
+    }
+
+    fn file_node_with_component(path: &str, component: Option<&str>) -> Node {
+        let mut n = file_node(path);
+        if let crate::graph::NodeData::File(f) = &mut n.data {
+            f.component = component.map(str::to_string);
+        }
+        n
+    }
+
+    fn doc_with_components(
+        nodes: Vec<Node>,
+        edges: Vec<Edge>,
+        components: Vec<crate::components::Component>,
+    ) -> GraphDocument {
+        GraphDocument {
+            components,
+            ..doc(nodes, edges)
+        }
+    }
+
+    #[test]
+    fn component_of_resolves_a_symbol_through_its_owning_file() {
+        let file = crate::graph::file_id("services/orders/handler.rs");
+        let sym = symbol_node("services/orders/handler.rs", "run", &file);
+        let sym_id = sym.id.clone();
+        let qg = QueryGraph::from_document(doc(
+            vec![
+                file_node_with_component("services/orders/handler.rs", Some("orders")),
+                sym,
+            ],
+            vec![],
+        ));
+        assert_eq!(qg.component_of(&file), Some("orders"));
+        assert_eq!(qg.component_of(&sym_id), Some("orders"));
+    }
+
+    #[test]
+    fn component_of_is_none_for_module_and_dangling_ids() {
+        let module = Node::module(
+            crate::graph::module_id("serde", true),
+            Provenance::Syntactic,
+            "test@1",
+            crate::graph::ModuleNode {
+                path: "serde".to_string(),
+                external: true,
+            },
+        );
+        let module_id = module.id.clone();
+        let qg = QueryGraph::from_document(doc(vec![module], vec![]));
+        assert_eq!(qg.component_of(&module_id), None);
+        assert_eq!(qg.component_of(&crate::graph::file_id("nowhere.rs")), None);
+    }
+
+    #[test]
+    fn component_in_scope_none_or_empty_filter_means_no_restriction() {
+        let qg = QueryGraph::from_document(doc(
+            vec![file_node_with_component(
+                "services/orders/a.rs",
+                Some("orders"),
+            )],
+            vec![],
+        ));
+        let id = crate::graph::file_id("services/orders/a.rs");
+        assert!(qg.component_in_scope(&id, None));
+        assert!(qg.component_in_scope(&id, Some(&BTreeSet::new())));
+    }
+
+    #[test]
+    fn component_in_scope_filters_files_and_symbols_by_owning_file() {
+        let orders_file_id = crate::graph::file_id("services/orders/a.rs");
+        let billing_file_id = crate::graph::file_id("services/billing/b.rs");
+        let sym = symbol_node("services/orders/a.rs", "run", &orders_file_id);
+        let sym_id = sym.id.clone();
+        let qg = QueryGraph::from_document(doc(
+            vec![
+                file_node_with_component("services/orders/a.rs", Some("orders")),
+                file_node_with_component("services/billing/b.rs", Some("billing")),
+                sym,
+            ],
+            vec![],
+        ));
+        let filter: BTreeSet<String> = ["orders".to_string()].into_iter().collect();
+        assert!(qg.component_in_scope(&orders_file_id, Some(&filter)));
+        assert!(qg.component_in_scope(&sym_id, Some(&filter)));
+        assert!(!qg.component_in_scope(&billing_file_id, Some(&filter)));
+    }
+
+    #[test]
+    fn component_in_scope_excludes_a_file_with_no_component_under_a_real_filter() {
+        let qg = QueryGraph::from_document(doc(vec![file_node("scripts/a.rs")], vec![]));
+        let id = crate::graph::file_id("scripts/a.rs");
+        let filter: BTreeSet<String> = ["orders".to_string()].into_iter().collect();
+        assert!(!qg.component_in_scope(&id, Some(&filter)));
+    }
+
+    #[test]
+    fn component_in_scope_always_true_for_module_and_contract_nodes() {
+        let module = Node::module(
+            crate::graph::module_id("serde", true),
+            Provenance::Syntactic,
+            "test@1",
+            crate::graph::ModuleNode {
+                path: "serde".to_string(),
+                external: true,
+            },
+        );
+        let module_id = module.id.clone();
+        let qg = QueryGraph::from_document(doc(vec![module], vec![]));
+        let filter: BTreeSet<String> = ["orders".to_string()].into_iter().collect();
+        assert!(qg.component_in_scope(&module_id, Some(&filter)));
+    }
+
+    #[test]
+    fn validate_component_filter_none_or_empty_always_passes() {
+        let qg = QueryGraph::from_document(doc(vec![], vec![]));
+        assert!(qg.validate_component_filter(None).is_ok());
+        assert!(qg.validate_component_filter(Some(&BTreeSet::new())).is_ok());
+    }
+
+    #[test]
+    fn validate_component_filter_rejects_an_unknown_name() {
+        let components = vec![crate::components::Component {
+            name: "orders".to_string(),
+            path: "services/orders".to_string(),
+            kind: "go".to_string(),
+        }];
+        let qg = QueryGraph::from_document(doc_with_components(vec![], vec![], components));
+        let filter: BTreeSet<String> = ["orders".to_string(), "typo".to_string()]
+            .into_iter()
+            .collect();
+        let err = qg.validate_component_filter(Some(&filter)).unwrap_err();
+        assert!(err.to_string().contains("typo"));
+        assert!(err.to_string().contains("orders"));
+    }
+
+    #[test]
+    fn validate_component_filter_accepts_every_known_name() {
+        let components = vec![crate::components::Component {
+            name: "orders".to_string(),
+            path: "services/orders".to_string(),
+            kind: "go".to_string(),
+        }];
+        let qg = QueryGraph::from_document(doc_with_components(vec![], vec![], components));
+        let filter: BTreeSet<String> = ["orders".to_string()].into_iter().collect();
+        assert!(qg.validate_component_filter(Some(&filter)).is_ok());
+    }
+
+    #[test]
+    fn known_component_names_and_components_reflect_the_document() {
+        let components = vec![
+            crate::components::Component {
+                name: "billing".to_string(),
+                path: "services/billing".to_string(),
+                kind: "go".to_string(),
+            },
+            crate::components::Component {
+                name: "orders".to_string(),
+                path: "services/orders".to_string(),
+                kind: "go".to_string(),
+            },
+        ];
+        let qg = QueryGraph::from_document(doc_with_components(vec![], vec![], components));
+        assert_eq!(qg.components().len(), 2);
+        let names = qg.known_component_names();
+        assert!(names.contains("billing"));
+        assert!(names.contains("orders"));
+        assert!(!names.contains("nonexistent"));
     }
 }

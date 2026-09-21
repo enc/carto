@@ -11,6 +11,25 @@
 
 use carto_core::consts::MCP_TEXT_CAP;
 use serde_json::{Value, json};
+use std::collections::BTreeSet;
+
+/// Parses a tool call's `component` param (ADR-0034/0035) — a
+/// comma-separated string, the same MCP shape `map_tool.rs`'s own
+/// `sections` param already uses for its own repeatable CLI flag.
+/// `None`/absent/empty (after trimming each part) means no restriction;
+/// [`carto_core::query::QueryGraph::validate_component_filter`] is
+/// where an unknown name becomes a tool error, not here — this function
+/// only parses the wire shape.
+pub fn parse_component_list(args: &Value) -> Option<BTreeSet<String>> {
+    let raw = args.get("component").and_then(Value::as_str)?;
+    let names: BTreeSet<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if names.is_empty() { None } else { Some(names) }
+}
 
 /// Truncates `text` to at most [`MCP_TEXT_CAP`] bytes, on a line boundary
 /// so a cut point is never mid-UTF8-sequence (newlines are single-byte

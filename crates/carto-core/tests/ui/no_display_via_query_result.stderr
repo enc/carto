@@ -1,7 +1,7 @@
 error[E0277]: `TaintedString` doesn't implement `std::fmt::Display`
-  --> tests/ui/no_display_via_query_result.rs:22:24
+  --> tests/ui/no_display_via_query_result.rs:23:24
    |
-22 |         println!("{}", sig);
+23 |         println!("{}", sig);
    |                   --   ^^^ `TaintedString` cannot be formatted with the default formatter
    |                   |
    |                   required by this formatting parameter

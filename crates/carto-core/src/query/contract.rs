@@ -10,6 +10,7 @@ use crate::consts;
 use crate::graph::{Confidence, Edge, EdgeKind, NodeData, NodeId};
 use crate::taint::{Provenance, TaintedString};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 pub const DEFAULT_LIMIT: usize = 50;
 
@@ -24,6 +25,15 @@ pub struct ContractQuery {
     /// both called `X`).
     pub category: Option<String>,
     pub limit: usize,
+    /// Restrict *listed producer/consumer sites* to these components
+    /// (ADR-0034/0035, `--component`, repeatable) — see
+    /// [`QueryGraph::component_in_scope`]. Deliberately does **not**
+    /// drop a whole `ContractMatch` when it has no in-scope sites left —
+    /// cross-component contract joins are the entire point of this
+    /// capability (ADR-0026), so a match losing all its rows under a
+    /// filter is itself informative, not something to hide. `None` or
+    /// empty means no restriction.
+    pub component: Option<BTreeSet<String>>,
 }
 
 /// One site producing or consuming a `Contract` — the `Symbol`/`File`
@@ -37,6 +47,11 @@ pub struct ContractSite {
     pub location: Option<String>,
     pub confidence: Confidence,
     pub evidence: Vec<String>,
+    /// The component (ADR-0034/0035) this site's owning file belongs
+    /// to, `None` if it's under no recognized project root — which
+    /// component produces vs. consumes is exactly the question a
+    /// cross-component contract join exists to answer.
+    pub component: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,8 +95,8 @@ pub fn run(qg: &QueryGraph, query: &ContractQuery) -> ContractResult {
         }
 
         let incoming = qg.neighbors(&node.id, Direction::In);
-        let producers = sites(qg, &incoming, EdgeKind::Produces);
-        let consumers = sites(qg, &incoming, EdgeKind::Consumes);
+        let producers = sites(qg, &incoming, EdgeKind::Produces, query.component.as_ref());
+        let consumers = sites(qg, &incoming, EdgeKind::Consumes, query.component.as_ref());
 
         matches.push(ContractMatch {
             contract_id: node.id.clone(),
@@ -116,10 +131,16 @@ pub fn run(qg: &QueryGraph, query: &ContractQuery) -> ContractResult {
     }
 }
 
-fn sites(qg: &QueryGraph, incoming: &[&Edge], kind: EdgeKind) -> Vec<ContractSite> {
+fn sites(
+    qg: &QueryGraph,
+    incoming: &[&Edge],
+    kind: EdgeKind,
+    component_filter: Option<&BTreeSet<String>>,
+) -> Vec<ContractSite> {
     let mut out: Vec<ContractSite> = incoming
         .iter()
         .filter(|e| e.kind == kind)
+        .filter(|e| qg.component_in_scope(&e.from, component_filter))
         .filter_map(|e| {
             let from = qg.node(&e.from)?;
             let (label, location) = match &from.data {
@@ -138,6 +159,7 @@ fn sites(qg: &QueryGraph, incoming: &[&Edge], kind: EdgeKind) -> Vec<ContractSit
                 location,
                 confidence: e.confidence,
                 evidence: e.evidence.clone(),
+                component: qg.component_of(&e.from).map(str::to_string),
             })
         })
         .collect();
@@ -227,6 +249,7 @@ mod tests {
                 value: "QuoteDropsPerSecond".to_string(),
                 category: None,
                 limit: DEFAULT_LIMIT,
+                component: None,
             },
         );
         assert_eq!(result.matches.len(), 1);
@@ -246,6 +269,7 @@ mod tests {
                 value: "QuoteDropsPerSecond".to_string(),
                 category: Some("env_var".to_string()),
                 limit: DEFAULT_LIMIT,
+                component: None,
             },
         );
         assert!(result.matches.is_empty());
@@ -268,6 +292,7 @@ mod tests {
                 value: "QuoteDropsPerSecond".to_string(),
                 category: None,
                 limit: DEFAULT_LIMIT,
+                component: None,
             },
         );
         assert_eq!(result.matches.len(), 1);
@@ -282,6 +307,7 @@ mod tests {
                 value: "NoSuchMetric".to_string(),
                 category: None,
                 limit: DEFAULT_LIMIT,
+                component: None,
             },
         );
         assert!(result.matches.is_empty());

@@ -11,6 +11,7 @@ use super::{Direction, QueryGraph, Truncation};
 use crate::consts;
 use crate::graph::{EdgeKind, NodeData, NodeId};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 pub const DEFAULT_LIMIT: usize = 200;
 
@@ -20,6 +21,17 @@ pub struct OrphansQuery {
     /// test's `--category metric_name`).
     pub category: Option<String>,
     pub limit: usize,
+    /// Restrict the report to orphan contracts with at least one
+    /// producer/consumer site in one of these components
+    /// (ADR-0034/0035, `--component`, repeatable) — "which of my
+    /// component's contracts are orphaned," a legitimate question for a
+    /// service owner in a monorepo. Unlike `contract`'s own
+    /// `--component` (which filters sites, never a whole match), this
+    /// filters the *contract itself* out of the report, since an
+    /// orphan's defining fact (no producer, or no consumer, anywhere)
+    /// is inherently repo-wide, not a per-site listing. `None` or empty
+    /// means no restriction.
+    pub component: Option<BTreeSet<String>>,
 }
 
 impl OrphansQuery {
@@ -27,6 +39,7 @@ impl OrphansQuery {
         OrphansQuery {
             category: None,
             limit: DEFAULT_LIMIT,
+            component: None,
         }
     }
 }
@@ -43,6 +56,14 @@ pub struct OrphanContract {
     pub category: String,
     pub qualifier: Option<String>,
     pub value: String,
+    /// Every distinct component (ADR-0034/0035) among this contract's
+    /// producer/consumer sites, sorted. A component-less site
+    /// contributes nothing here (not a `None` entry) — this is a
+    /// positive list of "which components touch this," not a row per
+    /// site. Usually one entry (the orphan's own producer or consumer
+    /// component), but can be several — e.g. a metric several services
+    /// each emit, none of which is the one alarm consuming it.
+    pub components: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,6 +99,17 @@ pub fn run(qg: &QueryGraph, query: &OrphansQuery) -> OrphansResult {
             continue;
         }
 
+        let components: BTreeSet<String> = incoming
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Produces || e.kind == EdgeKind::Consumes)
+            .filter_map(|e| qg.component_of(&e.from).map(str::to_string))
+            .collect();
+        if let Some(filter) = &query.component {
+            if !filter.is_empty() && components.is_disjoint(filter) {
+                continue;
+            }
+        }
+
         let entry = OrphanContract {
             contract_id: node.id.clone(),
             category: c.category.clone(),
@@ -86,6 +118,7 @@ pub fn run(qg: &QueryGraph, query: &OrphansQuery) -> OrphansResult {
                 .as_ref()
                 .map(|q| q.render_capped(consts::SIGNATURE_CAP)),
             value: c.value.render_capped(consts::SIGNATURE_CAP),
+            components: components.into_iter().collect(),
         };
 
         if has_consumer {
@@ -226,6 +259,7 @@ mod tests {
             &OrphansQuery {
                 category: Some("metric_name".to_string()),
                 limit: DEFAULT_LIMIT,
+                component: None,
             },
         );
 
@@ -244,6 +278,7 @@ mod tests {
             &OrphansQuery {
                 category: Some("env_var".to_string()),
                 limit: DEFAULT_LIMIT,
+                component: None,
             },
         );
         assert!(result.consumed_never_produced.is_empty());

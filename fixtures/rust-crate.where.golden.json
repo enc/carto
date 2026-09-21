@@ -1,6 +1,7 @@
 {
   "matches": [
     {
+      "component": null,
       "id": "6b3204814809105e",
       "location": "src/orders.rs:6-8",
       "name": "summary",

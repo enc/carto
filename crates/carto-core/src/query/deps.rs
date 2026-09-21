@@ -40,6 +40,13 @@ pub struct DepsQuery {
     /// unconditionally would break that common case (see
     /// `resolve_target`). `None` means no restriction.
     pub subpath: Option<String>,
+    /// Restrict *reported* rows to nodes in one of these components
+    /// (ADR-0034/0035, `--component`, repeatable) — see
+    /// [`QueryGraph::component_in_scope`]. Same traversal-vs-reporting
+    /// split as `subpath`, and the same tiebreaker-only role in
+    /// `resolve_target`. `None` or empty means no restriction;
+    /// independent of `subpath` (both given means both apply).
+    pub component: Option<BTreeSet<String>>,
 }
 
 impl DepsQuery {
@@ -50,6 +57,7 @@ impl DepsQuery {
             depth: 1,
             kinds: None,
             subpath: None,
+            component: None,
         }
     }
 }
@@ -66,6 +74,10 @@ pub struct NodeSummary {
     pub label: String,
     /// `path:start-end` (spec §7.2), only present for `Symbol` nodes.
     pub location: Option<String>,
+    /// The component (ADR-0034/0035) this node belongs to — `None` for
+    /// a `Module`/`Contract` node (no component of their own) or a
+    /// `File`/`Symbol` under no recognized project root.
+    pub component: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,6 +98,16 @@ pub struct DepEdge {
     /// a legibility gap this flag exists to close without changing the
     /// data model.
     pub same_file_as_root: bool,
+    /// Whether this edge's node shares `root`'s component
+    /// (ADR-0034/0035) — the exact analogue of `same_file_as_root`,
+    /// same gating: `false` whenever either side is a `Module`/
+    /// `Contract` node (no component to compare, `owning_file` is
+    /// `None`), `true` only when both sides have an owning file *and*
+    /// that file's `component` matches — including both being `None`,
+    /// so a repo with no components anywhere reports `true` for every
+    /// same-file-kind pair the way `same_file_as_root` already does,
+    /// rather than reading as "definitely a cross-component edge."
+    pub same_component_as_root: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -157,9 +179,16 @@ pub fn run(qg: &QueryGraph, query: &DepsQuery) -> Result<DepsResult> {
         ));
     }
 
-    let root_id = resolve_target(qg, &query.target, query.subpath.as_deref())?;
+    let root_id = resolve_target(
+        qg,
+        &query.target,
+        query.subpath.as_deref(),
+        query.component.as_ref(),
+    )?;
     let root = summarize(qg, &root_id);
     let root_file = owning_file(qg, &root_id);
+    // Captured before `root_id` moves into `frontier` below.
+    let root_component: Option<String> = qg.component_of(&root_id).map(str::to_string);
     let root_unresolved_calls = match qg.node(&root_id).map(|n| &n.data) {
         Some(NodeData::Symbol(s)) => s.unresolved_calls.clone(),
         _ => Vec::new(),
@@ -215,9 +244,16 @@ pub fn run(qg: &QueryGraph, query: &DepsQuery) -> Result<DepsResult> {
                 // that dips outside `--subpath` and back must not be
                 // silently broken). Only whether this edge gets
                 // *reported* is scoped.
-                if qg.path_in_scope(&other, query.subpath.as_deref()) {
-                    let same_file_as_root = match (&root_file, owning_file(qg, &other)) {
-                        (Some(rf), Some(of)) => *rf == of,
+                if qg.path_in_scope(&other, query.subpath.as_deref())
+                    && qg.component_in_scope(&other, query.component.as_ref())
+                {
+                    let other_file = owning_file(qg, &other);
+                    let same_file_as_root = match (&root_file, &other_file) {
+                        (Some(rf), Some(of)) => rf == of,
+                        _ => false,
+                    };
+                    let same_component_as_root = match (&root_file, &other_file) {
+                        (Some(_), Some(_)) => root_component.as_deref() == qg.component_of(&other),
                         _ => false,
                     };
                     edges_this_hop.push(DepEdge {
@@ -227,6 +263,7 @@ pub fn run(qg: &QueryGraph, query: &DepsQuery) -> Result<DepsResult> {
                         direction,
                         node: summarize(qg, &other),
                         same_file_as_root,
+                        same_component_as_root,
                     });
                 }
                 next_frontier.push(other);
@@ -256,16 +293,27 @@ pub fn run(qg: &QueryGraph, query: &DepsQuery) -> Result<DepsResult> {
 
     let truncation = match (hit_depth_cap, query.depth < consts::MAX_DEPS_DEPTH) {
         (true, true) => {
-            // Carries --subpath forward too, if set — spec §7.2's "the
-            // exact follow-up call to get more" should reproduce the
-            // same scoped view, not silently drop the restriction.
+            // Carries --subpath/--component forward too, if set — spec
+            // §7.2's "the exact follow-up call to get more" should
+            // reproduce the same scoped view, not silently drop either
+            // restriction.
             let subpath_flag = query
                 .subpath
                 .as_deref()
                 .map(|s| format!(" --subpath {s}"))
                 .unwrap_or_default();
+            let component_flag = query
+                .component
+                .as_ref()
+                .filter(|c| !c.is_empty())
+                .map(|c| {
+                    c.iter()
+                        .map(|name| format!(" --component {name}"))
+                        .collect::<String>()
+                })
+                .unwrap_or_default();
             Truncation::more(format!(
-                "carto deps {} --dir {} --depth {}{subpath_flag}",
+                "carto deps {} --dir {} --depth {}{subpath_flag}{component_flag}",
                 query.target,
                 query.dir.as_str(),
                 query.depth + 1
@@ -335,22 +383,34 @@ impl Candidate {
 /// otherwise-ambiguous name (e.g. the same symbol name present in a live
 /// tree and in some unrelated vendored/dead-code directory) — a side
 /// effect of narrowing the candidate set, not a separate mechanism, and
-/// never invoked for a name that was already unambiguous. Zero matches
-/// or more than one match (after any tiebreak attempt) are both
-/// `UserError`s (INV-8's honesty rule, applied to the CLI surface: no
-/// silent pick among ambiguous candidates) — the multi-match case lists
-/// every candidate's ID so the caller can re-run with one.
-fn resolve_target(qg: &QueryGraph, target: &str, subpath: Option<&str>) -> Result<NodeId> {
+/// never invoked for a name that was already unambiguous. `component`
+/// (ADR-0034/0035, `--component`) is the exact same tiebreaker-only
+/// shape, alongside `subpath` rather than instead of it — a name
+/// ambiguous even after applying both stays ambiguous, listing every
+/// remaining candidate. Zero matches or more than one match (after any
+/// tiebreak attempt) are both `UserError`s (INV-8's honesty rule,
+/// applied to the CLI surface: no silent pick among ambiguous
+/// candidates) — the multi-match case lists every candidate's ID so the
+/// caller can re-run with one.
+fn resolve_target(
+    qg: &QueryGraph,
+    target: &str,
+    subpath: Option<&str>,
+    component: Option<&BTreeSet<String>>,
+) -> Result<NodeId> {
     if let Some(node) = qg.nodes().find(|n| n.id.as_str() == target) {
         return Ok(node.id.clone());
     }
 
-    let candidates = |scope: Option<&str>| -> Vec<Candidate> {
+    let candidates = |subpath_scope: Option<&str>,
+                      component_scope: Option<&BTreeSet<String>>|
+     -> Vec<Candidate> {
         let find_query = FindQuery {
             needle: target.to_string(),
             exact: true,
             limit: usize::MAX,
-            subpath: scope.map(str::to_string),
+            subpath: subpath_scope.map(str::to_string),
+            component: component_scope.cloned(),
         };
         let found = find(qg, &find_query);
         let mut out: Vec<Candidate> = found
@@ -366,7 +426,10 @@ fn resolve_target(qg: &QueryGraph, target: &str, subpath: Option<&str>) -> Resul
         );
         for node in qg.nodes() {
             if let NodeData::File(f) = &node.data {
-                if f.path == target && qg.path_in_scope(&node.id, scope) {
+                if f.path == target
+                    && qg.path_in_scope(&node.id, subpath_scope)
+                    && qg.component_in_scope(&node.id, component_scope)
+                {
                     out.push(Candidate::File(node.id.clone(), f.path.clone()));
                 }
             }
@@ -374,9 +437,9 @@ fn resolve_target(qg: &QueryGraph, target: &str, subpath: Option<&str>) -> Resul
         out
     };
 
-    let unscoped = candidates(None);
-    let matches = if unscoped.len() > 1 && subpath.is_some() {
-        candidates(subpath)
+    let unscoped = candidates(None, None);
+    let matches = if unscoped.len() > 1 && (subpath.is_some() || component.is_some()) {
+        candidates(subpath, component)
     } else {
         unscoped
     };
@@ -412,24 +475,28 @@ fn owning_file(qg: &QueryGraph, id: &NodeId) -> Option<NodeId> {
 }
 
 fn summarize(qg: &QueryGraph, id: &NodeId) -> NodeSummary {
+    let component = qg.component_of(id).map(str::to_string);
     match qg.node(id).map(|n| &n.data) {
         Some(data @ NodeData::File(f)) => NodeSummary {
             id: id.clone(),
             kind: data.kind_str().to_string(),
             label: f.path.clone(),
             location: None,
+            component,
         },
         Some(data @ NodeData::Symbol(s)) => NodeSummary {
             id: id.clone(),
             kind: data.kind_str().to_string(),
             label: s.name.clone(),
             location: Some(qg.location(s)),
+            component,
         },
         Some(data @ NodeData::Module(m)) => NodeSummary {
             id: id.clone(),
             kind: data.kind_str().to_string(),
             label: m.path.clone(),
             location: None,
+            component,
         },
         // `value` is tainted (ADR-0026) — `render_capped` is the INV-5
         // accessor, same as every other tainted-field-to-plain-`String`
@@ -439,6 +506,7 @@ fn summarize(qg: &QueryGraph, id: &NodeId) -> NodeSummary {
             kind: data.kind_str().to_string(),
             label: c.value.render_capped(crate::consts::SIGNATURE_CAP),
             location: None,
+            component,
         },
         // A dangling reference would mean the graph itself is malformed
         // (persist's own `validate_edge_endpoints` should prevent this at
@@ -448,6 +516,7 @@ fn summarize(qg: &QueryGraph, id: &NodeId) -> NodeSummary {
             kind: "unknown".to_string(),
             label: "<missing>".to_string(),
             location: None,
+            component,
         },
     }
 }
@@ -646,6 +715,7 @@ mod tests {
             depth: 2,
             kinds: None,
             subpath: Some("mg_site".to_string()),
+            component: None,
         };
         let result = run(&qg, &query).unwrap();
 
@@ -668,6 +738,7 @@ mod tests {
                 depth: 2,
                 kinds: None,
                 subpath: None,
+                component: None,
             },
         )
         .unwrap();
@@ -695,6 +766,7 @@ mod tests {
             depth: 1,
             kinds: None,
             subpath: Some("mg_site".to_string()),
+            component: None,
         };
         let result = run(&qg, &query).unwrap();
         assert_eq!(result.root.id, live_sym.id);
@@ -721,6 +793,7 @@ mod tests {
             depth: 1,
             kinds: None,
             subpath: None,
+            component: None,
         };
         let result = run(&qg, &query).unwrap();
         assert_eq!(result.hops[0].edges.len(), 1);
@@ -743,6 +816,7 @@ mod tests {
                 depth: 2,
                 kinds: None,
                 subpath: None,
+                component: None,
             },
         )
         .unwrap();
@@ -759,6 +833,7 @@ mod tests {
             depth: consts::MAX_DEPS_DEPTH + 1,
             kinds: None,
             subpath: None,
+            component: None,
         };
         let err = run(&qg, &query).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::UserError);
@@ -791,6 +866,7 @@ mod tests {
             depth: consts::MAX_DEPS_DEPTH,
             kinds: None,
             subpath: None,
+            component: None,
         };
         // Must terminate (this test would hang forever on an unbounded
         // cyclic BFS with no visited set) and report exactly one hop:
@@ -828,6 +904,7 @@ mod tests {
             depth: 1,
             kinds: Some(kinds),
             subpath: None,
+            component: None,
         };
         let result = run(&qg, &query).unwrap();
         assert_eq!(result.hops[0].edges.len(), 1);
@@ -897,6 +974,7 @@ mod tests {
                 depth: 1,
                 kinds: None,
                 subpath: None,
+                component: None,
             },
         )
         .unwrap();
@@ -945,6 +1023,7 @@ mod tests {
                 depth: 1,
                 kinds: None,
                 subpath: None,
+                component: None,
             },
         )
         .unwrap();
@@ -1059,6 +1138,7 @@ mod tests {
             depth: 1,
             kinds: Some(kinds),
             subpath: None,
+            component: None,
         };
         let result = run(&qg, &query).unwrap();
         assert_eq!(result.root_unresolved_calls.len(), 1);
@@ -1112,6 +1192,7 @@ mod tests {
             depth: 1,
             kinds: Some(kinds),
             subpath: None,
+            component: None,
         };
         let result = run(&qg, &query).unwrap();
         assert_eq!(result.root_uncaptured_outbound_calls, 6);
@@ -1136,10 +1217,12 @@ mod tests {
                 InboundCallSite {
                     file: "src/CancelQueryUseCase.cs".to_string(),
                     line: 77,
+                    component: None,
                 },
                 InboundCallSite {
                     file: "src/GetQueryStatusUseCase.cs".to_string(),
                     line: 102,
+                    component: None,
                 },
             ],
             2,
@@ -1155,10 +1238,12 @@ mod tests {
                 InboundCallSite {
                     file: "src/CancelQueryUseCase.cs".to_string(),
                     line: 77,
+                    component: None,
                 },
                 InboundCallSite {
                     file: "src/GetQueryStatusUseCase.cs".to_string(),
                     line: 102,
+                    component: None,
                 },
             ]
         );
@@ -1190,6 +1275,7 @@ mod tests {
             depth: 1,
             kinds: None,
             subpath: None,
+            component: None,
         };
         let result = run(&qg, &query).unwrap();
         assert!(result.truncation.truncated);
@@ -1208,6 +1294,7 @@ mod tests {
             depth: consts::MAX_DEPS_DEPTH,
             kinds: None,
             subpath: None,
+            component: None,
         };
         let result = run(&qg, &query).unwrap();
         assert!(!result.truncation.truncated);

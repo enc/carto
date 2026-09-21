@@ -17,6 +17,7 @@ fn main() {
         location: "src/lib.rs:1-2".to_string(),
         signature: Some(TaintedString::new("fn foo()", Provenance::Syntactic)),
         provenance: Provenance::Syntactic,
+        component: None,
     };
     if let Some(sig) = &m.signature {
         println!("{}", sig);

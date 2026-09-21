@@ -10,6 +10,7 @@ use carto_core::query::{self, FindQuery, QueryGraph};
 use carto_core::taint::TaintedString;
 use carto_core::{consts, graph, target};
 use clap::Args;
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 #[derive(Args)]
@@ -40,17 +41,32 @@ pub struct WhereArgs {
     /// scope an already-built `--out` index by itself.
     #[arg(long)]
     subpath: Option<String>,
+
+    /// Restrict matches to one of these components (repeatable, e.g.
+    /// `--component orders --component billing`). A component is a
+    /// project root carto detected inside the repo (or one declared in
+    /// `.carto/roots.json`) — see `carto map --section components`.
+    /// Independent of `--subpath`; both given means both apply.
+    #[arg(long)]
+    component: Vec<String>,
 }
 
 pub fn run(args: &WhereArgs) -> Result<query::FindResult> {
     let target = target::resolve(&args.path, &args.out)?;
     let doc = graph::load(&target.out_root)?;
     let qg = QueryGraph::from_document(doc);
+    let component = if args.component.is_empty() {
+        None
+    } else {
+        Some(args.component.iter().cloned().collect::<BTreeSet<_>>())
+    };
+    qg.validate_component_filter(component.as_ref())?;
     let find_query = FindQuery {
         needle: args.needle.clone(),
         exact: args.exact,
         limit: args.limit,
         subpath: args.subpath.clone(),
+        component,
     };
     Ok(query::find(&qg, &find_query))
 }
@@ -70,7 +86,17 @@ pub fn print_human(result: &query::FindResult) {
         println!("{}", consts::FENCE_OPEN);
     }
     for m in &result.matches {
-        println!("{}  {}  {}", m.name, m.sym_kind.as_str(), m.location);
+        let component = m
+            .component
+            .as_deref()
+            .map(|c| format!("  [{c}]"))
+            .unwrap_or_default();
+        println!(
+            "{}  {}  {}{component}",
+            m.name,
+            m.sym_kind.as_str(),
+            m.location
+        );
         if let Some(sig) = &m.signature {
             println!("    {}", capped(sig));
         }
