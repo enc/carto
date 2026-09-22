@@ -209,6 +209,30 @@ fn rust_subtable_path_dependency_resolves() {
 }
 
 #[test]
+fn rust_inline_table_path_dependency_resolves_when_the_dependency_name_contains_the_key_as_a_substring()
+ {
+    // `line.find("path")` would previously match inside `path_two`
+    // itself (the dependency's own name), before the real `path =`
+    // attribute later on the same line -- the real attribute must
+    // still be found, not hidden behind that earlier false match.
+    let dir = TempDir::new("rust-inline-name-collides-with-key");
+    std::fs::create_dir_all(dir.path().join("crates/a")).unwrap();
+    std::fs::create_dir_all(dir.path().join("crates/path_two")).unwrap();
+    std::fs::write(
+        dir.path().join("crates/a/Cargo.toml"),
+        "[package]\nname = \"a\"\n\n[dependencies]\npath_two = { path = \"../path_two\" }\n",
+    )
+    .unwrap();
+    let mut components = vec![
+        component("a", "crates/a", "rust"),
+        component("path_two", "crates/path_two", "rust"),
+    ];
+    resolve(dir.path(), &mut components);
+    let a = components.iter().find(|c| c.name == "a").unwrap();
+    assert_eq!(a.depends_on, vec!["path_two".to_string()]);
+}
+
+#[test]
 fn rust_version_only_dependency_produces_no_component_dependency() {
     let dir = TempDir::new("rust-version-only");
     std::fs::create_dir_all(dir.path().join("crates/a")).unwrap();

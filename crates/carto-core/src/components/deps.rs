@@ -283,18 +283,33 @@ fn parse_cargo_path_deps(content: &str) -> Vec<String> {
 /// Finds `key`, then `=`, then a quoted string — anywhere in `line`, so
 /// this matches both `name = { path = "../x" }` (an inline table on one
 /// line, inside `[dependencies]`) and a bare `path = "../x"` line
-/// inside a `[dependencies.name]` sub-table.
+/// inside a `[dependencies.name]` sub-table. Tries every occurrence of
+/// `key` in the line, left to right, not just the first — a dependency
+/// whose own name happens to contain `key` as a substring (a crate
+/// named `path_two`, say: `path_two = { path = "../path_two" }`) would
+/// otherwise have its real `path = "…"` attribute hidden behind an
+/// earlier, non-matching occurrence of the word inside the name itself.
 fn extract_quoted_after(line: &str, key: &str) -> Option<String> {
-    let idx = line.find(key)?;
-    let rest = line[idx + key.len()..].trim_start();
-    let rest = rest.strip_prefix('=')?.trim_start();
-    let quote = rest.chars().next()?;
-    if quote != '"' && quote != '\'' {
-        return None;
+    let mut search_from = 0;
+    while let Some(rel_idx) = line[search_from..].find(key) {
+        let idx = search_from + rel_idx;
+        search_from = idx + key.len();
+        let Some(rest) = line[search_from..].trim_start().strip_prefix('=') else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let Some(quote) = rest.chars().next() else {
+            continue;
+        };
+        if quote != '"' && quote != '\'' {
+            continue;
+        }
+        let inner = &rest[1..];
+        if let Some(end) = inner.find(quote) {
+            return Some(inner[..end].to_string());
+        }
     }
-    let inner = &rest[1..];
-    let end = inner.find(quote)?;
-    Some(inner[..end].to_string())
+    None
 }
 
 fn resolve_rust(
