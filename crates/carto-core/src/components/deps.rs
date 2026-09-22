@@ -289,11 +289,27 @@ fn parse_cargo_path_deps(content: &str) -> Vec<String> {
 /// named `path_two`, say: `path_two = { path = "../path_two" }`) would
 /// otherwise have its real `path = "…"` attribute hidden behind an
 /// earlier, non-matching occurrence of the word inside the name itself.
+/// Only a *standalone* occurrence of `key` counts — not immediately
+/// preceded or followed by another identifier character — so `path`
+/// doesn't match inside `ignored_path` (a different, unrelated key that
+/// merely contains it as a substring) and `Include` doesn't match
+/// inside `IncludeAssets` (a real, different MSBuild/NuGet attribute).
+/// Without this, a malformed real attribute (an unquoted value, so the
+/// loop's own retry logic moves past it) could fall through to such a
+/// substring-colliding attribute later on the same line and return its
+/// value instead — a fabricated match, not merely a missed one.
 fn extract_quoted_after(line: &str, key: &str) -> Option<String> {
+    let is_ident_char = |c: char| c.is_alphanumeric() || c == '_' || c == '-';
     let mut search_from = 0;
     while let Some(rel_idx) = line[search_from..].find(key) {
         let idx = search_from + rel_idx;
-        search_from = idx + key.len();
+        let after = idx + key.len();
+        search_from = after;
+        let preceded_by_ident = line[..idx].chars().next_back().is_some_and(is_ident_char);
+        let followed_by_ident = line[after..].chars().next().is_some_and(is_ident_char);
+        if preceded_by_ident || followed_by_ident {
+            continue;
+        }
         let Some(rest) = line[search_from..].trim_start().strip_prefix('=') else {
             continue;
         };

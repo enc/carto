@@ -233,6 +233,57 @@ fn rust_inline_table_path_dependency_resolves_when_the_dependency_name_contains_
 }
 
 #[test]
+fn extract_quoted_after_does_not_fall_through_a_malformed_key_to_a_substring_colliding_one() {
+    // The multi-occurrence retry (added for the `path_two` case above)
+    // must not itself fabricate a match: a malformed (unquoted) real
+    // `path` value must not let the search fall through to a *different*
+    // key later on the same line just because that key's name contains
+    // "path" as a substring.
+    let line = "foo = { path = something_bareword, ignored_path = \"spurious/value\" }";
+    assert_eq!(extract_quoted_after(line, "path"), None);
+}
+
+#[test]
+fn extract_quoted_after_does_not_match_a_key_that_is_a_prefix_of_a_longer_identifier() {
+    // Same failure shape, opposite side: `Include` must not match
+    // inside `IncludeAssets` (a real, different MSBuild/NuGet
+    // attribute) when the real `Include` attribute is itself malformed.
+    let line = "<ProjectReference Include=bad IncludeAssets=\"all\" />";
+    assert_eq!(extract_quoted_after(line, "Include"), None);
+}
+
+#[test]
+fn extract_quoted_after_still_finds_a_standalone_key_after_a_prefix_collision() {
+    // The word-boundary check must not be so strict it rejects a real,
+    // well-formed key just because an unrelated longer identifier
+    // sharing its prefix appears earlier on the same line.
+    let line = "<ProjectReference IncludeAssets=\"all\" Include=\"../Other/Other.csproj\" />";
+    assert_eq!(
+        extract_quoted_after(line, "Include"),
+        Some("../Other/Other.csproj".to_string())
+    );
+}
+
+#[test]
+fn dotnet_include_assets_attribute_is_never_mistaken_for_a_project_reference() {
+    let dir = TempDir::new("dotnet-include-assets-collision");
+    std::fs::create_dir_all(dir.path().join("services/a")).unwrap();
+    std::fs::create_dir_all(dir.path().join("services/b")).unwrap();
+    std::fs::write(
+        dir.path().join("services/a/A.csproj"),
+        "<Project>\n  <ItemGroup>\n    <ProjectReference Include=\"..\\b\\B.csproj\" IncludeAssets=\"all\" />\n  </ItemGroup>\n</Project>\n",
+    )
+    .unwrap();
+    let mut components = vec![
+        component("a", "services/a", "dotnet"),
+        component("b", "services/b", "dotnet"),
+    ];
+    resolve(dir.path(), &mut components);
+    let a = components.iter().find(|c| c.name == "a").unwrap();
+    assert_eq!(a.depends_on, vec!["b".to_string()]);
+}
+
+#[test]
 fn rust_version_only_dependency_produces_no_component_dependency() {
     let dir = TempDir::new("rust-version-only");
     std::fs::create_dir_all(dir.path().join("crates/a")).unwrap();
