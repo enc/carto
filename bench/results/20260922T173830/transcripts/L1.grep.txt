@@ -1,0 +1,31 @@
+Now I have enough for a structural picture. Here's the orientation.
+
+## Zed — structural orientation
+
+**Shape:** A Cargo **workspace**, not a single crate — 245 member crates under `crates/`, plus `extensions/` (bundled extensions) and `tooling/`. ~1,970 Rust source files, ~117MB on disk (includes `Cargo.lock`, assets, docs). It's the [zed-industries/zed](https://github.com/zed-industries/zed) code editor.
+
+**Main pieces, by layer:**
+
+- **`gpui`** — the custom UI/application framework (not a generic GUI toolkit pulled from crates.io). Owns windows, the entity/context system, elements, layout (via `taffy`), text rendering, input, platform abstraction. Split further into `gpui_macros`, `gpui_platform`, and per-OS backends `gpui_apple`/`gpui_macos`/`gpui_linux`/`gpui_windows`/`gpui_web`, plus `gpui_wgpu` for rendering and `gpui_tokio` for async bridging. Everything else in the repo is built on top of this.
+
+- **`zed`** — the actual application binary (`crates/zed/src/main.rs`), which wires together all the feature crates into the running editor.
+
+- **Editing core** — `editor`, `multi_buffer`, `text`, `rope`, `buffer_diff`, `language`/`language_core`, `syntax_theme`, `outline`, `snippet*` — the text-buffer and syntax-aware editing machinery.
+
+- **Project/workspace model** — `project`, `worktree`, `workspace`, `fs`, `file_finder`, `search`, `settings`/`settings_content` — file-system and multi-pane workspace state.
+
+- **Language tooling** — `lsp`, `dap`/`dap_adapters`/`debugger_ui` (Debug Adapter Protocol), `context_server`, `prettier`, `extension`/`extension_host`/`extension_api` (the extension system), `languages` (bundled language configs), `grammars` (tree-sitter grammars).
+
+- **AI/agent features** — a large cluster: `agent`, `agent_ui`, `agent_servers`, `acp_thread`/`acp_tools` (Agent Client Protocol), `edit_prediction*`, `language_model*`, plus provider crates (`anthropic`, `open_ai`, `bedrock`, `google_ai`, `ollama`, `mistral`, `deepseek`, `copilot`, `x_ai`, etc.) — reflecting Zed's heavy investment in AI-assisted coding.
+
+- **Collaboration** — `collab` (the server), `collab_ui`, `call`, `channel`, `rpc`/`proto`, `livekit_api`/`livekit_client` — real-time multiplayer editing and voice/video.
+
+- **UI component layer** — `ui`, `ui_input`, `title_bar`, `picker`, `theme`/`theme_extension`, `component`/`component_preview` — the design-system widgets built on `gpui` primitives.
+
+- **Terminal, git, VCS** — `terminal`/`terminal_view`, `git`/`git_ui`.
+
+- **Persistence/infra** — `db`, `sqlez`/`sqlez_macros` (SQLite wrapper), `sum_tree` (the persistent B-tree used pervasively for buffers/collections), `settings_json`, `telemetry`.
+
+- **Supporting utility crates** — `util`, `collections`, `paths`, `clock`, `watch`, `scheduler`, `net`, `http_client*` — small, widely-depended-on building blocks.
+
+The overall architecture: `gpui` is the foundation everything renders/reacts through (entities + contexts + elements, per the GPUI conventions in this repo's `CLAUDE.md`); domain logic (buffers, projects, LSP, git, AI) lives in focused crates that compose into `workspace`/`editor`; and the `zed` binary crate assembles it all into the shipped app. `collab` is a separate server binary sharing the `rpc`/`proto` protocol crates with the client.

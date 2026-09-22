@@ -1,0 +1,19 @@
+If `graph::load`'s signature (`pub fn load(out_root: &Path) -> Result<GraphDocument>`, defined `crates/carto-core/src/graph/load.rs:23-78`) changes, these call sites need updating:
+
+**CLI (`crates/carto-cli/src/`)** — each does `graph::load(&target.out_root)?`:
+- `deps_cmd.rs:80`
+- `map_cmd.rs:80`
+- `orphans_cmd.rs:42`
+- `contract_cmd.rs:45`
+- `where_cmd.rs:56`
+
+**MCP server (`crates/carto-mcp/src/tools/`)** — each does `graph::load(&t.out_root).map_err(...)`:
+- `deps_tool.rs:68`
+- `map_tool.rs:48`
+- `orphans_tool.rs:32`
+- `contract_tool.rs:43`
+- `where_tool.rs:51`
+
+Plus the re-export point itself: `crates/carto-core/src/graph/mod.rs:20` (`pub use load::load;`).
+
+One caveat: carto's own `deps --dir in` on this symbol only surfaced same-file unit-test callers and flagged `root_uncaptured_inbound_calls: 15` — every real caller above invokes it as the path-qualified `graph::load(...)`, which is exactly the Rust `module::func()` call shape its extractor deliberately never attempts to resolve (a documented gap, not a bug). The list above comes from a direct grep, not the `deps` traversal.

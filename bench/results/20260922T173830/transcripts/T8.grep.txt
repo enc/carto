@@ -1,0 +1,15 @@
+`carto_core::indexer::build_and_persist` (crates/carto-core/src/indexer.rs:44) directly calls/depends on:
+
+1. **`pathguard::PathGuard::new`** — constructs the write-confinement guard (INV-3/INV-4) from `repo_root`/`out_root`.
+2. **`walk::walk`** — walks `repo_root` into `walked.nodes` (`File` nodes), honoring `respect_gitignore`.
+3. **`components::ComponentSet::discover`** — recognizes project roots/components from the walked file nodes (ADR-0034/0035).
+4. **`graph::NodeData::File`** — pattern-matched directly to stamp `file.component` via `components.component_of_path`.
+5. **`lang::extract_and_resolve`** — per-file extraction + whole-repo resolution, producing `resolved.nodes`/`resolved.edges` (Symbol/Module nodes, contains/imports/calls/references edges).
+6. **`graph::Graph::new` / `Graph::insert_node` / `Graph::insert_edge`** — builds the in-memory graph from walked file nodes plus resolved nodes/edges.
+7. **`gitinfo::head_sha`** — reads the repo's current commit SHA for the manifest.
+8. **`graph::PersistMeta`** — struct built from commit sha, `walked.ignore_rule_digest`, `walked.file_sha256`, and `components.config_digest()`.
+9. **`graph::persist`** — the sole write choke-point (sort → redact → validate → size caps → atomic write through the `PathGuard`), given the graph, meta, and `components.components_sorted_by_path()`.
+10. **`components.components()` / `components.components_sorted_by_path()` / `components.config_digest()`** — used for the component count, persisted component table, and manifest digest.
+11. Returns `error::Result<IndexReport>`, its own `Serialize` struct (`crate::error::Result`).
+
+So the full direct dependency set is: `pathguard`, `walk`, `components::ComponentSet`, `graph::NodeData`/`Graph`/`PersistMeta`/`persist`, `lang::extract_and_resolve`, `gitinfo::head_sha`, and `error::Result` — matching the module doc's "walk → lang::extract_and_resolve → Graph → graph::persist" pipeline, with `ComponentSet` and `gitinfo` as the two extra pieces threaded in alongside it.

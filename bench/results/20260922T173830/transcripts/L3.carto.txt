@@ -1,0 +1,33 @@
+Based on carto's `deps` graph (all edges `certain` confidence, kind `imports`), these 24 files directly import from the `carto_core` crate:
+
+**crates/carto-cli/src/**
+- main.rs
+- contract_cmd.rs
+- map_cmd.rs
+- index.rs
+- deps_cmd.rs
+- component_arg.rs
+- selfcheck.rs
+- where_cmd.rs
+- orphans_cmd.rs
+
+**crates/carto-mcp/src/**
+- render.rs
+- server.rs
+- tools/orphans_tool.rs
+- tools/index_tool.rs
+- tools/contract_tool.rs
+- tools/map_tool.rs
+- tools/deps_tool.rs
+- tools/selfcheck_tool.rs
+- tools/where_tool.rs
+
+**crates/carto-core/tests/ui/** (the trybuild compile-fail suite for INV-5)
+- no_deref.rs
+- no_display_via_query_result.rs
+- no_into_string.rs
+- no_display.rs
+- no_as_ref_str.rs
+- no_field_access.rs
+
+Two entries (`main.rs`, `deps_tool.rs`) carry `external-package-bare-reference` evidence alongside `external-package` — meaning at least one import there is a bare fully-qualified path (`carto_core::...`) with no `use` statement, per carto's Rust-import heuristic.

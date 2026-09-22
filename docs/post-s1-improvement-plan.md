@@ -5,11 +5,16 @@
 `bench/field-log.md`) · **Status:** slices 1–4 of the slice order below
 are **implemented** (ADRs 0020–0022; `docs/STATUS.md`'s milestone entry
 has the full list). Slice order step 5 (re-running `bench/run.sh` as a
-full three-arm batch against these changes) is **not yet run** — a
-separate measurement round the user approves independently, per spec
-§11.4. Written in response to the S-1 result, at the user's request, to
-turn "neither threshold met" into a concrete next-slice plan rather
-than a dead end.
+full three-arm batch against these changes) **ran 2026-09-22** — see
+ADR-0040 and `bench/results/20260922T173830/`: neither S-1 threshold
+met, same headline as ADR-0019, but accuracy fully reversed in carto's
+favor (87.5%→100%, was −6.2 points vs. grep, now +12.5) while token
+cost barely moved (18.0%→15.8% more than grep) — the M3 decision this
+plan's own reasoning (the section below) said to defer until
+re-measured is now the user's to make on current data, per spec §11.4.
+Written in response
+to the S-1 result, at the user's request, to turn "neither threshold
+met" into a concrete next-slice plan rather than a dead end.
 
 ## Why this plan exists instead of a straight M3 go/no-go
 
@@ -315,12 +320,11 @@ showed, not from the original hypothesis:
    re-running S-1 against the same 8 tasks before deciding whether M3
    proceeds — not re-arguing the case from this document alone.
 
-## Suggested slice order (steps 0–4 implemented; step 5 pending)
+## Suggested slice order (steps 0–5 all implemented/run)
 
 0. §0 (`cli` benchmark arm) — **implemented** (`bench/run.sh`, `bench/
-   score.py`, `bench/cli-arm-prompt.md`), smoke-tested, not yet run as a
-   full batch. Runs alongside the next full measurement (step 5), not as
-   a separate pass.
+   score.py`, `bench/cli-arm-prompt.md`), and run as part of step 5's
+   full batch below.
 1. §1.1 (honest absence signal on `deps`) + §3.1 (skill file known-gaps
    section) together — **implemented** (ADR-0020; skill-file wording
    commit). Cheapest, highest-evidence, no new dependencies, directly
@@ -335,12 +339,18 @@ showed, not from the original hypothesis:
    the cross-language check (Python/TS-JS/PHP/C#) was done rather than
    deferred — none of the other four extractors shared the failure mode,
    so no further language-specific work followed from it.
-5. **Not yet run.** Re-run `bench/run.sh` against the same 8 tasks, now
-   with all three arms (grep, cli, carto-MCP) and steps 0–4's changes in
-   place. Compare against this session's `bench/results/20260803T112447/`
-   baseline (grep/carto only) before deciding on M3 — and let the
-   cli-vs-MCP numbers from this run decide which surface `skill/
-   carto.skill.md`/README lead with, rather than this document's own
-   reasoning in §0. This is a separate measurement round the user
-   approves independently, per spec §11.4 — implementing steps 0–4 does
-   not itself decide the M3 go/no-go question.
+5. **Run 2026-09-22 — ADR-0040, `bench/results/20260922T173830/`.**
+   Re-ran `bench/run.sh` against the same 8 tasks (ground truth
+   re-verified first — six weeks of subsequent work had made some of it
+   stale, one task's provably so), all three arms (grep, cli,
+   carto-MCP), steps 0–4's changes in place. Compared against this
+   session's `bench/results/20260803T112447/` baseline: neither S-1
+   threshold met, but accuracy fully reversed (87.5%→100%, was −6.2
+   points vs. grep, now +12.5) while token cost barely moved
+   (18.0%→15.8% more). cli-vs-MCP: `cli` matches MCP's 100% accuracy at
+   7.7% fewer tokens — real evidence for leading with the CLI surface
+   over MCP in `skill/carto.skill.md`/README, if/when that's revisited.
+   This was a separate measurement round the user approved
+   independently, per spec §11.4 — implementing steps 0–4 didn't itself
+   decide the M3 go/no-go question, and this run's result doesn't
+   either; that call is the user's, presented on current data now.

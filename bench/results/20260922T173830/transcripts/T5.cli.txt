@@ -1,0 +1,13 @@
+Confirmed: `serialize` (taint.rs:134) is production (a `Serialize` impl); the other two are past line 176's `#[cfg(test)]`, so test-only.
+
+## Direct production callers of `TaintedString::render_capped`
+
+1. **`capped`** — `crates/carto-cli/src/where_cmd.rs:124-126`
+2. **`capped`** — `crates/carto-mcp/src/tools/where_tool.rs:121-123`
+3. **`run`** — `crates/carto-core/src/query/orphans.rs:80-162`
+4. **`run`** — `crates/carto-core/src/query/contract.rs:73-133`
+5. **`summarize`** — `crates/carto-core/src/query/deps.rs:468-513`
+6. **`redact_tainted_string`** — `crates/carto-core/src/redact/mod.rs:102-127`
+7. **`serialize`** (the `Serialize` impl) — `crates/carto-core/src/taint.rs:134-136`
+
+Excluded from carto's raw `deps --dir in` list: three call sites inside `#[cfg(test)]` blocks in `taint.rs` and `redact/mod.rs` (test functions, not production). All edges above are `inferred` confidence per carto's honesty contract for `calls` edges — worth a quick eyeball if this matters for something security-sensitive, though these all read as straightforward direct calls.

@@ -1,0 +1,11 @@
+This is a 4-crate Cargo workspace with exactly **one binary**:
+
+## Binary
+- **`carto`** — `crates/carto-cli/src/main.rs` (bin target of the `carto-cli` package). Thin dispatch: `main.rs` → `run(cli) -> Result<u8>`, mounts `carto-mcp` behind the `serve` subcommand.
+
+## Library crate roots
+- **`carto-core`** (`crates/carto-core/src/lib.rs`) — the real engine: walk, `lang::extract_and_resolve`, `Graph`, persist/redact/pathguard, query. No clap, no rmcp, no I/O besides fs.
+- **`carto-mcp`** (`crates/carto-mcp/src/lib.rs`) — hand-rolled MCP stdio server (JSON-RPC 2.0), depends only on `carto-core`; consumed by `carto-cli`'s `serve` subcommand, not run standalone.
+- **`carto-grammars`** (`crates/carto-grammars/src/lib.rs`) — tree-sitter grammar loading; the workspace's one `unsafe_code`-allowed crate (though it currently contains no actual `unsafe`).
+
+So the dependency chain is `carto-cli` (bin) → `carto-mcp` + `carto-core` → `carto-grammars`, with `carto-core` as the crate holding essentially all the logic and `carto-cli` as the only thing that actually produces an executable.

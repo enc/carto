@@ -1,0 +1,23 @@
+Note: the sandbox failed to initialize on an unrelated command and has been disabled for the rest of this session — not something I requested; flagging it since it changes what "sandboxed" means for any further Bash calls here.
+
+## Definition
+
+`crates/util/src/util.rs:95` — truncates a `&str` to `max_chars` Unicode scalar values, appending `…`. It walks `char_indices()` rather than byte-slicing, so it never panics on a multi-byte boundary. It does have `debug_assert!(max_chars >= 5)` — a debug-only panic if `max_chars < 5`, no effect in release.
+
+## Callers, with confidence
+
+**High confidence (fixed literal or constant ≥ 5, no way to violate the invariant):**
+- `agent_ui/agent_diff.rs:686` — literal `20`
+- `agent_ui/conversation_view/thread_view.rs:1730` — literal `200`
+- `git_ui/commit_view.rs:1193` — literal `20`
+- `git_ui/blame_ui.rs:170` — `GIT_BLAME_MAX_AUTHOR_CHARS_DISPLAYED = 20`
+- `terminal/terminal.rs:2996,3029,3030` — `MAX_CHARS = 25` (all three)
+- `tasks_ui/modal.rs:532` — `MAX_TAGS_LINE_LEN = 30`
+- `debugger_ui/dropdown_menus.rs:35,83,314` — `MAX_LABEL_CHARS = 150 / 50 / 150`
+- `search/project_search.rs:1154` — `MAX_TAB_TITLE_LEN = 24` (editor constant)
+- `git_ui/picker_prompt.rs:221` — `max_match_length`, but its only construction site (`picker_prompt.rs:37`) hardcodes `70`
+- `editor/items.rs:794,817` — `params.max_title_len.unwrap_or(MAX_TAB_TITLE_LEN)` (`MAX_TAB_TITLE_LEN = 24`); I checked every place `TabContentParams` is built (`tab_switcher.rs:865` sets `Some(usize::MAX)`, `pane.rs:2859`/`5064` set `None`) — none pass a small value
+- `title_bar/title_bar.rs:808,946` — `MAX_PROJECT_NAME_LENGTH`/`MAX_BRANCH_NAME_LENGTH = 40`
+
+**Lower confidence — latent bug:**
+- `activity_indicator/activity_indicator.rs:634-637`: `truncate_and_trailoff(&single_line_message, MAX_MESSAGE_LEN.saturating_sub(health_str.len()))`, where `MAX_MESSAGE_LEN = 50` and `health_str` is built from a language-server name (e.g. `"(tailwindcss-language-server) Error: "`, already ~38 chars). If a server name is long enough that `health_str.len()` exceeds 45, `saturating_sub` yields a value under 5, tripping the `debug_assert!` (debug/test builds only — a real panic path, not just theoretical). In release it wouldn't panic but would silently truncate to fewer than 5 chars. Server names are typically short today, so this is unlikely to fire in practice, but it's the one call site that isn't provably safe by construction the way the others are.

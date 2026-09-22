@@ -1,0 +1,16 @@
+carto's heuristic list mixes real entry points with noise (Cargo.toml manifests, `.scm` query files, integration-test files, and trybuild fixture `main.rs`s under `tests/ui/`) — filtering those out, the real ones are:
+
+**Binary**
+- `crates/carto-cli/src/main.rs:62` (`fn main`) — the `carto` binary; thin dispatch into `run(cli)`, including the `serve` subcommand that mounts `carto-mcp`.
+
+**Library crate roots**
+- `crates/carto-core/src/lib.rs` — core library (graph, extraction, query, no I/O besides fs).
+- `crates/carto-mcp/src/lib.rs` — MCP stdio server library, depended on by `carto-cli`.
+- `crates/carto-grammars/src/lib.rs` — tree-sitter grammar loading library, depended on by `carto-core`.
+
+Also technically a build-time entry point:
+- `crates/carto-cli/build.rs:11` (`fn main`) — Cargo build script, not a runtime entry point.
+
+The other `main`-named functions carto listed (`crates/carto-core/tests/ui/no_*.rs`) are trybuild compile-fail fixtures for INV-5 enforcement, not program entry points — each is a throwaway snippet the trybuild harness compiles to check it *fails*.
+
+This matches the component dependency chain from `map`'s `components` section: `carto-grammars` ← `carto-core` ← `carto-mcp`, `carto-cli`; and `carto-cli` → `carto-mcp`.

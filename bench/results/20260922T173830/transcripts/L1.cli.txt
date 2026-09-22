@@ -1,0 +1,38 @@
+This is the **Zed editor** repository — a large Rust **Cargo workspace**, not a single crate.
+
+## Scale
+- **245 crates** under `crates/`
+- carto's index: **4,050 files**, **68,374 symbols**, **788 modules**, ~151k call edges — this is a big, mature codebase.
+- Top-level layout: `crates/` (the app), `assets/` (icons, fonts, themes, keymaps, default settings), `extensions/`, `docs/`, `script/`, `ci/`, `nix/`, `tooling/`, `legal/`.
+
+## Main architectural pieces (by import fan-out/fan-in from the map)
+
+**UI/App shell**
+- `crates/zed/src/zed.rs` and `main.rs` — the application entry point, wiring everything together (highest fan-out, 55-69 outbound imports).
+- `crates/gpui/` — Zed's own custom GUI framework (immediate-ish mode UI, entities, async executors); `gpui_linux/` has platform-specific backends (e.g. Wayland client, 61 imports).
+- `crates/workspace/` — pane/window/workspace management (highest fan-in among core crates, 64 outbound).
+- `crates/ui/`-style component crates build on `gpui`.
+
+**Editing core**
+- `crates/editor/src/editor.rs` — the single largest hub in the repo (101 outbound imports) — text editing, selections, multibuffers, etc.
+- `crates/language/` — language server protocol, syntax, buffers.
+- `crates/project/` — project/workspace-wide state (file system, LSP coordination) — 59 outbound imports.
+
+**AI/agent features** (a major subsystem)
+- `crates/agent/`, `crates/agent_ui/`, `crates/agent_servers/`, `crates/agent_settings/`, `crates/agent_skills/`, `crates/acp_thread/`, `crates/acp_tools/` — the "agentic" coding assistant (tools like edit/read/grep/terminal, ACP protocol, thread/conversation UI).
+- `crates/edit_prediction/` — Zed's inline AI prediction feature (55 outbound imports).
+- Model-provider crates: `crates/anthropic/`, `crates/bedrock/`, `crates/codestral/`, `crates/cloud_llm_client/`, `crates/cloud_api_client/`.
+
+**Collaboration/backend**
+- `crates/collab/` — the server-side collab backend (Postgres via `db/tables`, `db/queries`, websocket APIs) — this is effectively a separate service living in the same workspace.
+- `crates/call/`, `crates/channel/`, `crates/client/` — realtime multiplayer/channels/RPC client.
+
+**Foundational/shared utilities**
+- `std`, `gpui`, `anyhow`, `util`, `collections`, `settings`, `futures`, `language`, `log`, `serde_json` are the most depended-upon internal/external packages — `util`, `collections`, and `settings` are Zed's own foundational crates used almost everywhere.
+
+**Distribution/tooling**
+- `crates/cli/` — the `zed` CLI launcher.
+- `crates/auto_update/`, `crates/auto_update_helper/`, `crates/auto_update_ui/` — self-update mechanism.
+- `crates/benchmarks/` — perf benchmarks for editor/display-map/markdown rendering.
+
+In short: a native desktop code editor built on a custom GPU-accelerated GUI framework (`gpui`), with a sizable first-party AI-agent subsystem and an optional collaboration backend, all as one large Cargo workspace.

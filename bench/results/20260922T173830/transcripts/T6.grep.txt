@@ -1,0 +1,22 @@
+That's just doc-comment references, no actual call. So the real call sites are the 9 direct callers plus the definition itself.
+
+## `graph::load`'s callers (would need updating if its signature changes)
+
+**Definition:**
+- `crates/carto-core/src/graph/load.rs:23` — `pub fn load(out_root: &Path) -> Result<GraphDocument>`
+
+**Direct call sites** (all currently call it as `graph::load(&target.out_root)?` or with `.map_err(...)`):
+- `crates/carto-cli/src/where_cmd.rs:56`
+- `crates/carto-cli/src/deps_cmd.rs:80`
+- `crates/carto-cli/src/map_cmd.rs:80`
+- `crates/carto-cli/src/contract_cmd.rs:45`
+- `crates/carto-cli/src/orphans_cmd.rs:42`
+- `crates/carto-mcp/src/tools/where_tool.rs:51`
+- `crates/carto-mcp/src/tools/deps_tool.rs:68`
+- `crates/carto-mcp/src/tools/map_tool.rs:48`
+- `crates/carto-mcp/src/tools/contract_tool.rs:43`
+- `crates/carto-mcp/src/tools/orphans_tool.rs:32`
+
+Only doc-comment references (not calls) exist in `crates/carto-core/src/query/mod.rs:2,88`, and `crates/carto-core/src/lang/resolve.rs:450` is also just a comment mentioning it — no update needed there beyond the wording if the change is substantial.
+
+That's the architecture described in `CLAUDE.md`: every CLI subcommand and its matching MCP tool handler independently call the same core `graph::load` — there's no shared wrapper, so all 10 sites (1 def + 9 callers) are where a signature change lands.

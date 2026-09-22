@@ -1,0 +1,26 @@
+That confirms the source-code call sites are exactly the 11 listed above (the rest are bench/docs artifacts, not code). This is a case where carto's `deps --dir in` answer is genuinely incomplete for a real reason worth explaining.
+
+## Answer
+
+`graph::load` (`crates/carto-core/src/graph/load.rs:23-78`) is called from 11 production call sites, all via the module-qualified form `graph::load(...)`. If its signature changes, update:
+
+**Definition**
+- `crates/carto-core/src/graph/load.rs` — the function itself (and its own unit tests in the same file, which call it directly)
+
+**CLI (`crates/carto-cli/src/`)**
+- `where_cmd.rs:56`
+- `contract_cmd.rs:45`
+- `deps_cmd.rs:80`
+- `orphans_cmd.rs:42`
+- `map_cmd.rs:80`
+
+**MCP tool handlers (`crates/carto-mcp/src/tools/`)**
+- `where_tool.rs:51`
+- `deps_tool.rs:68`
+- `orphans_tool.rs:32`
+- `contract_tool.rs:43`
+- `map_tool.rs:48`
+
+This lines up with the architecture doc's note that every MCP tool handler calls the same core function its same-named CLI subcommand calls — `load` is the one function both front ends share on the read path.
+
+One caveat worth flagging: I didn't rely on carto's `deps --dir in` edges alone. That query returned mostly same-file test-helper edges and flagged `root_uncaptured_inbound_calls: 15` — Rust's `Type::method()`/`module::func()` call shape (exactly `graph::load(...)`) is one the extractor deliberately never attempts to resolve, so the real callers don't show up as `calls` edges at all. I confirmed the actual call sites with a source grep for `graph::load(`, which is what the list above is based on.

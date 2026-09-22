@@ -1,0 +1,33 @@
+Based on `carto deps` (inbound `imports` edges into the `carto_core` module, confidence `certain`), **24 files** import from `carto_core`:
+
+**crates/carto-cli/src/**
+- main.rs *(bare fully-qualified reference, not a `use`)*
+- index.rs
+- where_cmd.rs
+- deps_cmd.rs
+- map_cmd.rs
+- contract_cmd.rs
+- orphans_cmd.rs
+- selfcheck.rs
+- component_arg.rs
+
+**crates/carto-mcp/src/**
+- server.rs
+- render.rs
+- tools/index_tool.rs
+- tools/where_tool.rs
+- tools/deps_tool.rs *(both a regular import and a bare reference)*
+- tools/map_tool.rs
+- tools/contract_tool.rs
+- tools/orphans_tool.rs
+- tools/selfcheck_tool.rs
+
+**crates/carto-core/tests/ui/** (the `trybuild` compile-fail suite for `TaintedString`, INV-5)
+- no_deref.rs
+- no_display.rs
+- no_display_via_query_result.rs
+- no_into_string.rs
+- no_as_ref_str.rs
+- no_field_access.rs
+
+Caveat: this is via `certain`-confidence `imports` edges carto could verify. Per carto's own documented gap, a file whose only import is a wildcard (`use carto_core::*;`) or an aliased import (`use carto_core as x;`) would be extracted as nothing and wouldn't appear in this list — so treat this as complete for ordinary `use` statements and bare fully-qualified paths, not an absolute guarantee against those two shapes.

@@ -1,0 +1,35 @@
+I looked up the definition (`crates/util/src/util.rs:95-108`), then queried inbound `calls` edges and cross-checked with a grep across the repo, since carto flagged that some call shapes get silently dropped for this symbol.
+
+## Resolved callers (carto found these — all `inferred` confidence)
+
+Carto surfaced 8 direct-call edges, all at `calls`/`inferred` confidence (best-effort match, not verified against real dispatch — carto's honesty contract says to double check before relying on them for anything correctness-sensitive):
+
+| Caller | Location |
+|---|---|
+| `label_element` | `crates/debugger_ui/src/dropdown_menus.rs:20-77` (call at line 35) |
+| `dropdown_label` | `crates/debugger_ui/src/dropdown_menus.rs:81-85` (call at line 83) |
+| `render_thread_dropdown` | `crates/debugger_ui/src/dropdown_menus.rs:273-332` (call at line 314) |
+| `primary_content` | `crates/activity_indicator/src/activity_indicator.rs:392-696` (call at line 634) |
+| `render` | `crates/activity_indicator/src/activity_indicator.rs:736-852` (call at line 755) |
+| `render_match` | `crates/tasks_ui/src/modal.rs:435-582` (call at line 532) |
+| `title` | `crates/terminal/src/terminal.rs:2991-3041` (calls at 2996, 3029, 3030) |
+| `tab_content_text` | `crates/git_ui/src/commit_view.rs:1191-1195` (call at line 1193) |
+
+I'd trust these at face value — they're plain, unqualified function calls with no unusual indirection, so "inferred" here is basically just carto's standard caveat rather than a sign of ambiguity.
+
+## Callers carto explicitly told you it can't see (8, `root_uncaptured_inbound_calls: 8`)
+
+These call `util::truncate_and_trailoff(...)` with the module path qualifier — a call shape the Rust extractor doesn't attempt to resolve by design. Carto's count (8) matched exactly what grep found, so I trust this list is complete:
+
+- `crates/editor/src/items.rs:794, 817`
+- `crates/title_bar/src/title_bar.rs:808, 946`
+- `crates/search/src/project_search.rs:1154`
+- `crates/agent_ui/src/conversation_view/thread_view.rs:1730`
+- `crates/git_ui/src/picker_prompt.rs:221`
+- `crates/git_ui/src/blame_ui.rs:170`
+
+## One caller carto missed *without* flagging it
+
+`crates/agent_ui/src/agent_diff.rs:686`, inside `tab_content_text` — calls the unqualified, directly-imported `truncate_and_trailoff`, which should have resolved like the other 8. It didn't show up as an edge, and it isn't counted in `root_uncaptured_inbound_calls` either (that counter only tracked the qualified-path gap). The likely reason: the call sits inside a `format!(...)` macro argument (`format!("Review: {}", truncate_and_trailoff(&title, 20))`), and macro-argument token streams appear not to get walked for call extraction. This is a real caller with zero signal from carto — found only by reading the source directly.
+
+**Bottom line: 17 real call sites** across 9 files — 8 carto resolved (inferred confidence, trustworthy), 8 carto explicitly disclosed as unresolved-but-real, and 1 it silently missed. For anything correctness-sensitive built on top of this, I'd treat the grep-confirmed list as ground truth over carto's edge list alone.

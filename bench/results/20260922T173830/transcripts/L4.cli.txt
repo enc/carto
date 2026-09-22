@@ -1,0 +1,12 @@
+This confirms the 4-crate workspace. Filtering the heuristic list down to what's actually real:
+
+**Binary**
+- `crates/carto-cli/src/main.rs` — the single shipped binary, `carto` (dispatches `index`/`where`/`deps`/`map`/`contract`/`orphans`/`selfcheck`/`serve`). Its `fn main` at line 62-70 shows up in the heuristic's "named `main`" bucket, and the module itself has `in=0` in the earlier fan-in list.
+- `crates/carto-cli/build.rs` — a build-time entry point (compiled and run by Cargo at build, not shipped), not a program a user runs.
+
+**Library crate roots** (the other three workspace members, each `in=0` in the module fan-in table too)
+- `crates/carto-core/src/lib.rs` — the core library: extraction, resolution, graph, query, redaction, pathguard.
+- `crates/carto-mcp/src/lib.rs` — the MCP stdio server library, mounted by the CLI's `serve` subcommand.
+- `crates/carto-grammars/src/lib.rs` — tree-sitter grammar loading, the one crate with an `unsafe_code` carve-out.
+
+Everything else the heuristic listed is noise it warns about by design: fixture `main`s (`fixtures/go-svc/cmd/server/main.go`, `fixtures/mixed/src/main.rs`) belong to test fixtures, not this repo's own program; the `tests/ui/*.rs main` fns are trybuild compile-fail snippets; `bench/score.py`'s `main` is a dev benchmarking script; and the long tail of README/config/`.scm`/ADR/fixture files are just files with no incoming imports, not entry points at all.

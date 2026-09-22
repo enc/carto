@@ -1,0 +1,48 @@
+This confirms it. Here's the structural orientation of the zed repo.
+
+## Shape
+
+This is a **Rust workspace**, not a single crate — `Cargo.toml` lists ~280 member crates under `crates/`, `extensions/`, and `tooling/`. carto's index confirms the scale:
+
+- **4,050 files**, **788 modules**, **68,374 symbols**
+- **150,959 call edges**, **70,947 type-reference edges**, **15,904 import edges**
+- ~230 distinct components detected, almost entirely `kind: rust`, plus a handful of `node`/`python` support scripts (`script/danger`, `crates/eval_cli/zed_eval`, `script/update_top_ranking_issues`)
+
+This is Zed, the GPU-accelerated code editor — the crate graph and naming line up with that (editor, workspace, gpui, language, project, terminal, vim, agent/AI crates, collab, etc.).
+
+## Main architectural pieces
+
+**UI/app shell**
+- `crates/zed` (62 files) — the top-level application binary; `zed.rs` and `main.rs` are both high-fanout hubs (69 and 55 outgoing imports respectively), gluing most other crates together.
+- `crates/gpui` (153 files, 6,122 symbols) — the custom GPU-accelerated UI framework everything renders through, with platform backends split into their own crates: `gpui_macos`, `gpui_linux`, `gpui_windows`, `gpui_web`, `gpui_wgpu`, `gpui_apple`.
+- `crates/workspace`, `crates/ui`, `crates/title_bar`, `crates/sidebar`, `crates/settings_ui` — the docking/pane/window-management and design-system layer.
+
+**Editing core**
+- `crates/editor` (77 files, 4,962 symbols, 101 outgoing imports — the single highest-fanout file in the repo) — the text editor widget itself.
+- `crates/language`, `crates/language_core`, `crates/multi_buffer`, `crates/text`, `crates/rope`, `crates/sum_tree`, `crates/buffer_diff` — the buffer/rope/syntax data model underneath the editor.
+- `crates/lsp`, `crates/dap`/`dap_adapters` — language server and debug adapter protocol clients.
+
+**Project/workspace model**
+- `crates/project` (86 files, 4,489 symbols) and `crates/worktree` — file system, project-wide state, and multi-root project management, used by nearly everything above.
+- `crates/fs`, `crates/settings`, `crates/settings_content` — filesystem abstraction and the layered settings system.
+
+**Collaboration & networking**
+- `crates/collab` (89 files) — the collab server.
+- `crates/client`, `crates/rpc`, `crates/proto`, `crates/channel`, `crates/call`, `crates/livekit_client`/`livekit_api` — client-side networking, RPC protocol, and voice/screen-share.
+
+**AI/agent stack** (a large, distinct subsystem)
+- `crates/agent` (81 files, 3,344 symbols) and `crates/agent_ui` (53 files, 2,973 symbols) are two of the largest crates in the repo, alongside `acp_thread`, `agent_servers`, `agent_skills`, `edit_prediction*` (Zeta), and a wide set of model-provider crates (`anthropic`, `open_ai`, `google_ai`, `bedrock`, `ollama`, `mistral`, `deepseek`, `x_ai`, `copilot`, `copilot_chat`, `open_router`, `llama_cpp`, `lmstudio`, `codestral`).
+
+**Extensibility**
+- `crates/extension`, `extension_host`, `extension_api`, `extension_cli`, plus actual extensions under `extensions/` (`glsl`, `html`, `test-extension`, `proto`).
+
+**Vim & misc feature crates**
+- `crates/vim` is unusually large by file count (348 files) — Vim emulation gets its own big crate.
+- Many small, single-purpose crates follow a consistent pattern of `<feature>` + `<feature>_ui` (e.g. `edit_prediction`/`edit_prediction_ui`, `debugger_tools`/`debugger_ui`, `theme`/`theme_settings`/`theme_selector`).
+
+**Tooling**
+- `tooling/xtask` (44 files), `tooling/lints`, `tooling/compliance`, `tooling/perf` — repo-internal build/lint/compliance tooling, separate from the product crates.
+
+**External dependency hot spots** (by import fan-in): `std`, `gpui` (1,164 importers), `anyhow`, `util`, `collections`, `serde_json`, `log`, `settings`, `futures`, `language` — `gpui` and `util`/`collections` being the two most cross-cutting internal deps confirms the framework + shared-utility layering.
+
+One caveat: carto's `entry-points` section came back empty at every budget I tried (60/120/200) — its full per-component `counts` payload apparently consumes the whole line budget before rendering entry-point rows, so I didn't get that list. Not a blocker for this orientation, just worth flagging as an observed carto rough edge if you rely on that section later.

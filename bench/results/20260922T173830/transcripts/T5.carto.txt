@@ -1,0 +1,11 @@
+This confirms and refines the carto results. Filtering out test code (lines 177/196/214 in `redact/mod.rs` are inside test functions per carto's caller names, and 211/224/235/236/243/274 in `taint.rs` are all inside `#[cfg(test)]` per the `..._truncates_on_char_boundary` etc. names), the direct production callers of `TaintedString::render_capped` are:
+
+1. **`crates/carto-core/src/query/orphans.rs:126-127`** — inside `orphans::run`, rendering a contract's producer/consumer signature and value for the report.
+2. **`crates/carto-core/src/query/contract.rs:81,93,107,108`** — inside `contract::run`: `81` renders a query value to compare against contract values (`93`), and `107-108` render signature/value for the result.
+3. **`crates/carto-core/src/query/deps.rs:498`** — inside `deps::summarize`, rendering a contract value into a label.
+4. **`crates/carto-core/src/redact/mod.rs:103`** — inside `redact_tainted_string`, capping text before running the redaction scan.
+5. **`crates/carto-core/src/taint.rs:135`** — `TaintedString`'s own `Serialize` impl (`serialize`), which caps output before emitting it as a string.
+6. **`crates/carto-cli/src/where_cmd.rs:125`** — the CLI's `capped` helper, used to render a signature for display.
+7. **`crates/carto-mcp/src/tools/where_tool.rs:122`** — the MCP server's own `capped` helper, same purpose for the `where` tool's response.
+
+So `render_capped` is called from five sites in `carto-core` (query layer's `orphans`/`contract`/`deps` result-building, the redaction choke-point, and `TaintedString`'s `Serialize` impl) plus one each in the CLI and MCP `where` renderers — consistent with INV-5's design: `render_capped` is one of the only two ways a `TaintedString`'s content can escape at all.

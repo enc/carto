@@ -1,0 +1,6 @@
+`truncate_and_trailoff` is defined in `crates/util/src/util.rs:95`.
+
+Signature:
+```rust
+pub fn truncate_and_trailoff(s: &str, max_chars: usize) -> String
+```

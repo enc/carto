@@ -1,0 +1,27 @@
+`build_and_persist` (crates/carto-core/src/indexer.rs:44-102) has both resolved call edges from carto and calls that its Rust extractor structurally can't attempt (path-qualified `Type::method()`/`module::func()` calls, per the doc header on this note). Combining both:
+
+**Resolved call edges (inferred confidence):**
+- `Graph::insert_edge` / `Graph::insert_node` — `crates/carto-core/src/graph/mod.rs`
+- `ComponentSet::config_digest` / `components_sorted_by_path` / `component_of_path` — `crates/carto-core/src/components/mod.rs`
+- `RedactionSummary::total` — `crates/carto-core/src/redact/mod.rs`
+- `PathGuard::out_root` — `crates/carto-core/src/pathguard/mod.rs`
+- references `error::Result`, and its own sibling `IndexReport` (same file)
+
+**Calls carto flags as uncaptured (module/type-qualified, in the function body but not resolvable by the extractor)** — confirmed by reading the source directly:
+- `pathguard::PathGuard::new(...)`
+- `walk::walk(...)`
+- `ComponentSet::discover(...)`
+- `lang::extract_and_resolve(...)`
+- `Graph::new()`
+- `gitinfo::head_sha(...)`
+- `graph::persist(...)`
+
+**Module/type dependencies (`use` statements):**
+- `crate::components::ComponentSet`
+- `crate::error::Result`
+- `crate::graph::Graph`
+- `crate::{gitinfo, graph, lang, pathguard, walk}`
+- `serde::Serialize`
+- `std::path::{Path, PathBuf}`
+
+So functionally it's the whole write-path pipeline described in CLAUDE.md's architecture diagram: `pathguard::PathGuard::new` → `walk::walk` → `ComponentSet::discover` (stamping each file's `component`) → `lang::extract_and_resolve` → builds a `Graph` (`insert_node`/`insert_edge`) → `gitinfo::head_sha` → `graph::persist` (the one writer, going through the same `PathGuard`). The seven module/type-qualified calls (`PathGuard::new`, `walk::walk`, `ComponentSet::discover`, `lang::extract_and_resolve`, `Graph::new`, `gitinfo::head_sha`, `graph::persist`) are exactly the ones carto's Rust extractor never attempts to resolve by design (ADR-0020's honesty gap), so they only show up by reading the source, not in carto's resolved edge list.

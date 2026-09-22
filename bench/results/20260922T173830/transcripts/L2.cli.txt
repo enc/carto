@@ -1,0 +1,7 @@
+`truncate_and_trailoff` is defined in `crates/util/src/util.rs:95`:
+
+```rust
+pub fn truncate_and_trailoff(s: &str, max_chars: usize) -> String
+```
+
+It removes characters from the end of `s` when its length exceeds `max_chars`, appending `…`; otherwise returns it unchanged.

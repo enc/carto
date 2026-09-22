@@ -1,0 +1,20 @@
+## Direct callers of `TaintedString::render_capped` in production code
+
+**Serialization / redaction (core):**
+1. `crates/carto-core/src/taint.rs:135` — `TaintedString`'s own `Serialize` impl: `self.render_capped(SIGNATURE_CAP)`. This is how every tainted field escapes into `graph.json`.
+2. `crates/carto-core/src/redact/mod.rs:103` — `redact_tainted_string()` calls `t.render_capped(usize::MAX)` to get the full sanitized text to scan for secrets before redaction runs.
+
+**Query layer (`crates/carto-core/src/query/`):**
+3. `orphans.rs:126` — `run()`, capping a contract's `qualifier`.
+4. `orphans.rs:127` — same function, capping the contract's `value`.
+5. `contract.rs:81` — `run()`, capping a query-built needle (`usize::MAX`, i.e. no real truncation) for comparison.
+6. `contract.rs:93` — same function, capping a candidate contract's `value` for that comparison.
+7. `contract.rs:107` — capping a match's `qualifier` for the result struct.
+8. `contract.rs:108` — capping a match's `value` for the result struct.
+9. `deps.rs:498` — `NodeSummary` construction for a `Contract` node, capping `value`.
+
+**CLI / MCP front ends:**
+10. `crates/carto-cli/src/where_cmd.rs:125` — helper `capped()`, used to render a symbol's `signature` for `where`'s human output.
+11. `crates/carto-mcp/src/tools/where_tool.rs:122` — the same `capped()` helper, MCP's equivalent of the CLI one.
+
+All 11 sites sit before their file's `#[cfg(test)] mod tests` boundary, so none are test code. This is more than the "4 callers" recorded in `bench/tasks.md`/`bench/field-log.md` for the original T5 benchmark — that count predates the `Contract` node feature (ADR-0025–0027), which added the `orphans.rs` and `contract.rs` call sites since then.

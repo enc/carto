@@ -1,0 +1,27 @@
+Ran `where` to resolve the symbol (`crates/util/src/util.rs:95-108`), then `deps --dir in --depth 2`, and cross-checked with a repo-wide grep since carto flagged an uncaptured-calls gap.
+
+**Callers carto resolved** (all edges came back `confidence: inferred` — best-effort name match, not verified against a resolved import — but I confirmed each site by reading the source, so they're real):
+
+Direct callers:
+- `crates/debugger_ui/src/dropdown_menus.rs` — `label_element` (:35), `dropdown_label` (:83), `render_thread_dropdown` (:314)
+- `crates/activity_indicator/src/activity_indicator.rs` — `primary_content` (:634), `render` (:755)
+- `crates/tasks_ui/src/modal.rs` — `render_match` (:532)
+- `crates/terminal/src/terminal.rs` — `title` (:2996, :3029, :3030)
+- `crates/git_ui/src/commit_view.rs` — `tab_content_text` (:1193)
+
+Indirect (depth 2, callers of the above):
+- `debugger_ui::dropdown_menus::render_session_menu_entry` → `dropdown_label`
+- `debugger_ui::debugger_panel::top_controls_strip` (same-component call)
+- `activity_indicator::content_to_render` → `primary_content`
+
+**Callers carto missed entirely** — its own `root_uncaptured_inbound_calls: 8` counter flagged this, and grep confirms exactly 8 sites written as module-qualified `util::truncate_and_trailoff(...)` (a documented gap: qualified-path calls are never attempted for resolution):
+- `crates/editor/src/items.rs:794, 817`
+- `crates/title_bar/src/title_bar.rs:808, 946`
+- `crates/search/src/project_search.rs:1154`
+- `crates/git_ui/src/picker_prompt.rs:221`
+- `crates/git_ui/src/blame_ui.rs:170`
+- `crates/agent_ui/src/conversation_view/thread_view.rs:1730`
+
+One more miss grep turned up that *doesn't* fit that documented gap: `crates/agent_ui/src/agent_diff.rs:686`, inside a function also named `tab_content_text` (:684-689) — an unqualified call, same shape as the one carto did capture in `git_ui/commit_view.rs`. My best guess is a same-name collision between the two `tab_content_text` symbols caused carto to drop one; that's outside the documented gaps, so treat it as a possible carto quirk rather than expected behavior.
+
+**Bottom line:** trust the source, not the graph, for completeness here — carto's own counter told me it was missing calls, and grep found 9 more real callers (8 qualified + 1 name-collision) beyond the 8 it resolved. All 17 total call sites are genuine `truncate_and_trailoff` calls confirmed directly in source; carto's "inferred" tag on the 8 it did find just means it didn't verify them against a resolved import, not that they're doubtful.

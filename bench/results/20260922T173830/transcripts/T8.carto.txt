@@ -1,0 +1,25 @@
+`carto_core::indexer::build_and_persist` (crates/carto-core/src/indexer.rs:44-102) calls/depends on:
+
+**Resolved calls (from carto, all `inferred`, same-component):**
+- `Graph::insert_edge` — `graph/mod.rs:52`
+- `Graph::insert_node` — `graph/mod.rs:46`
+- `components::ComponentSet::config_digest` — `components/mod.rs:136`
+- `components::ComponentSet::components_sorted_by_path` — `components/mod.rs:146`
+- `components::ComponentSet::component_of_path` — `components/mod.rs:164`
+- `redact::RedactionSummary::total` — `redact/mod.rs:40`
+- `pathguard::PathGuard::out_root` — `pathguard/mod.rs:111`
+
+**Type references:**
+- `error::Result` (its own return type)
+- `IndexReport` (same file, its own return type)
+
+**Uncaptured outbound calls (7)** — carto flags these as present but doesn't attempt resolution for Rust's `Type::method()`/`module::func()` call shape (by design, not a bug). Reading the source directly, these are:
+- `pathguard::PathGuard::new`
+- `walk::walk`
+- `components::ComponentSet::discover`
+- `lang::extract_and_resolve`
+- `graph::Graph::new`
+- `gitinfo::head_sha`
+- `graph::persist`
+
+So the full direct call graph is the union of both lists above — the module-doc comment also names the two front ends (`carto-cli`'s `index` subcommand and `carto-mcp`'s `index` tool) that call *into* `build_and_persist`, though that's the inbound side, not what it depends on.
