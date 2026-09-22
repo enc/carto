@@ -105,6 +105,69 @@ shows its work.
 
 ---
 
+## 2026-09-22 re-verification, before re-running S-1
+
+Six weeks and 20 ADRs (0020–0039) after the numbers below were recorded,
+a prod-readiness review flagged that re-running `bench/run.sh` against
+the *same* 8 tasks without first re-deriving their ground truth would
+not be a valid comparison — a theoretical risk that turned out to have
+concrete, confirmed instances, not just staleness in the abstract:
+
+- **T8's ground truth is provably wrong, not just old.** Its target
+  function, `indexer::build_and_persist`, was directly modified in the
+  same work session that produced this correction (multi-root support,
+  ADR-0034–0039 added `ComponentSet::discover`/`components()` calls to
+  it) — the exact call list the original entry records as "known with
+  certainty" no longer matches the function's actual current body.
+- **L3's entire premise no longer holds.** The task existed to
+  demonstrate that Rust's grouped `use a::{b, c};` imports are invisible
+  to carto (ADR-0008). ADR-0022, part of the post-S-1 improvement plan
+  *this benchmark's own first run motivated*, fixed exactly that gap.
+  Re-verified fresh (`carto deps <carto_core-module-id> --dir in`
+  against the current repo): carto now finds **24 of 24** real
+  importers (`rg -l "^use carto_core::" crates` plus `main.rs`'s
+  fully-qualified references) — zero missed, zero false positives.
+  Compare the original "11 of 18, missing 7."
+- **T6's failure mode is directly addressed by a feature that didn't
+  exist yet.** `docs/post-s1-improvement-plan.md` names T6 as the
+  motivating case for §1.1 (ADR-0020's honest-absence signal): the
+  original grading's sharpest finding was that carto returns 5
+  irrelevant test-only callers with *no indication anything real is
+  missing*. Re-verified fresh: `carto deps <graph::load-id> --dir in`
+  now explicitly reports `root_uncaptured_inbound_calls: 15` alongside
+  the same 5 test-only edges — the exact silent-omission failure T6 was
+  built to catch is now flagged, not silent. The 6 real production
+  callers (still path-qualified `graph::load(...)`, still ADR-0008-
+  excluded) are still not *resolved* — only now honestly disclosed as
+  missing.
+- **Every carto's-own-repo task's raw numbers drifted with repo growth**
+  (~181 → 474 walked files): L3's importer count (18→24, see above), L4's
+  noise-row count (~130→410), T5's production-caller count (4→7, three
+  new sites from the contracts feature: `query/orphans.rs::run`,
+  `query/contract.rs::run`, `query/deps.rs::summarize`), T6's real-caller
+  count (6→10, contract/orphans command handlers added), T8's call-site
+  count (14→~23 occurrences, see above). The zed-corpus tasks (L1, L2,
+  T7) drifted less dramatically (zed's own upstream commits, not carto's
+  capability changes) but every specific number/line reference needs a
+  fresh source read, not the numbers below.
+
+**Corpus note:** `~/playground/zed` no longer existed on the machine
+this re-verification ran on and was re-cloned fresh
+(`git clone --depth 1 https://github.com/zed-industries/zed`,
+commit `62e5991dd0f0c8a3af8d5e7e9c4652490d468db8`, 2026-09-22) — the
+original run never recorded a pinned commit, a reproducibility gap this
+closes going forward. carto's own repo is used at whatever commit is
+checked out when the benchmark actually runs, per its own nature.
+
+**What follows below is the original 2026-08-03 write-up, unchanged** —
+correction kept visible per this file's own house style (see L3's own
+methodology-correction section above), not silently edited over. Each
+task affected carries a dated pointer back to this section rather than
+having its numbers rewritten in place; **the numbers actually used for
+grading a fresh run are the ones in this section, not below.**
+
+---
+
 ## Category L — lookup / orientation (carto predicted to win)
 
 ### L1 — repo orientation (zed)
@@ -133,6 +196,13 @@ reading a handful of files), verified in Part 0 against zed's real scale
 (3,754 walked files is the same figure `bench/field-log.md` recorded
 independently via `carto index`'s own summary).
 
+**2026-09-22 re-verification** (see the section above): re-cloned zed,
+245 crates now (was 236, still "order of magnitude ~200+" — grading
+criterion unaffected). Carto's fresh answer: `files=4050 symbols=68374
+modules=788`, `edges: calls=150959 contains=68374 imports=15904
+references=70947` — same kind of answer, larger numbers, plus a
+`references` edge kind (ADR-0029) that didn't exist in the original run.
+
 ### L2 — symbol lookup (zed)
 
 **Prompt:** "Where is `truncate_and_trailoff` defined, and what's its
@@ -150,6 +220,12 @@ crates/util/src/util.rs:58:pub fn truncate_and_trailoff(s: &str, max_chars: usiz
 one exact match, `crates/util/src/util.rs:58-71`, signature `pub fn
 truncate_and_trailoff(s: &str, max_chars: usize) -> String` — correct,
 verified against the ground truth above.
+
+**2026-09-22 re-verification**: same file, definition moved to
+`crates/util/src/util.rs:95-108` (zed's own churn, not a carto-side
+change) — signature unchanged. Carto's fresh answer still correct, and
+now labels the match `[util]` (its own component, ADR-0034 multi-root
+support — not built yet at the original run).
 
 ### L3 — import fan-out (carto's own repo)
 
@@ -256,6 +332,28 @@ different, real gap (`where`/`deps` have no `Module`-node discovery
 path) worth measuring on its own terms rather than folding into the same
 narrative.
 
+**2026-09-22 re-verification** (see the section above for the headline
+number): both of this task's two documented failures are now fixed, not
+merely improved. `rg -l "^use carto_core::" -g '*.rs' crates` plus
+`main.rs`'s own fully-qualified references now total **24 files**
+(5 new since Aug: `component_arg.rs`/`contract_cmd.rs`/`orphans_cmd.rs`,
+`contract_tool.rs`/`orphans_tool.rs` — all from the contracts feature,
+ADR-0025–0027, added after this write-up). `carto deps
+7ceb829e0163fd98 --dir in` (still needing the module's node ID as of
+this note, see below) returns **exactly those 24, zero missed, zero
+false positives** — the "biased toward heterogeneous-import files" gap
+is gone along with the underlying extraction bug (ADR-0022).
+Separately, the MCP-unreachability finding is *also* independently
+fixed: `where carto_core` (ADR-0021, Module/File discovery in
+`where`/`deps`, landed as part of the same post-S-1 improvement plan)
+now finds the `Module` node directly by name, and `carto deps
+carto_core --dir in` resolves and returns the full correct list with no
+node-ID indirection needed at all — the "unreachable via the actual MCP
+tool surface" framing this task's whole second half was built around no
+longer applies. This task, as originally scoped, is very likely now a
+clean carto win on both of its own documented axes; grade against the
+24-file list above, not the 18/11 numbers in the write-up below.
+
 ### L4 — real entry points vs. carto's heuristic (carto's own repo)
 
 **Prompt:** "What are this repo's real entry points — the binaries and
@@ -283,6 +381,15 @@ have zero incoming `imports` edges simply because nothing ever imports a
 markdown file. Graded on whether the answer surfaces this signal-to-
 noise problem (documented already in `docs/STATUS.md` as a known,
 labeled heuristic limit) rather than reading off the raw list uncritically.
+
+**2026-09-22 re-verification**: the 4 real entry points are unchanged
+and still all present in carto's answer (still verified via
+`crates/*/Cargo.toml` and each crate's `src/lib.rs`). The noise grew
+roughly 3x — 410 non-header rows now (was ~130), tracking the repo's own
+growth (more ADRs, fixtures, goldens). The task's actual point — does
+the answer notice and surface the noise rather than reading the list
+literally — is if anything a sharper test now than before, not a
+weaker one.
 
 ---
 
@@ -322,6 +429,18 @@ where carto's raw recall is genuinely strong; the honest grading
 question is whether an answer correctly separates the 4 that matter from
 the 5 that don't, since carto's own output doesn't do that separation.
 
+**2026-09-22 re-verification**: 3 new production callers exist, all
+from the contracts feature (ADR-0025–0027, added after this write-up):
+`query/orphans.rs::run` (×2 call sites), `query/contract.rs::run` (×4),
+`query/deps.rs::summarize` (×1) — **production is now 7, not 4**
+(`capped`×2, `run`×2, `redact_tainted_string`, `serialize`,
+`summarize`). Test-only is still 9 (unchanged). Carto's fresh answer
+(`carto deps render_capped --dir in --depth 1`) returns **11 `calls`
+edges** — still all 7 production callers plus a subset of the 9 test
+callers, undifferentiated, the identical shape as before at larger
+scale. The grading question is unchanged; the raw counts to grade
+against are 7 production / 9 test, not 4 / 9.
+
 ### T6 — direct-caller impact, the sharp negative case (carto's own repo)
 
 **Prompt:** "If `graph::load`'s function signature changes, which files
@@ -359,6 +478,29 @@ point* of the question asked, silently omitting the one thing (the 6
 production command handlers) that actually matters. An agent that trusts
 this answer without independent verification would conclude the wrong
 files need updating.
+
+**2026-09-22 re-verification — this task's own documented failure mode
+is directly targeted by a capability that didn't exist at the original
+write-up.** `docs/post-s1-improvement-plan.md` names *this task* as
+§1.1's motivating case. `bare load` is now ambiguous (a second `load`
+exists, `contracts::mod::load`, added by the contracts feature) — use
+`carto deps <graph::load's-own-node-id> --dir in --depth 1` instead.
+Real call-site count is now **10**, not 6 (contract/orphans command
+handlers added: `contract_cmd.rs`, `orphans_cmd.rs`,
+`contract_tool.rs`, `orphans_tool.rs`), all still path-qualified and
+still not resolved as `calls` edges — that part of the failure is
+unchanged by design (ADR-0008). But the answer itself changed
+materially: carto's fresh response now explicitly states
+`root_uncaptured_inbound_calls: 15` alongside the same 5 test-only
+edges — the *exact* silent-omission this task exists to demonstrate is
+now flagged, not silent (ADR-0020/0023). Grading this fresh run against
+the original "carto silently misleads, an agent would conclude the
+wrong files need updating" framing would be scoring a bug that's fixed;
+grade instead on whether the *current* answer (5 correct-but-beside-
+the-point edges, explicitly flagged as incomplete, real 10-site list
+still not resolved) is enough for the agent to avoid being misled —
+materially better than the original, but the underlying `calls` edges
+for the 10 real callers are still genuinely absent.
 
 ### T7 — incoming calls with confidence (zed)
 
@@ -404,6 +546,22 @@ confidence marker, just silence. Every edge that *is* present carries
 `inferred`, correctly signaling "verify before trusting," but the
 9 entirely absent callers get no signal of any kind.
 
+**2026-09-22 re-verification** (re-cloned zed, commit
+`62e5991dd0f0c8a3af8d5e7e9c4652490d468db8`): raw occurrences shifted —
+zed's own code changed a path-qualified call site (`agent/tools/
+update_title_tool.rs` no longer contains this call) and added a new
+bare one (`agent_ui/agent_diff.rs`) since Aug 3; re-derive the exact
+per-file breakdown fresh at grading time rather than reusing the list
+above. The structural finding is the same shape as T6's: carto's fresh
+answer (`carto deps truncate_and_trailoff --dir in --depth 1` against
+the re-cloned corpus) returns 8 `calls` edges, all `inferred`, **plus
+now `root_uncaptured_inbound_calls: 8`** — the exact "nothing indicates
+anything is missing" gap this task was built to demonstrate is fixed
+the same way T6's is (ADR-0020/0023, landed after this write-up). The
+9 path-qualified callers are still not resolved as edges — only the
+*disclosure* that something's missing changed, not the underlying
+extraction gap (ADR-0008, unchanged by design).
+
 ### T8 — outgoing dependencies (carto's own repo, self-authored ground truth)
 
 **Prompt:** "What does `carto_core::indexer::build_and_persist` call or
@@ -439,6 +597,38 @@ exclusion, invisible by construction). Written and verified in the same
 session the function itself was authored, before `deps` was run on this
 symbol even once — no risk of the ground truth being reverse-engineered
 from carto's own answer.
+
+**2026-09-22 re-verification — this ground truth is not merely stale,
+it is provably wrong as written**, confirmed by direct inspection of
+`crates/carto-core/src/indexer.rs`'s current body:
+`build_and_persist` was itself modified by the multi-root support work
+(ADR-0034–0039) in the intervening six weeks, adding real new calls.
+Current, re-derived from the actual source:
+
+- Path-qualified (**7**, was 6): the original 6 plus
+  `ComponentSet::discover`.
+- Receiver-method calls (**~17 distinct call expressions, 13 distinct
+  method names**, was 8/6): the original set plus
+  `.component_of_path()`, `.map()`, `.components()` (×2 — once feeding
+  `extract_and_resolve`, once for `.len()`), `.config_digest()`,
+  `.to_string()`, `.components_sorted_by_path()`.
+
+**Carto's fresh answer** (`carto deps build_and_persist --dir out
+--depth 1`): **7 resolved `calls` edges** now (was 4) —
+`insert_edge`, `config_digest`, `total`, `insert_node`, `out_root`,
+`components_sorted_by_path`, `component_of_path`. `root_
+unresolved_calls` lists **9** attempted-but-unresolved sites (was 4):
+`len`×2, `map`, `components`×2, `clone`, `to_string`, `Ok`,
+`to_path_buf`. And — the change that matters most for this task's own
+point — **`root_uncaptured_outbound_calls: 7`** is now reported
+explicitly, naming the count of the 7 path-qualified calls that are
+still never attempted (ADR-0023, the outbound half of the same
+honest-absence signal T6/T7 rely on, landed after this write-up). The
+"sharpest possible three-way split" this task documents is now visible
+*as three actual numbers in carto's own output* (7 resolved / 9
+honestly-unresolved / 7 honestly-uncaptured) rather than the third
+bucket being invisible by construction — grade against these three
+numbers, not the original 4/4/6.
 
 ---
 

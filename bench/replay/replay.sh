@@ -107,7 +107,11 @@ grep_T6() { # carto: graph::load callers
   ( cd "$CARTO_REPO" && rg -n 'graph::load\(' -g '*.rs' crates )
 }
 carto_T6() {
-  "$CARTO_BIN" deps load "$CARTO_REPO" --out "$IDX_CARTO" --dir in --depth 1 --json
+  # 2026-09-22: `load` alone is now ambiguous — `contracts::mod::load`
+  # was added after this script was written (contracts feature,
+  # ADR-0025-0027) — disambiguated via --subpath exactly like the
+  # unscoped-vs-scoped tiebreaker ADR-0014 built --subpath for.
+  "$CARTO_BIN" deps load "$CARTO_REPO" --out "$IDX_CARTO" --dir in --depth 1 --subpath crates/carto-core/src/graph --json
 }
 
 grep_T7() { # zed: truncate_and_trailoff callers
