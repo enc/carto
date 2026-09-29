@@ -273,6 +273,36 @@ pub struct RawLiteral {
     pub line: u32,
 }
 
+/// One Terraform reference expression found in a `.tf` file
+/// (ADR-0041): `var.region`, `local.prefix`, `module.vpc.vpc_id`,
+/// `aws_s3_bucket.logs.arn`, `data.aws_iam_policy_document.x.json`.
+/// `segments` are the dotted names in order, with index/splat
+/// operators (`[0]`, `[*]`, `.*`) skipped, not terminating —
+/// `aws_instance.w[0].id` is `["aws_instance", "w", "id"]`.
+/// Resolution is a dedicated directory-scoped pass
+/// (`super::terraform`), not the generic call-site tier ladder:
+/// Terraform's scope is exactly one directory.
+pub struct RawTfRef {
+    pub segments: Vec<String>,
+    /// 1-based line of the reference's first token.
+    pub line: u32,
+}
+
+/// What a `.tf` file's extraction carries beyond `symbols` (ADR-0041).
+/// `None` on [`ExtractOut::terraform`] for every non-Terraform file.
+#[derive(Default)]
+pub struct TerraformFacts {
+    /// `Some(suffix)` for an environment-variant file such as
+    /// `locals.tf.simu` (the part after `.tf.`); `None` for a plain
+    /// `*.tf` file.
+    pub variant: Option<String>,
+    /// `override.tf` / `*_override.tf` — Terraform merges these over
+    /// same-named declarations, so a duplicate definition here is not
+    /// a true duplicate.
+    pub is_override: bool,
+    pub refs: Vec<RawTfRef>,
+}
+
 /// One file's raw extraction output (spec §5.2: "symbols, imports,
 /// call-sites").
 #[derive(Default)]
@@ -309,6 +339,9 @@ pub struct ExtractOut {
     /// have no equivalent. Feeds `resolve`'s repo-wide FQN index; not
     /// itself a `RawImport`, since it isn't an import.
     pub declared_namespace: Option<String>,
+    /// Terraform-specific facts (ADR-0041) — `Some` only for `.tf`
+    /// (and `.tf.<variant>`) files.
+    pub terraform: Option<TerraformFacts>,
 }
 
 pub trait LangExtractor {

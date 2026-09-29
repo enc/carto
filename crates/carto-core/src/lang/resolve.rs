@@ -540,6 +540,11 @@ pub fn resolve(
     let mut edges = Vec::new();
     let mut external_modules: BTreeMap<&str, NodeId> = BTreeMap::new();
 
+    // ADR-0041: Terraform references resolve in their own
+    // directory-scoped pass, never through the tier ladder above.
+    let mut tf = super::terraform::resolve(&extractions, &symbol_ids);
+    edges.append(&mut tf.edges);
+
     for (fi, fe) in extractions.iter().enumerate() {
         let (calls_by_symbol, unattached_calls) =
             assign_to_innermost_symbol(&fe.extract.symbols, &fe.extract.call_sites, |c| c.line);
@@ -570,7 +575,7 @@ pub fn resolve(
         for (si, sym) in fe.extract.symbols.iter().enumerate() {
             let id = symbol_ids[fi][si].clone();
 
-            let mut unresolved_calls = Vec::new();
+            let mut unresolved_calls = tf.unresolved.remove(&(fi, si)).unwrap_or_default();
             for &call in &calls_by_symbol[si] {
                 match resolver.resolve(fi, call.callee_name.as_str()) {
                     Some((target_fi, target_si, evidence)) => {
@@ -1291,7 +1296,7 @@ pub fn resolve(
 /// copies of the same loop, ADR-0026's contract-literal pass had before
 /// this) so a future change to the tie-break rule can't apply to one
 /// call site and silently miss the other.
-fn smallest_containing_symbol(symbols: &[RawSymbol], line: u32) -> Option<usize> {
+pub(super) fn smallest_containing_symbol(symbols: &[RawSymbol], line: u32) -> Option<usize> {
     let mut best: Option<usize> = None;
     for (si, sym) in symbols.iter().enumerate() {
         if line < sym.start_line || line > sym.end_line {
@@ -1744,7 +1749,7 @@ fn join(dir: &str, name: &str) -> String {
 /// `resolve_relative_import`'s own directory-walking and Go's
 /// directory-scoped resolution (ADR-0015), both of which need a file's
 /// own containing directory as their starting point.
-fn relpath_dir(relpath: &str) -> &str {
+pub(super) fn relpath_dir(relpath: &str) -> &str {
     relpath.rsplit_once('/').map(|(d, _)| d).unwrap_or("")
 }
 

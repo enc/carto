@@ -73,6 +73,7 @@ impl LangExtractor for GoExtractor {
             // `package_scope_is_directory` + `resolve`'s tier (a′), not
             // by an FQN index.
             declared_namespace: None,
+            terraform: None,
         }
     }
 }

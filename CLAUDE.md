@@ -36,6 +36,7 @@ cargo run -p carto-cli -- index fixtures/csharp-app --out /tmp/carto-out
 cargo run -p carto-cli -- index fixtures/secrets-corpus --out /tmp/carto-out
 cargo run -p carto-cli -- index fixtures/sid-like --out /tmp/carto-out
 cargo run -p carto-cli -- index fixtures/monorepo --out /tmp/carto-out
+cargo run -p carto-cli -- index fixtures/tf-modules --out /tmp/carto-out
 cargo run -p carto-cli -- index <repo> --json 2>/dev/null | python3 -m json.tool
 cargo run -p carto-cli -- where <name> <repo> --out /tmp/carto-out
 cargo run -p carto-cli -- deps <name|id> <repo> --out /tmp/carto-out --dir out --depth 2
@@ -420,6 +421,27 @@ declared deps; `resolve_fqn`/the `NamespaceImport` fan-out each gain a
 tier preferring a declared dependency between same-component and the
 pre-existing arbitrary fallback; `map --section components` renders
 `depends_on` and marks an undeclared crossing `[undeclared]`.
+
+### Terraform source support (ADR-0041 →)
+
+Another user-requested capability outside spec §4–§7 (spec §6 assumes
+`terraform show -json`; that path is a later slice, not replaced).
+`lang/hcl.rs` turns `*.tf`/`*.tf.<variant>` files into symbols **named by
+Terraform address** (`var.region`, `local.prefix`, `aws_s3_bucket.logs`;
+`SymKind::Tf*`), and every reference expression into a `RawTfRef` on
+`ExtractOut::terraform`. References resolve in `lang/terraform.rs`, a
+**dedicated directory-scoped pass** — not the generic tier ladder, whose
+repo-wide fallback is wrong for Terraform (scope is one directory). Three
+things that will bite you: HCL symbols must stay `is_pub: false` and emit
+no `call_sites` (`resolve.rs`'s name indices are language-agnostic — a
+`variable "timeout"` would make a Python `timeout()` ambiguous);
+references are lexed from the source text after each `variable_expr`
+(sibling runs are unreliable inside binary operations — see ADR-0041's
+verified shapes before touching the walk); and edges are always
+`inferred` (spec §4.2), env-variant files (`locals.tf.simu`) fan out one
+edge per variant rather than guessing. `*.tfvars` stays on the sensitive
+denylist — contents are never read; ADR-0044 models the implication
+(a variable may be set outside the code) at query time instead.
 
 ## Conventions
 

@@ -126,6 +126,7 @@ fn extract_with(language: Language, src: &[u8], is_ts_family: bool) -> ExtractOu
         uncaptured_call_sites: Vec::new(),
         type_refs: extract_type_refs(root, src, &language, is_ts_family),
         declared_namespace: None,
+        terraform: None,
     }
 }
 

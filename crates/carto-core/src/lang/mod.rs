@@ -13,6 +13,7 @@ pub mod php;
 pub mod python;
 pub mod resolve;
 pub mod rust;
+pub mod terraform;
 
 pub use csharp::CSharpExtractor;
 pub use ecma::{JavaScriptExtractor, TsxExtractor, TypeScriptExtractor};

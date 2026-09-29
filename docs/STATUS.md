@@ -576,6 +576,31 @@ so they've been subdivided. Current state:
     secrets before committing (none found). Per spec §11.4, this ADR
     presents the result and does not make the M3 go/no-go call —
     **that decision remains the user's, now on current data.**
+- **Terraform source support, slice 1 of 4 (2026-09-29, ADR-0041)** —
+  pulled ahead of the M3 gate on user request (source HCL first; plan/
+  state-JSON ingestion stays a later slice). `.tf`/`.tf.<variant>` files
+  now yield one symbol per top-level `variable`/`output`/`resource`/
+  `data`/`module` block and per `locals` attribute, **named by Terraform
+  address** (`var.region`, `local.prefix`, `aws_s3_bucket.logs`) so
+  `where`/`deps` work on them directly; seven new `SymKind`s. References
+  (`var.*`, `local.*`, `module.*`, `data.*`, `<type>.<name>`) resolve in
+  a **dedicated directory-scoped pass** (`lang/terraform.rs`), never the
+  generic tier ladder: same-module → `inferred` `references`; definitions
+  only in other env-variant files (`locals.tf.simu`/`.prod`) → one edge
+  per variant; `override.tf` yields to the base; a miss or a real
+  duplicate → no edge, recorded in `unresolved_calls`. Symbols are never
+  `is_pub` (else a Terraform `variable "timeout"` would make a Python
+  `timeout()` call ambiguous). References are read from source text
+  after each `variable_expr` because the grammar's sibling runs are
+  unreliable inside binary operations (verified on real parse trees).
+  `SCHEMA_VERSION` 8 → 9. `fixtures/tf-modules/` +
+  `cli_terraform.rs` (7 tests). Contract literals in HCL now attach to
+  the resource symbol instead of the `File`. **Next slices:** ADR-0042
+  module calls/cross-module edges, ADR-0043 Terragrunt, ADR-0044 the
+  tfvars implication (variables may be set outside the code; `.tfvars`
+  contents stay unread). Note: `carto-core`'s `trybuild` compile-fail
+  suite mismatches its snapshots on rustc 1.94.1 (extra `println!`
+  macro note) — pre-existing, identical on untouched `origin/main`.
 - **M2+ remaining (infra graph proper, join, ingest)** — spec §10. The
   contract slice above is adjacent to, not a substitute for, this: no
   `IacResource`/`depends_on`/IAM extraction/§6.6 attribute allowlist
@@ -655,8 +680,19 @@ Do not "fix" these without checking the linked reasoning first:
 - **No `IacResource`/`depends_on`/IAM-extraction/§6.6 attribute
   allowlist** — the contract slice (ADR-0025/0026/0027) is adjacent to
   spec §6's infra graph, not a substitute for it. HCL literals attach
-  directly to the `File` node, not to any infra-graph node, because
+  to the enclosing resource *symbol* (ADR-0041; the `File` node only
+  when no symbol contains them) — never to an infra-graph node, because
   that node doesn't exist yet.
+- **Terraform source support is source-level and approximate** (ADR-0041):
+  references are always `inferred`; scope is "this directory's `*.tf` +
+  env-variant files", so a gitignored generated file (`locals_env.tf`), a
+  `*.tf.json`, terragrunt `generate` blocks are invisible — an
+  `unresolved_calls` entry means "not found among parsed files". No
+  `count`/`for_each` instance expansion, no provider aliases, no
+  `moved`/`import`/`check`/`provider`/`terraform` block symbols, nested
+  blocks are not symbols. Module calls, Terragrunt and the tfvars
+  caveat are ADR-0042/0043/0044 (not yet built); `*.hcl` files still
+  yield contract literals only.
 - **Rust path-qualified call resolution** (`Type::method()`, `module::func()`).
   Call matching is bare-name-only; those call sites aren't captured at all.
   Spec §5.3's "deliberately modest" policy — [ADR-0008](adr/0008-rust-resolution-policy-mapping.md).

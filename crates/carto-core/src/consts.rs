@@ -53,7 +53,13 @@ pub const BIN_NAME: &str = "carto";
 /// component" (a real, meaningful value this slice introduces) versus
 /// "never looked for one," the same absence-vs-zero distinction every
 /// prior bump in this family protects.
-pub const SCHEMA_VERSION: u32 = 8;
+/// 8 -> 9 (ADR-0041): Terraform source support. `SymKind` gained the
+/// `tf_*`/`tg_*` variants and HCL files now produce symbols and
+/// `references` edges. A v8 graph has HCL files but no Terraform symbols
+/// at all — `deps var.x --dir in` against it must fail with "re-run
+/// index" rather than answer "not found" (absence vs. zero again), and
+/// an older binary cannot deserialize the new `sym_kind` spellings.
+pub const SCHEMA_VERSION: u32 = 9;
 
 /// Max entries kept in `SymbolNode::unresolved_inbound_calls` /
 /// `DepsResult::root_unresolved_inbound_calls`; `_count` fields carry the

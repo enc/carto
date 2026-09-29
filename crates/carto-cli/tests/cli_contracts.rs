@@ -133,3 +133,28 @@ fn two_part_tf_extension_file_is_indexed_as_hcl_with_no_crash() {
         .expect("locals.tf.simu must be indexed as a File node");
     assert_eq!(locals_node["lang"], "hcl");
 }
+
+/// ADR-0041: an HCL contract literal now attaches to the enclosing
+/// resource symbol (the alarm), not just to its `File` node.
+#[test]
+fn hcl_consumer_site_is_the_alarm_resource_symbol() {
+    let tmp = TempDir::new("hcl-site");
+    index(tmp.path());
+
+    let output = Command::cargo_bin("carto")
+        .unwrap()
+        .args(["contract", "SequenceGapsTotal"])
+        .arg(fixture_path())
+        .arg("--out")
+        .arg(tmp.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(output).unwrap();
+    assert!(
+        text.contains("aws_cloudwatch_metric_alarm.sequence_gaps"),
+        "{text}"
+    );
+}

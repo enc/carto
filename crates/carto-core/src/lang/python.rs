@@ -64,6 +64,7 @@ impl LangExtractor for PythonExtractor {
             uncaptured_call_sites: Vec::new(),
             type_refs: extract_type_refs(root, src),
             declared_namespace: None,
+            terraform: None,
         }
     }
 }

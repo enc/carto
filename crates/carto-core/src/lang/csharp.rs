@@ -84,6 +84,7 @@ impl LangExtractor for CSharpExtractor {
             uncaptured_call_sites: Vec::new(),
             type_refs: extract_type_refs(root, src),
             declared_namespace,
+            terraform: None,
         }
     }
 }

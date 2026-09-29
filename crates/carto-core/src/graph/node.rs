@@ -192,6 +192,16 @@ pub enum SymKind {
     Type,
     Const,
     Var,
+    /// Terraform/Terragrunt declarations (ADR-0041): not in spec §4.1's
+    /// original list (amended by that ADR). Display-only — nothing in
+    /// `query`/the CLI/MCP branches on `sym_kind`.
+    TfVariable,
+    TfLocal,
+    TfOutput,
+    TfResource,
+    TfData,
+    TfModule,
+    TgDependency,
 }
 
 impl SymKind {
@@ -210,6 +220,13 @@ impl SymKind {
             SymKind::Type => "type",
             SymKind::Const => "const",
             SymKind::Var => "var",
+            SymKind::TfVariable => "tf_variable",
+            SymKind::TfLocal => "tf_local",
+            SymKind::TfOutput => "tf_output",
+            SymKind::TfResource => "tf_resource",
+            SymKind::TfData => "tf_data",
+            SymKind::TfModule => "tf_module",
+            SymKind::TgDependency => "tg_dependency",
         }
     }
 }
