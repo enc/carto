@@ -45,8 +45,12 @@ is done** (ADR-0017). **An MCP server slice** (normally M4, pulled ahead
 to measure spec §11.4's S-1 benchmark before more capability gets built —
 see [`bench/`](bench/)) also exists: `carto serve` exposes
 `index`/`where`/`deps`/`map`/`selfcheck` over MCP stdio
-([ADR-0018](docs/adr/0018-mcp-transport-hand-rolled-jsonrpc.md)). See
-[`docs/STATUS.md`](docs/STATUS.md) for the detailed handoff.
+([ADR-0018](docs/adr/0018-mcp-transport-hand-rolled-jsonrpc.md)).
+Also pulled ahead on request: cross-language string-literal contracts
+(`contract`/`orphans`, ADRs 0025–0027) and
+[monorepo / multi-component indexing](#monorepos-multiple-projects-in-one-tree)
+(ADRs 0034–0039). See [`docs/STATUS.md`](docs/STATUS.md) for the
+detailed handoff.
 
 ## Building
 
@@ -63,6 +67,154 @@ cargo build --release -p carto-cli
 # binary at target/release/carto — put it on PATH, or reference the
 # full path in the MCP config below.
 ```
+
+## Monorepos: multiple projects in one tree
+
+carto indexes **one directory tree** at a time. If that tree holds
+several projects — services, frontends, lambdas, shared libraries,
+Terraform — carto recognizes each of them as a **component** inside
+the tree. You still run a single `carto index <repo>`; there is no
+separate "multi-repo" mode and no way to index several unrelated
+checkouts into one graph.
+
+### What components change
+
+| Without components (single scope) | With components |
+|---|---|
+| Two services that both define `Handler` make every bare `Handler()` call ambiguous → no edge | A call prefers a match in its **own** component first, then falls back to repo-wide |
+| A PHP `use` / C# `using` can resolve to a same-named class in an unrelated service, at `certain` confidence | Same-component (then declared-dependency) targets are preferred; Rust `mod` never resolves across crates |
+| Cross-project edges look like any other edge | Edges crossing a component boundary carry `cross-component` evidence, plus `undeclared-dependency` if the caller's manifest doesn't declare the target |
+| Queries always cover the whole repo | `--component <name>` narrows `where`/`deps`/`map`/`contract`/`orphans` |
+
+A repo with no nested projects is unaffected: its graph just gets an
+empty `components` list and `component: null` on every file.
+
+### How components are found
+
+Automatically, from manifest files in **subdirectories** (the repo
+root itself is never a component — a manifest there describes the
+whole repo):
+
+| Marker in a directory | Component kind | `depends_on` resolved from |
+|---|---|---|
+| `go.mod` | `go` | `require` (matched to other components' `module`), local `replace` |
+| `package.json` | `node` | `dependencies`/`devDependencies`: `file:`/`workspace:` paths or package-name match |
+| `Cargo.toml` | `rust` | `path = "…"` entries in `[dependencies]`/`[dev-dependencies]`/`[build-dependencies]` |
+| `pyproject.toml`, `setup.py` | `python` | — (not resolved) |
+| `composer.json` | `php` | `"type": "path"` repositories, `require` name match |
+| `*.csproj`, `*.fsproj` | `dotnet` | `<ProjectReference>` |
+| ≥1 `.tf` file (no other marker) | `terraform` | — (not resolved) |
+
+Rules worth knowing:
+
+- **Name** = the directory's basename (`services/orders` → `orders`).
+  If two collide, both get extended by their parent directory
+  (`services-orders`, `lambdas-orders`).
+- **Workspace roots are skipped**: a `Cargo.toml` with `[workspace]`
+  but no `[package]`, or a `package.json` with a `"workspaces"` key or
+  a sibling `pnpm-workspace.yaml`/`lerna.json`/`turbo.json`/`nx.json`/
+  `rush.json`, is an aggregator, not a component.
+- **Terraform rolls up**: `infra/envs/prod`, `infra/envs/dev`,
+  `infra/modules/vpc` become one `infra` component, not three. A `.tf`
+  directory inside another component (`services/orders/infra`) belongs
+  to that component.
+- **Nesting**: a file belongs to its **innermost** component.
+  `--component api` also includes components nested under `api`'s
+  directory (not the other way round).
+- **`.gitignore`/`.cartoignore` apply**: a manifest carto doesn't walk
+  can't mark a component.
+
+### Overriding detection: `.carto/roots.json`
+
+Needed when auto-detection is wrong or insufficient — most commonly a
+repo with a **single top-level manifest** (one `go.mod` at the root
+with several `cmd/*` binaries), which yields zero components.
+`carto index` prints `components: 0` and a hint in that case.
+
+```json
+{
+  "detect": true,
+  "exclude": ["services/orders/infra"],
+  "roots": [
+    { "name": "ingest", "path": "lambdas/ingest", "kind": "python" },
+    { "name": "api",    "path": "cmd/api" }
+  ]
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `roots` | Declared components. `name` must match `^[A-Za-z0-9][A-Za-z0-9_.-]*$`; `path` is repo-relative and must contain at least one walked file; `kind` is free text, default `custom`. A declared root replaces an auto-detected one at the same path. |
+| `detect` | `true`: declared roots are **added** to auto-detection. `false`: **only** declared roots. Default: `true` if `roots` is empty, otherwise `false`. |
+| `exclude` | Repo-relative paths whose auto-detected components (and those nested below) are dropped. Applied before `roots`. |
+
+Invalid entries (bad name, `..` in a path, duplicate name/path, a name
+colliding with an auto-detected component) fail `index` with an error
+naming the file — they are never silently ignored.
+
+### Using it
+
+```bash
+carto index .                                   # prints "components: N"
+carto map . --section components                # list components, depends_on, cross-component edges
+carto where Handler . --exact                   # each hit labelled [component]
+carto deps Handler . --dir out --component orders   # disambiguate by component
+carto map . --component orders --component billing  # repeatable
+carto orphans . --category metric_name --component infra
+```
+
+Real output against [`fixtures/monorepo`](fixtures/monorepo/README.md):
+
+```
+## components
+  admin  path=web/admin kind=node files=2 symbols=3 depends_on=(none)
+  billing  path=services/billing kind=dotnet files=2 symbols=2 depends_on=(none)
+  infra  path=infra kind=terraform files=3 symbols=0 depends_on=(none)
+  ingest  path=lambdas/ingest kind=python files=1 symbols=2 depends_on=(none)
+  orders  path=services/orders kind=go files=3 symbols=2 depends_on=shared
+  shared  path=libs/shared kind=go files=2 symbols=1 depends_on=(none)
+## cross-component edges
+  orders -> shared: 1 calls(inferred)
+```
+
+A crossing to a component the caller's manifest does not declare is
+marked `[undeclared]` in that list. Over MCP, the same filter is the
+`component` argument on the `where`/`deps`/`map`/`contract`/`orphans`
+tools, as a comma-separated string (`"orders,billing"`).
+
+`--component` restricts **what is listed**, not what is computed:
+edges are resolved once at index time over the whole tree, so the
+filter never adds or removes an edge. The one extra effect is in
+`deps`: when a name matches several symbols, `--component` acts as a
+tiebreaker for picking the target, exactly like `--subpath`
+(ADR-0014/0035).
+
+### Not supported (yet)
+
+- **Several separate repositories/checkouts in one graph** — index
+  each on its own, or place them under one parent directory and index
+  that.
+- **One component spanning disjoint directories** (`services/orders`
+  + `libs/orders-proto` as a single component) — a component is
+  exactly one directory.
+- **`go.work` / nested-workspace hierarchies** beyond innermost-
+  directory nesting; no per-component `.cartoignore`.
+- **`depends_on` for `python`, `terraform` and declared (`custom`)
+  components** — always empty, meaning "not analysed", not "has no
+  dependencies"; these never get `undeclared-dependency` evidence.
+- **Links between components through deployed infrastructure** (a
+  service → the queue or Lambda it talks to) — that needs the infra
+  graph and code↔infra join (milestones M2/M3), which aren't built yet.
+  Today components are connected only by code-level calls/imports/type
+  references and string-literal contracts.
+
+Design record: ADRs
+[0034](docs/adr/0034-component-discovery-and-scoping.md),
+[0035](docs/adr/0035-component-scoped-resolution-and-query-layer.md),
+[0036](docs/adr/0036-cross-component-import-evidence-and-discoverability.md),
+[0037](docs/adr/0037-terraform-rollup-aggregator-parsing-exclude.md),
+[0038](docs/adr/0038-descendant-component-scoping.md),
+[0039](docs/adr/0039-component-dependency-graph.md).
 
 ## Using with Claude Code
 
