@@ -46,7 +46,7 @@
 //! is not field-free after all), used to skip bare object keys.
 
 use super::extractor::{
-    ExtractOut, LangExtractor, RawLiteral, RawSymbol, RawTfRef, TerraformFacts,
+    ExtractOut, LangExtractor, RawLiteral, RawSymbol, RawTfModuleCall, RawTfRef, TerraformFacts,
 };
 use crate::graph::SymKind;
 use crate::lang::Lang;
@@ -95,6 +95,7 @@ impl LangExtractor for HclExtractor {
         collect_symbols(tree.root_node(), src, &mut symbols);
         let mut refs = Vec::new();
         collect_refs(tree.root_node(), src, &mut refs);
+        let module_calls = collect_module_calls(tree.root_node(), src);
 
         ExtractOut {
             symbols,
@@ -103,6 +104,7 @@ impl LangExtractor for HclExtractor {
                 variant,
                 is_override,
                 refs,
+                module_calls,
             }),
             ..ExtractOut::default()
         }
@@ -249,6 +251,66 @@ fn collect_symbols(root: Node, src: &[u8], out: &mut Vec<RawSymbol>) {
             _ => {}
         }
     }
+}
+
+/// Attributes of a `module` block that are meta-arguments, not inputs to
+/// the called module's variables.
+const MODULE_META_ARGS: &[&str] = &[
+    "source",
+    "version",
+    "count",
+    "for_each",
+    "providers",
+    "depends_on",
+];
+
+/// Every top-level `module "name" { … }` call (ADR-0042).
+fn collect_module_calls(root: Node, src: &[u8]) -> Vec<RawTfModuleCall> {
+    let mut calls = Vec::new();
+    let Some(body) = root.children(&mut root.walk()).find(|c| c.kind() == "body") else {
+        return calls;
+    };
+    for block in body
+        .children(&mut body.walk())
+        .filter(|c| c.kind() == "block")
+    {
+        let (Some(ty), labels) = block_type_and_labels(block, src) else {
+            continue;
+        };
+        if ty != "module" || labels.len() != 1 || !valid_ident(&labels[0]) {
+            continue;
+        }
+        let mut call = RawTfModuleCall {
+            name: labels[0].clone(),
+            line: block.start_position().row as u32 + 1,
+            source: None,
+            dynamic_source: false,
+            args: Vec::new(),
+        };
+        if let Some(call_body) = block
+            .children(&mut block.walk())
+            .find(|c| c.kind() == "body")
+        {
+            for attr in call_body
+                .children(&mut call_body.walk())
+                .filter(|c| c.kind() == "attribute")
+            {
+                let Some(name) = attribute_name(attr, src) else {
+                    continue;
+                };
+                if name == "source" {
+                    match attribute_value_node(attr).and_then(|e| plain_string_value(e, src)) {
+                        Some(v) => call.source = Some(v),
+                        None => call.dynamic_source = true,
+                    }
+                } else if !MODULE_META_ARGS.contains(&name.as_str()) && valid_ident(&name) {
+                    call.args.push((name, attr.start_position().row as u32 + 1));
+                }
+            }
+        }
+        calls.push(call);
+    }
+    calls
 }
 
 /// Every reference expression in the file (see the module doc for why
@@ -755,5 +817,42 @@ locals {
             "locals {\n  a = 1\n}\ninputs = { r = local.a }\n",
         );
         assert!(out.symbols.is_empty() && out.terraform.is_none());
+    }
+
+    #[test]
+    fn module_calls_capture_source_and_inputs_but_not_meta_arguments() {
+        let out = extract_at(
+            "main.tf",
+            r#"
+module "vpc" {
+  source     = "../modules/vpc"
+  version    = "1.0"
+  count      = 2
+  depends_on = [module.other]
+  cidr       = var.cidr
+  region     = "x"
+}
+module "dyn" {
+  source = "${var.base}/m"
+}
+module "nosrc" {
+  a = 1
+}
+"#,
+        );
+        let calls = &out.terraform.as_ref().unwrap().module_calls;
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0].name, "vpc");
+        assert_eq!(calls[0].line, 2);
+        assert_eq!(calls[0].source.as_deref(), Some("../modules/vpc"));
+        assert!(!calls[0].dynamic_source);
+        assert_eq!(
+            calls[0].args,
+            vec![("cidr".to_string(), 7), ("region".to_string(), 8)]
+        );
+        assert_eq!(calls[1].source, None);
+        assert!(calls[1].dynamic_source);
+        assert_eq!(calls[2].source, None);
+        assert!(!calls[2].dynamic_source);
     }
 }

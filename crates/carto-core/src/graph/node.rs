@@ -205,6 +205,20 @@ pub enum SymKind {
 }
 
 impl SymKind {
+    /// Terraform/Terragrunt declaration kinds (ADR-0041).
+    pub fn is_terraform(self) -> bool {
+        matches!(
+            self,
+            SymKind::TfVariable
+                | SymKind::TfLocal
+                | SymKind::TfOutput
+                | SymKind::TfResource
+                | SymKind::TfData
+                | SymKind::TfModule
+                | SymKind::TgDependency
+        )
+    }
+
     /// The string used in the symbol's canonical key (spec §4.3:
     /// `sym:<relpath>:<sym_kind>:<qualified_name>:<start_line>`) and in
     /// serde output.

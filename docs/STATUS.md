@@ -601,6 +601,21 @@ so they've been subdivided. Current state:
   contents stay unread). Note: `carto-core`'s `trybuild` compile-fail
   suite mismatches its snapshots on rustc 1.94.1 (extra `println!`
   macro note) — pre-existing, identical on untouched `origin/main`.
+- **Terraform source support, slice 2 of 4 (2026-09-29, ADR-0042)** —
+  module calls. A local `source` (`./`, `../`) → file-level `imports`
+  fan-out to every `.tf` file of the target directory, `certain`
+  (`tf-module-source`); any other source → an external `Module` node
+  whose key has **credentials and `?query` stripped before it exists**
+  (`ModuleNode::path` is never redacted); `module.m.out` → the *called*
+  directory's `output`, module arguments → the called directory's
+  `variable`s (both `inferred`); missing target dir / argument /
+  output / dynamic source → `unresolved_calls`, never guessed.
+  `map --section infra` now summarizes source-level Terraform (counts
+  per kind, module-call graph, remote modules) and still says the
+  resolved graph needs M2; non-Terraform repos keep the placeholder.
+  No `SCHEMA_VERSION` change. `fixtures/tf-modules/.../modules.tf`,
+  +5 `cli_terraform.rs` tests, 19 `terraform.rs` tests. **Next:**
+  ADR-0043 Terragrunt, ADR-0044 tfvars caveat.
 - **M2+ remaining (infra graph proper, join, ingest)** — spec §10. The
   contract slice above is adjacent to, not a substitute for, this: no
   `IacResource`/`depends_on`/IAM extraction/§6.6 attribute allowlist
@@ -690,9 +705,11 @@ Do not "fix" these without checking the linked reasoning first:
   `unresolved_calls` entry means "not found among parsed files". No
   `count`/`for_each` instance expansion, no provider aliases, no
   `moved`/`import`/`check`/`provider`/`terraform` block symbols, nested
-  blocks are not symbols. Module calls, Terragrunt and the tfvars
-  caveat are ADR-0042/0043/0044 (not yet built); `*.hcl` files still
-  yield contract literals only.
+  blocks are not symbols. A token embedded in a remote module
+  source's *path* is not detected (userinfo and `?query` are
+  stripped, ADR-0042). Terragrunt and the tfvars caveat are
+  ADR-0043/0044 (not yet built); `*.hcl` files still yield contract
+  literals only.
 - **Rust path-qualified call resolution** (`Type::method()`, `module::func()`).
   Call matching is bare-name-only; those call sites aren't captured at all.
   Spec §5.3's "deliberately modest" policy — [ADR-0008](adr/0008-rust-resolution-policy-mapping.md).

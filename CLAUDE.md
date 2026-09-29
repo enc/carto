@@ -439,7 +439,12 @@ references are lexed from the source text after each `variable_expr`
 (sibling runs are unreliable inside binary operations — see ADR-0041's
 verified shapes before touching the walk); and edges are always
 `inferred` (spec §4.2), env-variant files (`locals.tf.simu`) fan out one
-edge per variant rather than guessing. `*.tfvars` stays on the sensitive
+edge per variant rather than guessing. Module calls (ADR-0042): a local
+`source` is a directory imported as a file-level fan-out (`certain`), a
+remote one an external `Module` node whose key has userinfo and
+`?query` stripped *before* it exists (`ModuleNode::path` is a plain
+`String` — redaction never sees it); `module.m.out` and module
+arguments cross into the *called* directory. `*.tfvars` stays on the sensitive
 denylist — contents are never read; ADR-0044 models the implication
 (a variable may be set outside the code) at query time instead.
 

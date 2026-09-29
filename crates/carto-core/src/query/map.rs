@@ -176,7 +176,7 @@ pub fn run(qg: &QueryGraph, query: &MapQuery) -> MapResult {
             MapSection::EntryPoints,
             entry_points_lines(qg, subpath, component),
         ),
-        (MapSection::Infra, infra_lines()),
+        (MapSection::Infra, infra_lines(qg, subpath, component)),
         (MapSection::Components, components_lines(&counts, qg)),
     ];
     let sections: Vec<Vec<String>> = all_sections
@@ -537,17 +537,113 @@ fn entry_points_lines(
     lines
 }
 
-/// Explicit placeholders rather than omitting the sections entirely —
+/// The `infra`/`join` sections. Without any Terraform symbol in scope
+/// these stay the explicit placeholders they have always been —
 /// an absent section reads as "no infra found"; a present one saying
 /// "not implemented" is honest about why (spec §10: infra is M2, the
-/// join is M3).
-fn infra_lines() -> Vec<String> {
-    vec![
-        "## infra".to_string(),
-        "  none — requires M2 (infrastructure graph)".to_string(),
+/// join is M3). With Terraform present (ADR-0041/0042) the `infra`
+/// section summarizes what *source-level* Terraform support can say —
+/// symbol counts, the module-call graph, remote modules — and states
+/// plainly that this is not a resolved plan (no `IacResource`,
+/// `depends_on` or IAM: those need plan/state-JSON ingestion, M2).
+fn infra_lines(
+    qg: &QueryGraph,
+    subpath: Option<&str>,
+    component: Option<&BTreeSet<String>>,
+) -> Vec<String> {
+    let in_scope = |id: &crate::graph::NodeId| {
+        qg.path_in_scope(id, subpath) && qg.component_in_scope(id, component)
+    };
+
+    let mut by_kind: BTreeMap<&'static str, usize> = BTreeMap::new();
+    for node in qg.nodes() {
+        if let NodeData::Symbol(s) = &node.data {
+            if s.sym_kind.is_terraform() && in_scope(&node.id) {
+                *by_kind.entry(s.sym_kind.as_str()).or_insert(0) += 1;
+            }
+        }
+    }
+    let join = [
         "## join".to_string(),
         "  none — requires M3 (code<->infra join)".to_string(),
-    ]
+    ];
+    if by_kind.is_empty() {
+        let mut lines = vec![
+            "## infra".to_string(),
+            "  none — requires M2 (infrastructure graph)".to_string(),
+        ];
+        lines.extend(join);
+        return lines;
+    }
+
+    let total: usize = by_kind.values().sum();
+    let kinds: Vec<String> = by_kind.iter().map(|(k, n)| format!("{n} {k}")).collect();
+    let mut lines = vec![
+        "## infra".to_string(),
+        format!(
+            "  source-level Terraform (parsed .tf files, not a resolved plan): {total} symbols — {}",
+            kinds.join(", ")
+        ),
+    ];
+
+    // Module-call graph: `imports` edges the Terraform pass tagged.
+    let dir_of = |id: &crate::graph::NodeId| -> Option<String> {
+        let path = &qg.node(id)?.data.as_file()?.path;
+        Some(
+            path.rsplit_once('/')
+                .map(|(d, _)| d)
+                .unwrap_or("")
+                .to_string(),
+        )
+    };
+    let mut calls: BTreeMap<(String, String), usize> = BTreeMap::new();
+    let mut remote: BTreeMap<String, usize> = BTreeMap::new();
+    for edge in qg.edges() {
+        if edge.kind != EdgeKind::Imports || !in_scope(&edge.from) {
+            continue;
+        }
+        match edge.evidence.first().map(String::as_str) {
+            Some("tf-module-source") => {
+                if let (Some(from), Some(to)) = (dir_of(&edge.from), dir_of(&edge.to)) {
+                    *calls.entry((from, to)).or_insert(0) += 1;
+                }
+            }
+            Some("tf-module-remote") => {
+                if let Some(NodeData::Module(m)) = qg.node(&edge.to).map(|n| &n.data) {
+                    *remote.entry(m.path.clone()).or_insert(0) += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    if !calls.is_empty() {
+        let mut ranked: Vec<_> = calls.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        ranked.truncate(RANKED_ROWS);
+        lines.push("  module calls (calling dir -> called dir, file-level imports):".to_string());
+        for ((from, to), n) in ranked {
+            let from = if from.is_empty() { "." } else { from.as_str() };
+            let to = if to.is_empty() { "." } else { to.as_str() };
+            lines.push(format!("    {from} -> {to}  ({n})"));
+        }
+    }
+    if !remote.is_empty() {
+        let mut ranked: Vec<_> = remote.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        ranked.truncate(RANKED_ROWS);
+        lines.push(
+            "  remote modules (registry/git/http sources, credentials stripped):".to_string(),
+        );
+        for (path, n) in ranked {
+            lines.push(format!("    {path}  in={n}"));
+        }
+    }
+    lines.push(
+        "  resolved infrastructure graph (IacResource, depends_on, IAM): none — requires M2 (plan/state JSON ingestion)"
+            .to_string(),
+    );
+    lines.extend(join);
+    lines
 }
 
 /// ADR-0034/0035: one row per in-scope component (from `counts.components`,

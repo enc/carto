@@ -136,7 +136,9 @@ fn references_stay_inside_their_own_module_directory() {
     // only to its own directory's declaration.
     let region: Vec<_> = refs
         .iter()
-        .filter(|(_, to, _, _)| to.starts_with("var.region@"))
+        .filter(|(_, to, _, ev)| {
+            to.starts_with("var.region@") && ev.contains(&"tf-ref:same-module".to_string())
+        })
         .map(|(from, to, _, _)| (from.as_str(), to.as_str()))
         .collect();
     assert!(region.contains(&(
@@ -151,7 +153,28 @@ fn references_stay_inside_their_own_module_directory() {
         "aws_s3_bucket.logs@infra/envs/prod/main.tf",
         "var.region@infra/envs/prod/variables.tf"
     )));
-    assert_eq!(region.len(), 3, "no cross-directory match: {region:?}");
+    // The property that matters: every same-module edge stays inside
+    // one directory, whatever else the fixture adds.
+    let dir_of = |label: &str| -> String {
+        let path = label.split_once('@').unwrap().1;
+        path.rsplit_once('/').unwrap().0.to_string()
+    };
+    for (from, to) in &region {
+        assert_eq!(
+            dir_of(from),
+            dir_of(to),
+            "cross-directory match: {from} -> {to}"
+        );
+    }
+    for (from, to, _, ev) in &refs {
+        if ev.contains(&"tf-ref:same-module".to_string()) {
+            assert_eq!(
+                dir_of(from),
+                dir_of(to),
+                "cross-directory match: {from} -> {to}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -273,4 +296,222 @@ fn graph_is_deterministic_and_leaks_no_declaration_values() {
     // reaches the graph.
     assert!(!ga.contains("eu-central-1"));
     assert!(!ga.contains("\"override\""));
+}
+
+// ---- ADR-0042: module calls ------------------------------------------
+
+const MODULES_TF: &str = "infra/envs/prod/modules.tf";
+
+/// `(from path, to label, confidence, evidence)` for every `imports`
+/// edge whose first evidence entry starts with `tf-module`.
+fn module_imports(graph: &Value) -> Vec<(String, String, String, Vec<String>)> {
+    let label: BTreeMap<&str, String> = graph["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|n| match n["kind"].as_str()? {
+            "file" => Some((n["id"].as_str()?, n["path"].as_str()?.to_string())),
+            "module" => Some((n["id"].as_str()?, n["path"].as_str()?.to_string())),
+            _ => None,
+        })
+        .collect();
+    let mut v: Vec<_> = graph["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["kind"] == "imports")
+        .filter(|e| {
+            e["evidence"][0]
+                .as_str()
+                .is_some_and(|s| s.starts_with("tf-module"))
+        })
+        .map(|e| {
+            (
+                label[e["from"].as_str().unwrap()].clone(),
+                label[e["to"].as_str().unwrap()].clone(),
+                e["confidence"].as_str().unwrap().to_string(),
+                e["evidence"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|s| s.as_str().unwrap().to_string())
+                    .collect(),
+            )
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+#[test]
+fn local_module_source_imports_every_file_of_the_target_directory_certain() {
+    let out = TempDir::new("mod-imports");
+    let graph: Value = serde_json::from_str(&index(out.path())).unwrap();
+    let imports = module_imports(&graph);
+
+    for (dir, files) in [
+        (
+            "infra/modules/vpc",
+            vec!["main.tf", "outputs.tf", "variables.tf"],
+        ),
+        ("infra/modules/app", vec!["main.tf", "variables.tf"]),
+    ] {
+        let mut got: Vec<&str> = imports
+            .iter()
+            .filter(|(f, t, _, _)| f == MODULES_TF && t.starts_with(&format!("{dir}/")))
+            .map(|(_, t, c, ev)| {
+                assert_eq!(c, "certain");
+                assert_eq!(ev, &vec!["tf-module-source".to_string()]);
+                t.rsplit('/').next().unwrap()
+            })
+            .collect();
+        got.sort();
+        assert_eq!(got, files, "{dir}");
+    }
+    // The unresolvable `../../modules/nope` produced no edge at all.
+    assert!(!imports.iter().any(|(_, t, _, _)| t.contains("nope")));
+}
+
+#[test]
+fn remote_module_sources_become_external_modules_with_credentials_stripped() {
+    let out = TempDir::new("mod-remote");
+    let raw = index(out.path());
+    let graph: Value = serde_json::from_str(&raw).unwrap();
+    let remote: Vec<_> = module_imports(&graph)
+        .into_iter()
+        .filter(|(_, _, _, ev)| ev[0] == "tf-module-remote")
+        .collect();
+    let targets: Vec<&str> = remote.iter().map(|(_, t, _, _)| t.as_str()).collect();
+    assert_eq!(
+        targets,
+        vec![
+            "git::https://example.com/org/net.git//modules/net",
+            "terraform-aws-modules/vpc/aws",
+        ]
+    );
+    assert!(remote.iter().all(|(_, _, c, _)| c == "certain"));
+    // INV-6: neither the fake token nor the query string reached disk.
+    for leaked in ["tok3n", "S3CR3T", "ci-user", "sshkey", "v1.2.0"] {
+        assert!(!raw.contains(leaked), "graph.json leaks {leaked}");
+    }
+}
+
+#[test]
+fn module_output_and_arguments_cross_into_the_called_directory() {
+    let out = TempDir::new("mod-cross");
+    let graph: Value = serde_json::from_str(&index(out.path())).unwrap();
+    let refs = references(&graph);
+    let has = |from: &str, to: &str, ev: &str| {
+        refs.iter().any(|(f, t, c, e)| {
+            f == from && t == to && c == "inferred" && e.contains(&ev.to_string())
+        })
+    };
+
+    // `module.vpc.vpc_id` reaches modules/vpc's output, not the same-named
+    // output declared in this very directory.
+    let from = format!("output.vpc_id@{MODULES_TF}");
+    assert!(has(
+        &from,
+        "output.vpc_id@infra/modules/vpc/outputs.tf",
+        "tf-ref:module-output"
+    ));
+    assert!(
+        !refs
+            .iter()
+            .any(|(f, t, _, _)| *f == from && t == &format!("output.vpc_id@{MODULES_TF}"))
+    );
+
+    // Arguments reach the target's variables.
+    let module_vpc = format!("module.vpc@{MODULES_TF}");
+    assert!(has(
+        &module_vpc,
+        "var.cidr@infra/modules/vpc/variables.tf",
+        "tf-module-arg"
+    ));
+    assert!(has(
+        &module_vpc,
+        "var.region@infra/modules/vpc/variables.tf",
+        "tf-module-arg"
+    ));
+    // ...and only vpc's, never app's.
+    assert!(!refs.iter().any(|(f, t, _, e)| *f == module_vpc
+        && t.contains("modules/app")
+        && e.contains(&"tf-module-arg".to_string())));
+    // The call's own inputs still reference the *caller's* variable.
+    assert!(has(
+        &module_vpc,
+        &format!("var.region@{PROD}/variables.tf"),
+        "tf-ref:same-module"
+    ));
+}
+
+#[test]
+fn unresolvable_module_pieces_are_reported_not_guessed() {
+    let out = TempDir::new("mod-unresolved");
+    let graph: Value = serde_json::from_str(&index(out.path())).unwrap();
+    let unresolved_of = |name: &str| -> Vec<String> {
+        graph["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| {
+                n["kind"] == "symbol"
+                    && n["name"] == name
+                    && n["file"] == graph_file_id(&graph, MODULES_TF)
+            })
+            .and_then(|n| n["unresolved_calls"].as_array())
+            .map(|a| {
+                a.iter()
+                    .map(|u| u["name"].as_str().unwrap().to_string())
+                    .collect()
+            })
+            .unwrap_or_else(|| panic!("no symbol {name}"))
+    };
+    assert_eq!(unresolved_of("module.vpc"), vec!["arg:bogus"]);
+    assert_eq!(
+        unresolved_of("module.missing_dir"),
+        vec!["source:infra/modules/nope"]
+    );
+    assert_eq!(
+        unresolved_of("output.bad_output"),
+        vec!["module.vpc.nonexistent"]
+    );
+}
+
+fn graph_file_id(graph: &Value, path: &str) -> String {
+    graph["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["kind"] == "file" && n["path"] == path)
+        .and_then(|n| n["id"].as_str())
+        .unwrap()
+        .to_string()
+}
+
+#[test]
+fn map_infra_section_summarizes_source_level_terraform_honestly() {
+    let out = TempDir::new("map-infra");
+    index(out.path());
+    let stdout = Command::cargo_bin("carto")
+        .unwrap()
+        .args(["map", "--section", "infra"])
+        .arg(fixture_path())
+        .arg("--out")
+        .arg(out.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(stdout).unwrap();
+    assert!(text.contains("source-level Terraform"), "{text}");
+    assert!(
+        text.contains("infra/envs/prod -> infra/modules/vpc"),
+        "{text}"
+    );
+    assert!(text.contains("terraform-aws-modules/vpc/aws"), "{text}");
+    // Still honest that this is not the resolved infrastructure graph.
+    assert!(text.contains("requires M2"), "{text}");
+    assert!(text.contains("requires M3"), "{text}");
 }

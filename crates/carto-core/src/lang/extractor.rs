@@ -288,6 +288,26 @@ pub struct RawTfRef {
     pub line: u32,
 }
 
+/// One `module "name" { source = …, arg = … }` call (ADR-0042).
+pub struct RawTfModuleCall {
+    pub name: String,
+    /// 1-based line of the `module` block's first line — matches the
+    /// `module.<name>` symbol's `start_line`, which is how the resolver
+    /// finds that symbol again.
+    pub line: u32,
+    /// The `source` attribute when it is a plain string literal.
+    pub source: Option<String>,
+    /// A `source` attribute exists but is not a plain literal (an
+    /// interpolation Terraform itself would reject) — recorded as an
+    /// unresolved miss rather than silently ignored.
+    pub dynamic_source: bool,
+    /// Argument names (attribute names in the block body other than the
+    /// meta-arguments `source`, `version`, `count`, `for_each`,
+    /// `providers`, `depends_on`) with their 1-based lines — each is an
+    /// input to the called module's `variable` of that name.
+    pub args: Vec<(String, u32)>,
+}
+
 /// What a `.tf` file's extraction carries beyond `symbols` (ADR-0041).
 /// `None` on [`ExtractOut::terraform`] for every non-Terraform file.
 #[derive(Default)]
@@ -301,6 +321,8 @@ pub struct TerraformFacts {
     /// a true duplicate.
     pub is_override: bool,
     pub refs: Vec<RawTfRef>,
+    /// ADR-0042.
+    pub module_calls: Vec<RawTfModuleCall>,
 }
 
 /// One file's raw extraction output (spec §5.2: "symbols, imports,

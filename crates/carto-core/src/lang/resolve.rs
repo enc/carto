@@ -544,6 +544,7 @@ pub fn resolve(
     // directory-scoped pass, never through the tier ladder above.
     let mut tf = super::terraform::resolve(&extractions, &symbol_ids);
     edges.append(&mut tf.edges);
+    let tf_nodes = std::mem::take(&mut tf.nodes);
 
     for (fi, fe) in extractions.iter().enumerate() {
         let (calls_by_symbol, unattached_calls) =
@@ -1272,6 +1273,13 @@ pub fn resolve(
         }
     }
 
+    // ADR-0042: external Module nodes for remote Terraform module
+    // sources — appended last, skipping an ID another producer already
+    // created (a `github.com/org/repo` source and a Go import of the
+    // same string are genuinely one external module).
+    let existing: BTreeSet<NodeId> = nodes.iter().map(|n| n.id.clone()).collect();
+    nodes.extend(tf_nodes.into_iter().filter(|n| !existing.contains(&n.id)));
+
     ResolvedExtraction { nodes, edges }
 }
 
@@ -1648,7 +1656,10 @@ impl<'a> CallResolver<'a> {
 /// only), `Imports`' evidence here is always a single already-decided
 /// `&'static str` constant with room to spare under
 /// `MAX_EVIDENCE_ENTRIES`.
-fn cross_component_marker(caller: Option<&str>, target: Option<&str>) -> Option<&'static str> {
+pub(super) fn cross_component_marker(
+    caller: Option<&str>,
+    target: Option<&str>,
+) -> Option<&'static str> {
     (caller != target).then_some("cross-component")
 }
 

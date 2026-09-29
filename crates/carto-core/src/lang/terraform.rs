@@ -1,8 +1,9 @@
-//! Terraform reference resolution (ADR-0041) — a dedicated pass, not
-//! `resolve.rs`'s generic call/type-ref tier ladder. That ladder ends in
-//! a repo-wide fallback, which is wrong by construction here: Terraform
-//! scope is exactly one directory (a module), so a `var.region` in
-//! `modules/a` must never match the `variable "region"` in `modules/b`.
+//! Terraform reference and module-call resolution (ADR-0041/0042) — a
+//! dedicated pass, not `resolve.rs`'s generic call/type-ref tier ladder.
+//! That ladder ends in a repo-wide fallback, which is wrong by
+//! construction here: Terraform scope is exactly one directory (a
+//! module), so a `var.region` in `modules/a` must never match the
+//! `variable "region"` in `modules/b`.
 //!
 //! **Scope.** A module is the set of `*.tf` files in one directory plus
 //! its environment-variant files (`locals.tf.simu`, `locals.tf.prod` —
@@ -29,16 +30,38 @@
 //!    dropped (ADR-0029's policy for type refs) — `each.value`, `count`,
 //!    `for`/`dynamic` iterators would otherwise flood the list.
 //!
-//! Edges are always `inferred` (spec §4.2 allows nothing higher for
-//! `references`; source-level scope only approximates what Terraform
-//! really loads).
+//! **Module calls (ADR-0042).** A `module "m" { source = … }` whose
+//! source starts with `./` or `../` is a directory path relative to the
+//! calling file: an `imports` edge, `certain` (spec §5.3 rule 1 — an
+//! exact relative path), from the calling file to every Terraform file
+//! in the target directory (the Go `PackagePath` fan-out shape), so
+//! `map`'s module ranking and entry points stay right with no changes.
+//! Any other source (registry, `git::`, `github.com/…`, `tfr://`, …) is
+//! an external `Module` node keyed by the source with credentials and
+//! query stripped ([`sanitize_remote_source`]). Across the call:
+//! `module.m.out` → the target directory's `output "out"`, and each
+//! `arg = …` inside the block → the target's `variable "arg"` (both
+//! `inferred`, like every other source-level reference). A target
+//! directory holding no walked Terraform file, an argument with no
+//! matching variable, or an output with no matching declaration is
+//! recorded in the `module.m` (or enclosing) symbol's
+//! `unresolved_calls`, never guessed.
+//!
+//! Reference edges are always `inferred` (spec §4.2 allows nothing
+//! higher for `references`; source-level scope only approximates what
+//! Terraform really loads).
 
-use super::extractor::RawTfRef;
-use super::resolve::{FileExtraction, relpath_dir, smallest_containing_symbol};
-use crate::graph::{Confidence, Edge, EdgeKind, NodeId, UnresolvedCall};
-use std::collections::BTreeMap;
+use super::extractor::{RawTfModuleCall, RawTfRef};
+use super::resolve::{
+    FileExtraction, cross_component_marker, relpath_dir, smallest_containing_symbol,
+};
+use crate::graph::{Confidence, Edge, EdgeKind, ModuleNode, Node, NodeId, UnresolvedCall};
+use crate::taint::Provenance;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub(super) struct TerraformResolved {
+    /// External `Module` nodes for remote module sources.
+    pub nodes: Vec<Node>,
     pub edges: Vec<Edge>,
     /// `(file index, symbol index)` → misses to append to that symbol's
     /// `unresolved_calls`.
@@ -79,67 +102,317 @@ fn target_name(segments: &[String]) -> Option<(String, Shape)> {
     }
 }
 
-struct Def<'a> {
+/// Terraform's own rule: a local module source starts with `./` or `../`.
+fn is_local_source(source: &str) -> bool {
+    source.starts_with("./") || source.starts_with("../")
+}
+
+/// `rel` applied to the repo-relative directory `base`, `.`/`..`
+/// resolved and `//` collapsed. `None` if it escapes the repo root.
+fn normalize_rel(base: &str, rel: &str) -> Option<String> {
+    let mut segments: Vec<&str> = base.split('/').filter(|s| !s.is_empty()).collect();
+    for seg in rel.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                segments.pop()?;
+            }
+            other => segments.push(other),
+        }
+    }
+    Some(segments.join("/"))
+}
+
+/// Repo-relative paths only ever reach a plain-`String` field
+/// (`UnresolvedCall::name`) if they are path-shaped (INV-5: repo text is
+/// untrusted, and this string comes from a literal).
+fn safe_path(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 200
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
+}
+
+/// The key of the external `Module` node for a remote module source:
+/// the source with any `?query`/`#fragment` dropped (`?ref=…` and
+/// `?sshkey=…` are where tokens go) and any `user[:password]@` userinfo
+/// removed — `git::https://user:tok@host/x.git?ref=v1` becomes
+/// `git::https://host/x.git`. `//subdir` is kept. `None` when the result
+/// still isn't plain path-shaped text (`ModuleNode::path` is a plain
+/// `String`, never redacted — INV-6/INV-5), so nothing exotic is
+/// persisted. A token embedded in the *path* itself cannot be detected
+/// here; ADR-0042 records that limit.
+pub(super) fn sanitize_remote_source(source: &str) -> Option<String> {
+    let s = source.split(['?', '#']).next().unwrap_or("");
+    let (getter, rest) = match s.split_once("::") {
+        Some((g, r)) => (Some(g), r),
+        None => (None, s),
+    };
+    let cleaned = if let Some((scheme, after)) = rest.split_once("://") {
+        let (authority, path) = match after.split_once('/') {
+            Some((a, p)) => (a, Some(p)),
+            None => (after, None),
+        };
+        let host = authority.rsplit('@').next().unwrap_or(authority);
+        match path {
+            Some(p) => format!("{scheme}://{host}/{p}"),
+            None => format!("{scheme}://{host}"),
+        }
+    } else {
+        // scp-style `user@host:org/repo` — drop the user part.
+        match rest.split_once('@') {
+            Some((user, after)) if !user.contains('/') => after.to_string(),
+            _ => rest.to_string(),
+        }
+    };
+    let out = match getter {
+        Some(g) => format!("{g}::{cleaned}"),
+        None => cleaned,
+    };
+    let ok = !out.is_empty()
+        && out.len() <= 200
+        && out.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, '.' | '_' | '~' | ':' | '/' | '+' | '%' | '=' | '-')
+        });
+    ok.then_some(out)
+}
+
+struct Def {
     fi: usize,
     si: usize,
-    variant: Option<&'a str>,
+    variant: Option<String>,
     is_override: bool,
+}
+
+struct Ctx<'a> {
+    extractions: &'a [FileExtraction],
+    symbol_ids: &'a [Vec<NodeId>],
+    /// (directory, address) -> every definition, in file order.
+    defs: BTreeMap<(String, String), Vec<Def>>,
+    /// directory -> every Terraform file in it.
+    files_by_dir: BTreeMap<&'a str, Vec<usize>>,
+    /// (calling directory, module name) -> the local target
+    /// directories its `source` resolves to (more than one only when
+    /// env-variant files disagree — then module-crossing edges are
+    /// skipped rather than guessed).
+    module_dirs: BTreeMap<(String, String), BTreeSet<String>>,
+}
+
+impl<'a> Ctx<'a> {
+    /// Definitions of `name` in `dir` usable from a file with `variant`,
+    /// with `override.tf` candidates dropped when a base exists.
+    fn live(&self, dir: &str, name: &str, variant: Option<&str>) -> Vec<&Def> {
+        let mut live: Vec<&Def> = self
+            .defs
+            .get(&(dir.to_string(), name.to_string()))
+            .map(|v| v.iter())
+            .into_iter()
+            .flatten()
+            .filter(|d| d.variant.is_none() || d.variant.as_deref() == variant)
+            .collect();
+        if live.iter().any(|d| !d.is_override) {
+            live.retain(|d| !d.is_override);
+        }
+        live
+    }
 }
 
 pub(super) fn resolve(
     extractions: &[FileExtraction],
     symbol_ids: &[Vec<NodeId>],
 ) -> TerraformResolved {
-    // (directory, address) -> every definition, in file order.
-    let mut defs: BTreeMap<(&str, &str), Vec<Def<'_>>> = BTreeMap::new();
+    let mut ctx = Ctx {
+        extractions,
+        symbol_ids,
+        defs: BTreeMap::new(),
+        files_by_dir: BTreeMap::new(),
+        module_dirs: BTreeMap::new(),
+    };
     for (fi, fe) in extractions.iter().enumerate() {
         let Some(tf) = &fe.extract.terraform else {
             continue;
         };
+        let dir = relpath_dir(&fe.relpath);
+        ctx.files_by_dir.entry(dir).or_default().push(fi);
         for (si, sym) in fe.extract.symbols.iter().enumerate() {
-            defs.entry((relpath_dir(&fe.relpath), sym.name.as_str()))
+            ctx.defs
+                .entry((dir.to_string(), sym.name.clone()))
                 .or_default()
                 .push(Def {
                     fi,
                     si,
-                    variant: tf.variant.as_deref(),
+                    variant: tf.variant.clone(),
                     is_override: tf.is_override,
                 });
         }
     }
+    // Needs `files_by_dir` complete, hence a second walk.
+    let mut module_dirs: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
+    for fe in extractions {
+        let Some(tf) = &fe.extract.terraform else {
+            continue;
+        };
+        let dir = relpath_dir(&fe.relpath);
+        for call in &tf.module_calls {
+            let Some(src) = call.source.as_deref().filter(|s| is_local_source(s)) else {
+                continue;
+            };
+            let Some(target) = normalize_rel(dir, src) else {
+                continue;
+            };
+            if ctx.files_by_dir.contains_key(target.as_str()) {
+                module_dirs
+                    .entry((dir.to_string(), call.name.clone()))
+                    .or_default()
+                    .insert(target);
+            }
+        }
+    }
+    ctx.module_dirs = module_dirs;
 
     let mut out = TerraformResolved {
+        nodes: Vec::new(),
         edges: Vec::new(),
         unresolved: BTreeMap::new(),
     };
+    let mut remote_nodes: BTreeMap<String, NodeId> = BTreeMap::new();
 
     for (fi, fe) in extractions.iter().enumerate() {
         let Some(tf) = &fe.extract.terraform else {
             continue;
         };
         let dir = relpath_dir(&fe.relpath);
+        for call in &tf.module_calls {
+            resolve_module_call(&mut out, &mut remote_nodes, &ctx, fi, dir, call);
+        }
         for r in &tf.refs {
-            resolve_ref(
-                &mut out,
-                extractions,
-                symbol_ids,
-                &defs,
-                fi,
-                dir,
-                tf.variant.as_deref(),
-                r,
-            );
+            resolve_ref(&mut out, &ctx, fi, dir, tf.variant.as_deref(), r);
         }
     }
     out
 }
 
-#[allow(clippy::too_many_arguments)]
+fn record_miss(out: &mut TerraformResolved, at: Option<(usize, usize)>, name: String, line: u32) {
+    if let Some(key) = at {
+        out.unresolved
+            .entry(key)
+            .or_default()
+            .push(UnresolvedCall { name, line });
+    }
+}
+
+fn resolve_module_call(
+    out: &mut TerraformResolved,
+    remote_nodes: &mut BTreeMap<String, NodeId>,
+    ctx: &Ctx<'_>,
+    fi: usize,
+    dir: &str,
+    call: &RawTfModuleCall,
+) {
+    let fe = &ctx.extractions[fi];
+    let module_name = format!("module.{}", call.name);
+    let module_si = fe
+        .extract
+        .symbols
+        .iter()
+        .position(|s| s.start_line == call.line && s.name == module_name);
+    let at = module_si.map(|si| (fi, si));
+
+    let Some(source) = call.source.as_deref() else {
+        if call.dynamic_source {
+            record_miss(out, at, "source:<dynamic>".into(), call.line);
+        }
+        return;
+    };
+
+    if !is_local_source(source) {
+        match sanitize_remote_source(source) {
+            Some(key) => {
+                let id = remote_nodes
+                    .entry(key.clone())
+                    .or_insert_with(|| {
+                        let id = crate::graph::module_id(&key, true);
+                        out.nodes.push(Node::module(
+                            id.clone(),
+                            Provenance::Syntactic,
+                            fe.origin,
+                            ModuleNode {
+                                path: key.clone(),
+                                external: true,
+                            },
+                        ));
+                        id
+                    })
+                    .clone();
+                out.edges.push(Edge::new(
+                    EdgeKind::Imports,
+                    fe.file_id.clone(),
+                    id,
+                    Confidence::Certain,
+                    "tf-module-remote".to_string(),
+                ));
+            }
+            None => record_miss(out, at, "source:<remote>".into(), call.line),
+        }
+        return;
+    }
+
+    let Some(target) = normalize_rel(dir, source) else {
+        record_miss(out, at, "source:<outside-repo>".into(), call.line);
+        return;
+    };
+    let Some(target_files) = ctx.files_by_dir.get(target.as_str()) else {
+        let shown = if safe_path(&target) {
+            target.as_str()
+        } else {
+            "<invalid>"
+        };
+        record_miss(out, at, format!("source:{shown}"), call.line);
+        return;
+    };
+    for &tfi in target_files {
+        let target_fe = &ctx.extractions[tfi];
+        if target_fe.file_id == fe.file_id {
+            continue;
+        }
+        let mut edge = Edge::new(
+            EdgeKind::Imports,
+            fe.file_id.clone(),
+            target_fe.file_id.clone(),
+            Confidence::Certain,
+            "tf-module-source".to_string(),
+        );
+        if let Some(marker) =
+            cross_component_marker(fe.component.as_deref(), target_fe.component.as_deref())
+        {
+            edge.evidence.push(marker.to_string());
+        }
+        out.edges.push(edge);
+    }
+
+    // Each argument is an input to the target's `variable` of that name.
+    let Some(module_si) = module_si else {
+        return;
+    };
+    for (arg, line) in &call.args {
+        let candidates = ctx.live(&target, &format!("var.{arg}"), None);
+        match candidates.as_slice() {
+            [one] => out.edges.push(Edge::new(
+                EdgeKind::References,
+                ctx.symbol_ids[fi][module_si].clone(),
+                ctx.symbol_ids[one.fi][one.si].clone(),
+                Confidence::Inferred,
+                "tf-module-arg".to_string(),
+            )),
+            _ => record_miss(out, at, format!("arg:{arg}"), *line),
+        }
+    }
+}
+
 fn resolve_ref(
     out: &mut TerraformResolved,
-    extractions: &[FileExtraction],
-    symbol_ids: &[Vec<NodeId>],
-    defs: &BTreeMap<(&str, &str), Vec<Def<'_>>>,
+    ctx: &Ctx<'_>,
     fi: usize,
     dir: &str,
     variant: Option<&str>,
@@ -148,28 +421,22 @@ fn resolve_ref(
     let Some((name, shape)) = target_name(&r.segments) else {
         return;
     };
-    let fe = &extractions[fi];
+    let fe = &ctx.extractions[fi];
     let enclosing = smallest_containing_symbol(&fe.extract.symbols, r.line);
     let from_id = match enclosing {
-        Some(si) => symbol_ids[fi][si].clone(),
+        Some(si) => ctx.symbol_ids[fi][si].clone(),
         None => fe.file_id.clone(),
     };
 
-    let all: &[Def<'_>] = defs
-        .get(&(dir, name.as_str()))
+    let all: &[Def] = ctx
+        .defs
+        .get(&(dir.to_string(), name.clone()))
         .map(Vec::as_slice)
         .unwrap_or(&[]);
+    let live = ctx.live(dir, &name, variant);
 
-    let mut live: Vec<&Def<'_>> = all
-        .iter()
-        .filter(|d| d.variant.is_none() || d.variant == variant)
-        .collect();
-    if live.iter().any(|d| !d.is_override) {
-        live.retain(|d| !d.is_override);
-    }
-
-    let mut push_edge = |d: &Def<'_>, evidence: Vec<String>| {
-        let to_id = symbol_ids[d.fi][d.si].clone();
+    let mut push_edge = |d: &Def, evidence: Vec<String>| {
+        let to_id = ctx.symbol_ids[d.fi][d.si].clone();
         if to_id == from_id {
             return; // a declaration naming itself is not a dependency
         }
@@ -190,7 +457,7 @@ fn resolve_ref(
         [] if !all.is_empty() => {
             // Defined only in other environment variants.
             for d in all {
-                let suffix = d.variant.unwrap_or_default();
+                let suffix = d.variant.as_deref().unwrap_or_default();
                 push_edge(
                     d,
                     vec![
@@ -203,14 +470,47 @@ fn resolve_ref(
         [] if shape == Shape::ResourceShaped => {}
         // Genuinely undefined, or a real duplicate: no edge, and say so
         // on the enclosing symbol (no enclosing symbol: nowhere to say it).
-        _ => {
-            if let Some(si) = enclosing {
-                out.unresolved
-                    .entry((fi, si))
-                    .or_default()
-                    .push(UnresolvedCall { name, line: r.line });
-            }
-        }
+        _ => record_miss(out, enclosing.map(|si| (fi, si)), name, r.line),
+    }
+
+    // `module.m.out`: also cross into the called module's `output "out"`.
+    if r.segments.first().map(String::as_str) == Some("module") && r.segments.len() >= 3 {
+        resolve_module_output(out, ctx, fi, dir, enclosing, &from_id, r);
+    }
+}
+
+fn resolve_module_output(
+    out: &mut TerraformResolved,
+    ctx: &Ctx<'_>,
+    fi: usize,
+    dir: &str,
+    enclosing: Option<usize>,
+    from_id: &NodeId,
+    r: &RawTfRef,
+) {
+    let (module, output) = (&r.segments[1], &r.segments[2]);
+    let Some(dirs) = ctx.module_dirs.get(&(dir.to_string(), module.clone())) else {
+        return; // remote, unresolved, or not a module call we saw: nothing to cross into
+    };
+    let mut it = dirs.iter();
+    let (Some(target), None) = (it.next(), it.next()) else {
+        return; // env variants disagree on the source: ambiguous, skip
+    };
+    let candidates = ctx.live(target, &format!("output.{output}"), None);
+    match candidates.as_slice() {
+        [one] => out.edges.push(Edge::new(
+            EdgeKind::References,
+            from_id.clone(),
+            ctx.symbol_ids[one.fi][one.si].clone(),
+            Confidence::Inferred,
+            "tf-ref:module-output".to_string(),
+        )),
+        _ => record_miss(
+            out,
+            enclosing.map(|si| (fi, si)),
+            format!("module.{module}.{output}"),
+            r.line,
+        ),
     }
 }
 
@@ -472,5 +772,169 @@ mod tests {
             edges.iter().any(|e| e.kind == EdgeKind::Calls),
             "the Python call must still resolve: {nodes:?}"
         );
+    }
+
+    // ---- ADR-0042 -----------------------------------------------------
+
+    #[test]
+    fn normalize_rel_resolves_dots_and_refuses_to_escape_the_repo() {
+        assert_eq!(
+            normalize_rel("infra/envs/prod", "../../modules/vpc").as_deref(),
+            Some("infra/modules/vpc")
+        );
+        assert_eq!(normalize_rel("", "./m").as_deref(), Some("m"));
+        assert_eq!(normalize_rel("x", "./a//b").as_deref(), Some("x/a/b"));
+        assert_eq!(normalize_rel("a", "../../x"), None);
+    }
+
+    #[test]
+    fn remote_sources_lose_credentials_and_query_but_keep_the_subdir() {
+        for (input, expected) in [
+            (
+                "terraform-aws-modules/vpc/aws",
+                Some("terraform-aws-modules/vpc/aws"),
+            ),
+            (
+                "git::https://user:tok@host.com/x.git?ref=v1",
+                Some("git::https://host.com/x.git"),
+            ),
+            (
+                "git::https://host.com/x.git//sub/dir?ref=v1&sshkey=abc",
+                Some("git::https://host.com/x.git//sub/dir"),
+            ),
+            (
+                "git@github.com:org/repo.git",
+                Some("github.com:org/repo.git"),
+            ),
+            (
+                "git::git@github.com:org/repo.git?ref=x",
+                Some("git::github.com:org/repo.git"),
+            ),
+            (
+                "github.com/org/repo//sub?ref=1",
+                Some("github.com/org/repo//sub"),
+            ),
+            (
+                "tfr://registry.terraform.io/hashicorp/x/aws",
+                Some("tfr://registry.terraform.io/hashicorp/x/aws"),
+            ),
+            ("https://example.com/a b", None),
+            ("", None),
+        ] {
+            assert_eq!(
+                sanitize_remote_source(input).as_deref(),
+                expected,
+                "{input}"
+            );
+        }
+    }
+
+    fn imports(edges: &[Edge]) -> Vec<&Edge> {
+        edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::Imports)
+            .collect()
+    }
+
+    #[test]
+    fn module_call_fans_out_to_every_file_and_marks_component_crossings() {
+        let mut caller = tf_file("env/main.tf", "module \"m\" {\n  source = \"../mod\"\n}\n");
+        // `../mod` lacks the required `./`/`../` prefix? No: it has `../`.
+        caller.component = Some("a".into());
+        let mut t1 = tf_file("mod/a.tf", "variable \"x\" {}\n");
+        let mut t2 = tf_file("mod/b.tf", "variable \"y\" {}\n");
+        t1.component = Some("b".into());
+        t2.component = Some("b".into());
+        let (_, edges) = run(vec![caller, t1, t2]);
+        let imp = imports(&edges);
+        assert_eq!(imp.len(), 2);
+        for e in imp {
+            assert_eq!(e.confidence, Confidence::Certain);
+            assert_eq!(
+                e.evidence,
+                vec![
+                    "tf-module-source".to_string(),
+                    "cross-component".to_string()
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn a_source_without_dot_slash_is_remote_not_a_directory() {
+        // Terraform's own rule: `mod/x` is a registry/VCS address.
+        let (nodes, edges) = run(vec![
+            tf_file("env/main.tf", "module \"m\" {\n  source = \"mod/x\"\n}\n"),
+            tf_file("env/mod/x/a.tf", "variable \"v\" {}\n"),
+        ]);
+        let imp = imports(&edges);
+        assert_eq!(imp.len(), 1);
+        assert_eq!(imp[0].evidence, vec!["tf-module-remote".to_string()]);
+        assert!(nodes.iter().any(|n| matches!(
+            &n.data,
+            NodeData::Module(m) if m.external && m.path == "mod/x"
+        )));
+    }
+
+    #[test]
+    fn an_interpolated_source_is_reported_not_ignored() {
+        let (nodes, edges) = run(vec![
+            tf_file("env/vars.tf", "variable \"base\" {}\n"),
+            tf_file(
+                "env/main.tf",
+                "module \"m\" {\n  source = \"${var.base}/mod\"\n}\n",
+            ),
+        ]);
+        assert!(imports(&edges).is_empty());
+        assert_eq!(unresolved(&nodes, "module.m"), vec!["source:<dynamic>"]);
+    }
+
+    #[test]
+    fn a_source_escaping_the_repo_root_is_reported() {
+        let (nodes, edges) = run(vec![tf_file(
+            "env/main.tf",
+            "module \"m\" {\n  source = \"../../../elsewhere\"\n}\n",
+        )]);
+        assert!(imports(&edges).is_empty());
+        assert_eq!(
+            unresolved(&nodes, "module.m"),
+            vec!["source:<outside-repo>"]
+        );
+    }
+
+    #[test]
+    fn variants_that_disagree_on_a_module_source_skip_output_crossing() {
+        let (nodes, edges) = run(vec![
+            tf_file("env/a.tf.simu", "module \"m\" {\n  source = \"../x\"\n}\n"),
+            tf_file("env/a.tf.prod", "module \"m\" {\n  source = \"../y\"\n}\n"),
+            tf_file("x/o.tf", "output \"o\" {\n  value = 1\n}\n"),
+            tf_file("y/o.tf", "output \"o\" {\n  value = 2\n}\n"),
+            tf_file("env/main.tf", "output \"z\" {\n  value = module.m.o\n}\n"),
+        ]);
+        assert!(
+            !edges
+                .iter()
+                .any(|e| e.evidence.contains(&"tf-ref:module-output".to_string())),
+            "ambiguous module target must not be guessed"
+        );
+        assert!(unresolved(&nodes, "output.z").is_empty());
+    }
+
+    #[test]
+    fn module_arguments_resolve_against_the_target_and_misses_are_reported() {
+        let (nodes, edges) = run(vec![
+            tf_file(
+                "env/main.tf",
+                "module \"m\" {\n  source = \"../mod\"\n  count  = 2\n  a      = 1\n  nope   = 2\n}\n",
+            ),
+            tf_file("mod/v.tf", "variable \"a\" {}\n"),
+        ]);
+        let args: Vec<_> = edges
+            .iter()
+            .filter(|e| e.evidence == vec!["tf-module-arg".to_string()])
+            .collect();
+        assert_eq!(args.len(), 1);
+        // `count` is a meta-argument, not an input.
+        assert_eq!(unresolved(&nodes, "module.m"), vec!["arg:nope"]);
     }
 }
