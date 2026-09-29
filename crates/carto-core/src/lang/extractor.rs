@@ -308,6 +308,48 @@ pub struct RawTfModuleCall {
     pub args: Vec<(String, u32)>,
 }
 
+/// A path-valued Terragrunt expression, classified structurally at
+/// extraction time (ADR-0043). Only exact, statically decidable shapes
+/// are recognized; everything else is [`TgPath::Unresolvable`] and
+/// produces no edge — carto never executes Terragrunt functions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TgPath {
+    /// A plain string literal (`"../vpc"`, `"git::https://…//mod"`).
+    Literal(String),
+    /// `"${get_terragrunt_dir()}<suffix>"` — the unit's own directory
+    /// plus a literal suffix (empty when nothing follows).
+    TerragruntDir(String),
+    /// `find_in_parent_folders()` / `find_in_parent_folders("name")`.
+    FindInParentFolders(Option<String>),
+    /// `get_repo_root()`, `path_relative_to_include()`,
+    /// `include.x.locals.y`, string interpolation of anything else, …
+    Unresolvable,
+}
+
+/// One `dependency "name" { config_path = … }` block.
+pub struct RawTgDependency {
+    pub name: String,
+    /// 1-based first line of the block — matches the
+    /// `dependency.<name>` symbol's `start_line`.
+    pub line: u32,
+    pub config_path: TgPath,
+}
+
+/// What a Terragrunt file (`terragrunt.hcl`, `root.hcl`) says about its
+/// relations to other files (ADR-0043).
+#[derive(Default)]
+pub struct RawTerragrunt {
+    /// `terraform { source = … }`.
+    pub source: Option<TgPath>,
+    pub dependencies: Vec<RawTgDependency>,
+    /// `dependencies { paths = [ … ] }`.
+    pub dependencies_paths: Vec<TgPath>,
+    /// Every `include` / `include "label"` block's `path`.
+    pub includes: Vec<TgPath>,
+    /// Identifier-shaped keys of the top-level `inputs = { … }` object.
+    pub inputs: Vec<String>,
+}
+
 /// What a `.tf` file's extraction carries beyond `symbols` (ADR-0041).
 /// `None` on [`ExtractOut::terraform`] for every non-Terraform file.
 #[derive(Default)]
@@ -323,6 +365,11 @@ pub struct TerraformFacts {
     pub refs: Vec<RawTfRef>,
     /// ADR-0042.
     pub module_calls: Vec<RawTfModuleCall>,
+    /// `Some` for a Terragrunt file (ADR-0043). Such a file is its own
+    /// resolution scope (not its directory's): Terragrunt `locals` are
+    /// file-local, and a `local.x` there must never match a `.tf` local
+    /// that happens to sit in the same directory.
+    pub terragrunt: Option<RawTerragrunt>,
 }
 
 /// One file's raw extraction output (spec §5.2: "symbols, imports,

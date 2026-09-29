@@ -46,7 +46,8 @@
 //! is not field-free after all), used to skip bare object keys.
 
 use super::extractor::{
-    ExtractOut, LangExtractor, RawLiteral, RawSymbol, RawTfModuleCall, RawTfRef, TerraformFacts,
+    ExtractOut, LangExtractor, RawLiteral, RawSymbol, RawTerragrunt, RawTfModuleCall, RawTfRef,
+    RawTgDependency, TerraformFacts, TgPath,
 };
 use crate::graph::SymKind;
 use crate::lang::Lang;
@@ -84,18 +85,27 @@ impl LangExtractor for HclExtractor {
         walk_blocks(tree.root_node(), src, &mut literals);
 
         let file_name = relpath.rsplit('/').next().unwrap_or(relpath);
-        let Some((variant, is_override)) = terraform_file_kind(file_name) else {
-            return ExtractOut {
-                literals,
-                ..ExtractOut::default()
-            };
+        let root = tree.root_node();
+        let (variant, is_override, terragrunt) = match terraform_file_kind(file_name) {
+            Some((variant, is_override)) => (variant, is_override, false),
+            None if is_terragrunt_file(file_name) => (None, false, true),
+            None => {
+                return ExtractOut {
+                    literals,
+                    ..ExtractOut::default()
+                };
+            }
         };
 
         let mut symbols = Vec::new();
-        collect_symbols(tree.root_node(), src, &mut symbols);
+        collect_symbols(root, src, terragrunt, &mut symbols);
         let mut refs = Vec::new();
-        collect_refs(tree.root_node(), src, &mut refs);
-        let module_calls = collect_module_calls(tree.root_node(), src);
+        collect_refs(root, src, &mut refs);
+        let module_calls = if terragrunt {
+            Vec::new()
+        } else {
+            collect_module_calls(root, src)
+        };
 
         ExtractOut {
             symbols,
@@ -105,10 +115,20 @@ impl LangExtractor for HclExtractor {
                 is_override,
                 refs,
                 module_calls,
+                terragrunt: terragrunt.then(|| collect_terragrunt(root, src)),
             }),
             ..ExtractOut::default()
         }
     }
+}
+
+/// The Terragrunt files this extractor understands (ADR-0043). Other
+/// `*.hcl` files (`common.hcl`, `env.hcl`, Packer/Nomad/Vault, the
+/// `.terraform.lock.hcl` lock file) stay literals-only: a file's role
+/// can't be told from its extension, and their `locals` are read via
+/// `read_terragrunt_config(...)`, which carto does not follow.
+fn is_terragrunt_file(file_name: &str) -> bool {
+    matches!(file_name, "terragrunt.hcl" | "root.hcl")
 }
 
 /// `Some((variant, is_override))` for a Terraform source file name:
@@ -163,7 +183,7 @@ fn push_symbol(
 
 /// Top-level blocks only — nested blocks (`dynamic`, `lifecycle`,
 /// `content`, …) are part of their enclosing declaration.
-fn collect_symbols(root: Node, src: &[u8], out: &mut Vec<RawSymbol>) {
+fn collect_symbols(root: Node, src: &[u8], terragrunt: bool, out: &mut Vec<RawSymbol>) {
     let Some(body) = root.children(&mut root.walk()).find(|c| c.kind() == "body") else {
         return;
     };
@@ -187,6 +207,15 @@ fn collect_symbols(root: Node, src: &[u8], out: &mut Vec<RawSymbol>) {
             h
         };
         match (ty.as_str(), labels.len()) {
+            ("dependency", 1) if terragrunt => push_symbol(
+                out,
+                format!("dependency.{}", labels[0]),
+                SymKind::TgDependency,
+                block,
+                header(1),
+            ),
+            // Terragrunt files declare only `locals` and `dependency`.
+            (_, _) if terragrunt && ty != "locals" => {}
             ("variable", 1) => push_symbol(
                 out,
                 format!("var.{}", labels[0]),
@@ -251,6 +280,188 @@ fn collect_symbols(root: Node, src: &[u8], out: &mut Vec<RawSymbol>) {
             _ => {}
         }
     }
+}
+
+/// First named child of an `expression` node (the value shape).
+fn expr_inner(expr: Node) -> Option<Node> {
+    expr.named_child(0)
+}
+
+/// Classifies a Terragrunt path expression by exact structure (ADR-0043).
+fn classify_tg_path(expr: Node, src: &[u8]) -> TgPath {
+    if let Some(v) = plain_string_value(expr, src) {
+        return TgPath::Literal(v);
+    }
+    let Some(inner) = expr_inner(expr) else {
+        return TgPath::Unresolvable;
+    };
+    match inner.kind() {
+        "function_call" => {
+            let name = inner
+                .children(&mut inner.walk())
+                .find(|c| c.kind() == "identifier")
+                .map(|n| text(src, n));
+            if name.as_deref() != Some("find_in_parent_folders") {
+                return TgPath::Unresolvable;
+            }
+            let args = inner
+                .children(&mut inner.walk())
+                .find(|c| c.kind() == "function_arguments");
+            match args {
+                None => TgPath::FindInParentFolders(None),
+                Some(a) if a.named_child_count() == 1 => a
+                    .named_child(0)
+                    .and_then(|e| plain_string_value(e, src))
+                    .map_or(TgPath::Unresolvable, |v| {
+                        TgPath::FindInParentFolders(Some(v))
+                    }),
+                Some(_) => TgPath::Unresolvable,
+            }
+        }
+        "template_expr" => classify_terragrunt_dir_template(inner, src),
+        _ => TgPath::Unresolvable,
+    }
+}
+
+/// `"${get_terragrunt_dir()}"` optionally followed by one literal
+/// segment; any other interpolation makes it unresolvable.
+fn classify_terragrunt_dir_template(template_expr: Node, src: &[u8]) -> TgPath {
+    let Some(quoted) = template_expr
+        .children(&mut template_expr.walk())
+        .find(|c| c.kind() == "quoted_template")
+    else {
+        return TgPath::Unresolvable;
+    };
+    let parts: Vec<Node> = quoted
+        .children(&mut quoted.walk())
+        .filter(|c| !matches!(c.kind(), "quoted_template_start" | "quoted_template_end"))
+        .collect();
+    let Some((first, rest)) = parts.split_first() else {
+        return TgPath::Unresolvable;
+    };
+    if first.kind() != "template_interpolation" {
+        return TgPath::Unresolvable;
+    }
+    let Some(call) = first
+        .children(&mut first.walk())
+        .find(|c| c.kind() == "expression")
+        .and_then(expr_inner)
+        .filter(|c| c.kind() == "function_call")
+    else {
+        return TgPath::Unresolvable;
+    };
+    let is_dir_call = call.named_child_count() == 1
+        && call
+            .named_child(0)
+            .is_some_and(|i| i.kind() == "identifier" && text(src, i) == "get_terragrunt_dir");
+    if !is_dir_call {
+        return TgPath::Unresolvable;
+    }
+    match rest {
+        [] => TgPath::TerragruntDir(String::new()),
+        [lit] if lit.kind() == "template_literal" => TgPath::TerragruntDir(text(src, *lit)),
+        _ => TgPath::Unresolvable,
+    }
+}
+
+/// The value expression of `attr_name` in `block`'s body, if present.
+fn block_attr<'t>(block: Node<'t>, src: &[u8], attr_name: &str) -> Option<Node<'t>> {
+    let body = block
+        .children(&mut block.walk())
+        .find(|c| c.kind() == "body")?;
+    body.children(&mut body.walk())
+        .filter(|c| c.kind() == "attribute")
+        .find(|a| attribute_name(*a, src).as_deref() == Some(attr_name))
+        .and_then(attribute_value_node)
+}
+
+/// A bare-identifier or plain-string object key, if it is one.
+fn object_key_name(key: Node, src: &[u8]) -> Option<String> {
+    let inner = key
+        .named_child(0)
+        .filter(|_| key.named_child_count() == 1)?;
+    match inner.kind() {
+        "variable_expr" => Some(text(src, inner)),
+        "literal_value" => plain_string_value(key, src),
+        _ => None,
+    }
+}
+
+/// Terragrunt's file-level relations (ADR-0043).
+fn collect_terragrunt(root: Node, src: &[u8]) -> RawTerragrunt {
+    let mut tg = RawTerragrunt::default();
+    let Some(body) = root.children(&mut root.walk()).find(|c| c.kind() == "body") else {
+        return tg;
+    };
+    for child in body.children(&mut body.walk()) {
+        match child.kind() {
+            "block" => {
+                let (Some(ty), labels) = block_type_and_labels(child, src) else {
+                    continue;
+                };
+                match (ty.as_str(), labels.len()) {
+                    ("terraform", 0) => {
+                        if let Some(v) = block_attr(child, src, "source") {
+                            tg.source = Some(classify_tg_path(v, src));
+                        }
+                    }
+                    ("dependency", 1) if valid_ident(&labels[0]) => {
+                        if let Some(v) = block_attr(child, src, "config_path") {
+                            tg.dependencies.push(RawTgDependency {
+                                name: labels[0].clone(),
+                                line: child.start_position().row as u32 + 1,
+                                config_path: classify_tg_path(v, src),
+                            });
+                        }
+                    }
+                    ("dependencies", 0) => {
+                        let items = block_attr(child, src, "paths")
+                            .and_then(expr_inner)
+                            .filter(|n| n.kind() == "collection_value")
+                            .and_then(expr_inner)
+                            .filter(|n| n.kind() == "tuple");
+                        if let Some(tuple) = items {
+                            for e in tuple
+                                .children(&mut tuple.walk())
+                                .filter(|c| c.kind() == "expression")
+                            {
+                                tg.dependencies_paths.push(classify_tg_path(e, src));
+                            }
+                        }
+                    }
+                    ("include", 0 | 1) => {
+                        if let Some(v) = block_attr(child, src, "path") {
+                            tg.includes.push(classify_tg_path(v, src));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            "attribute" if attribute_name(child, src).as_deref() == Some("inputs") => {
+                let object = attribute_value_node(child)
+                    .and_then(expr_inner)
+                    .filter(|n| n.kind() == "collection_value")
+                    .and_then(expr_inner)
+                    .filter(|n| n.kind() == "object");
+                if let Some(object) = object {
+                    for elem in object
+                        .children(&mut object.walk())
+                        .filter(|c| c.kind() == "object_elem")
+                    {
+                        if let Some(name) = elem
+                            .child_by_field_name("key")
+                            .and_then(|k| object_key_name(k, src))
+                            .filter(|n| valid_ident(n))
+                        {
+                            tg.inputs.push(name);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    tg
 }
 
 /// Attributes of a `module` block that are meta-arguments, not inputs to
@@ -813,7 +1024,7 @@ locals {
     #[test]
     fn hcl_files_get_literals_but_no_symbols() {
         let out = extract_at(
-            "live/terragrunt.hcl",
+            "live/common.hcl",
             "locals {\n  a = 1\n}\ninputs = { r = local.a }\n",
         );
         assert!(out.symbols.is_empty() && out.terraform.is_none());
@@ -854,5 +1065,112 @@ module "nosrc" {
         assert!(calls[1].dynamic_source);
         assert_eq!(calls[2].source, None);
         assert!(!calls[2].dynamic_source);
+    }
+
+    #[test]
+    fn terragrunt_relations_are_classified_from_exact_shapes() {
+        let out = extract_at(
+            "live/terragrunt.hcl",
+            r#"
+include "root" {
+  path = find_in_parent_folders("root.hcl")
+}
+include {
+  path = find_in_parent_folders()
+}
+terraform {
+  source = "${get_terragrunt_dir()}/../m"
+}
+dependency "a" {
+  config_path = "../a"
+}
+dependency "b" {
+  config_path = "${get_repo_root()}/b"
+}
+dependencies {
+  paths = ["../c", "../d"]
+}
+inputs = {
+  x = 1
+  "y" = 2
+  (var.z) = 3
+}
+locals {
+  l = 1
+}
+"#,
+        );
+        let tg = out.terraform.as_ref().unwrap().terragrunt.as_ref().unwrap();
+        assert_eq!(
+            tg.includes,
+            vec![
+                TgPath::FindInParentFolders(Some("root.hcl".into())),
+                TgPath::FindInParentFolders(None)
+            ]
+        );
+        assert_eq!(tg.source, Some(TgPath::TerragruntDir("/../m".into())));
+        assert_eq!(tg.dependencies.len(), 2);
+        assert_eq!(tg.dependencies[0].name, "a");
+        assert_eq!(
+            tg.dependencies[0].config_path,
+            TgPath::Literal("../a".into())
+        );
+        assert_eq!(tg.dependencies[1].config_path, TgPath::Unresolvable);
+        assert_eq!(
+            tg.dependencies_paths,
+            vec![
+                TgPath::Literal("../c".into()),
+                TgPath::Literal("../d".into())
+            ]
+        );
+        // A parenthesised key is an expression, not a name.
+        assert_eq!(tg.inputs, vec!["x".to_string(), "y".to_string()]);
+        // Terragrunt files declare only `locals` and `dependency` symbols.
+        assert_eq!(
+            sym_names(&out),
+            vec![
+                ("dependency.a", SymKind::TgDependency),
+                ("dependency.b", SymKind::TgDependency),
+                ("local.l", SymKind::TfLocal),
+            ]
+        );
+        assert!(out.terraform.as_ref().unwrap().module_calls.is_empty());
+    }
+
+    #[test]
+    fn only_get_terragrunt_dir_followed_by_a_literal_is_decidable() {
+        let path_of = |expr: &str| {
+            let out = extract_at(
+                "u/terragrunt.hcl",
+                &format!("terraform {{\n  source = {expr}\n}}\n"),
+            );
+            out.terraform.unwrap().terragrunt.unwrap().source.unwrap()
+        };
+        assert_eq!(
+            path_of("\"${get_terragrunt_dir()}\""),
+            TgPath::TerragruntDir(String::new())
+        );
+        assert_eq!(
+            path_of("\"${path_relative_to_include()}/x\""),
+            TgPath::Unresolvable
+        );
+        assert_eq!(
+            path_of("\"${get_terragrunt_dir()}/a${local.b}\""),
+            TgPath::Unresolvable
+        );
+        assert_eq!(path_of("local.base"), TgPath::Unresolvable);
+        assert_eq!(path_of("\"../m\""), TgPath::Literal("../m".into()));
+    }
+
+    #[test]
+    fn only_terragrunt_and_root_hcl_are_terragrunt_files() {
+        for name in ["terragrunt.hcl", "root.hcl"] {
+            let out = extract_at(name, "locals {\n  a = 1\n}\n");
+            assert!(out.terraform.is_some(), "{name}");
+        }
+        for name in ["common.hcl", "app.pkr.hcl", ".terraform.lock.hcl"] {
+            let out = extract_at(name, "locals {\n  a = 1\n}\n");
+            assert!(out.terraform.is_none() && out.symbols.is_empty(), "{name}");
+        }
     }
 }

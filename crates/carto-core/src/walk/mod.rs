@@ -30,6 +30,11 @@ const DENIED_DIR_NAMES: &[&str] = &[
     ".venv",
     "venv",
     "__pycache__",
+    // Terraform/Terragrunt download caches (ADR-0043): third-party module
+    // copies (like `node_modules`) and, for `.terraform`, possibly
+    // backend state. Spec §5.1 amendment.
+    ".terraform",
+    ".terragrunt-cache",
 ];
 
 /// Every pattern string from spec §5.1's built-in denylist, gathered in
@@ -46,6 +51,8 @@ const DENYLIST_DESCRIPTION: &[&str] = &[
     ".venv/",
     "venv/",
     "__pycache__/",
+    ".terraform/",
+    ".terragrunt-cache/",
     "*.min.js",
     "*.lock",
     "*.pem",

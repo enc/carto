@@ -444,7 +444,13 @@ edge per variant rather than guessing. Module calls (ADR-0042): a local
 remote one an external `Module` node whose key has userinfo and
 `?query` stripped *before* it exists (`ModuleNode::path` is a plain
 `String` — redaction never sees it); `module.m.out` and module
-arguments cross into the *called* directory. `*.tfvars` stays on the sensitive
+arguments cross into the *called* directory. Terragrunt (ADR-0043):
+`terragrunt.hcl`/`root.hcl` are each their own scope; only statically
+decidable path shapes resolve (`get_repo_root()` etc. → no edge —
+Terragrunt functions are never evaluated, INV-2);
+`find_in_parent_folders` is a lookup over *walked* files, hence
+`inferred`; `.terraform/`/`.terragrunt-cache/` are pruned from the walk.
+`*.tfvars` stays on the sensitive
 denylist — contents are never read; ADR-0044 models the implication
 (a variable may be set outside the code) at query time instead.
 

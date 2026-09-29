@@ -47,11 +47,25 @@
 //! recorded in the `module.m` (or enclosing) symbol's
 //! `unresolved_calls`, never guessed.
 //!
+//! **Terragrunt (ADR-0043).** A Terragrunt file is its own resolution
+//! scope (its `locals` are file-local). Statically decidable path shapes
+//! only ([`TgPath`]) — carto never runs Terragrunt functions:
+//! `terraform.source` → the module directory's files (`certain`) or an
+//! external `Module`; `dependency.config_path` / `dependencies.paths` →
+//! that directory's `terragrunt.hcl` (`certain`); `include path` → the
+//! named file (`certain`), or for `find_in_parent_folders(name?)` the
+//! nearest ancestor-directory file of that name among the *walked* files
+//! (`inferred`: a closer match could be gitignored and invisible);
+//! `inputs = { k = … }` → the unit's source module's `variable "k"`;
+//! `dependency.x.outputs.y` → the *dependency unit's* source module's
+//! `output "y"`. An unmatched `inputs` key is silently dropped
+//! (Terragrunt passes unused inputs as `TF_VAR_*`).
+//!
 //! Reference edges are always `inferred` (spec §4.2 allows nothing
 //! higher for `references`; source-level scope only approximates what
 //! Terraform really loads).
 
-use super::extractor::{RawTfModuleCall, RawTfRef};
+use super::extractor::{RawTerragrunt, RawTfModuleCall, RawTfRef, TgPath};
 use super::resolve::{
     FileExtraction, cross_component_marker, relpath_dir, smallest_containing_symbol,
 };
@@ -81,7 +95,7 @@ enum Shape {
 
 /// The symbol name (Terraform address) a reference points at, if it is
 /// one of the shapes this pass understands.
-fn target_name(segments: &[String]) -> Option<(String, Shape)> {
+fn target_name(segments: &[String], is_tg: bool) -> Option<(String, Shape)> {
     let root = segments.first()?.as_str();
     if BUILTIN_ROOTS.contains(&root) {
         return None;
@@ -90,6 +104,11 @@ fn target_name(segments: &[String]) -> Option<(String, Shape)> {
         "var" | "local" | "module" => {
             let n = segments.get(1)?;
             Some((format!("{root}.{n}"), Shape::Strict))
+        }
+        // A Terragrunt `dependency.x` must be declared in the same file.
+        "dependency" if is_tg => {
+            let n = segments.get(1)?;
+            Some((format!("dependency.{n}"), Shape::Strict))
         }
         "data" => {
             let (t, n) = (segments.get(1)?, segments.get(2)?);
@@ -178,6 +197,64 @@ pub(super) fn sanitize_remote_source(source: &str) -> Option<String> {
     ok.then_some(out)
 }
 
+fn is_terragrunt(fe: &FileExtraction) -> bool {
+    fe.extract
+        .terraform
+        .as_ref()
+        .is_some_and(|t| t.terragrunt.is_some())
+}
+
+/// A Terraform file's resolution scope is its directory; a Terragrunt
+/// file's is the file itself.
+fn scope_of(fe: &FileExtraction) -> &str {
+    if is_terragrunt(fe) {
+        &fe.relpath
+    } else {
+        relpath_dir(&fe.relpath)
+    }
+}
+
+fn join(dir: &str, name: &str) -> String {
+    if dir.is_empty() {
+        name.to_string()
+    } else {
+        format!("{dir}/{name}")
+    }
+}
+
+/// A relative directory or file a Terragrunt path expression names,
+/// resolved against the unit's own directory. `None` for anything not
+/// statically decidable (or absolute).
+fn tg_target(dir: &str, p: &TgPath) -> Option<String> {
+    match p {
+        TgPath::Literal(s) if !s.starts_with('/') => normalize_rel(dir, s),
+        TgPath::TerragruntDir(suffix) => {
+            let rel = suffix.trim_start_matches('/');
+            if rel.is_empty() {
+                Some(dir.to_string())
+            } else {
+                normalize_rel(dir, rel)
+            }
+        }
+        _ => None,
+    }
+}
+
+enum SourceTarget<'p> {
+    Local(String),
+    Remote(&'p str),
+}
+
+/// What a Terragrunt `terraform.source` points at.
+fn source_target<'p>(dir: &str, p: &'p TgPath) -> Option<SourceTarget<'p>> {
+    match p {
+        TgPath::Literal(s) if is_local_source(s) => normalize_rel(dir, s).map(SourceTarget::Local),
+        TgPath::Literal(s) if !s.starts_with('/') => Some(SourceTarget::Remote(s)),
+        TgPath::TerragruntDir(_) => tg_target(dir, p).map(SourceTarget::Local),
+        _ => None,
+    }
+}
+
 struct Def {
     fi: usize,
     si: usize,
@@ -197,6 +274,11 @@ struct Ctx<'a> {
     /// env-variant files disagree — then module-crossing edges are
     /// skipped rather than guessed).
     module_dirs: BTreeMap<(String, String), BTreeSet<String>>,
+    /// repo-relative path -> file index, every extracted file.
+    by_relpath: BTreeMap<String, usize>,
+    /// Terragrunt file index -> its `terraform.source` module directory,
+    /// when that is a local directory holding walked Terraform files.
+    unit_sources: BTreeMap<usize, String>,
 }
 
 impl<'a> Ctx<'a> {
@@ -228,16 +310,21 @@ pub(super) fn resolve(
         defs: BTreeMap::new(),
         files_by_dir: BTreeMap::new(),
         module_dirs: BTreeMap::new(),
+        by_relpath: BTreeMap::new(),
+        unit_sources: BTreeMap::new(),
     };
     for (fi, fe) in extractions.iter().enumerate() {
+        ctx.by_relpath.insert(fe.relpath.clone(), fi);
         let Some(tf) = &fe.extract.terraform else {
             continue;
         };
-        let dir = relpath_dir(&fe.relpath);
-        ctx.files_by_dir.entry(dir).or_default().push(fi);
+        let scope = scope_of(fe);
+        if tf.terragrunt.is_none() {
+            ctx.files_by_dir.entry(scope).or_default().push(fi);
+        }
         for (si, sym) in fe.extract.symbols.iter().enumerate() {
             ctx.defs
-                .entry((dir.to_string(), sym.name.clone()))
+                .entry((scope.to_string(), sym.name.clone()))
                 .or_default()
                 .push(Def {
                     fi,
@@ -270,6 +357,24 @@ pub(super) fn resolve(
         }
     }
     ctx.module_dirs = module_dirs;
+    let mut unit_sources = BTreeMap::new();
+    for (fi, fe) in extractions.iter().enumerate() {
+        let Some(p) = fe
+            .extract
+            .terraform
+            .as_ref()
+            .and_then(|t| t.terragrunt.as_ref())
+            .and_then(|tg| tg.source.as_ref())
+        else {
+            continue;
+        };
+        if let Some(SourceTarget::Local(t)) = source_target(relpath_dir(&fe.relpath), p) {
+            if ctx.files_by_dir.contains_key(t.as_str()) {
+                unit_sources.insert(fi, t);
+            }
+        }
+    }
+    ctx.unit_sources = unit_sources;
 
     let mut out = TerraformResolved {
         nodes: Vec::new(),
@@ -286,8 +391,12 @@ pub(super) fn resolve(
         for call in &tf.module_calls {
             resolve_module_call(&mut out, &mut remote_nodes, &ctx, fi, dir, call);
         }
+        let scope = scope_of(fe);
         for r in &tf.refs {
-            resolve_ref(&mut out, &ctx, fi, dir, tf.variant.as_deref(), r);
+            resolve_ref(&mut out, &ctx, fi, scope, tf.variant.as_deref(), r);
+        }
+        if let Some(tg) = &tf.terragrunt {
+            resolve_terragrunt(&mut out, &mut remote_nodes, &ctx, fi, tg);
         }
     }
     out
@@ -418,10 +527,10 @@ fn resolve_ref(
     variant: Option<&str>,
     r: &RawTfRef,
 ) {
-    let Some((name, shape)) = target_name(&r.segments) else {
+    let fe = &ctx.extractions[fi];
+    let Some((name, shape)) = target_name(&r.segments, is_terragrunt(fe)) else {
         return;
     };
-    let fe = &ctx.extractions[fi];
     let enclosing = smallest_containing_symbol(&fe.extract.symbols, r.line);
     let from_id = match enclosing {
         Some(si) => ctx.symbol_ids[fi][si].clone(),
@@ -477,6 +586,15 @@ fn resolve_ref(
     if r.segments.first().map(String::as_str) == Some("module") && r.segments.len() >= 3 {
         resolve_module_output(out, ctx, fi, dir, enclosing, &from_id, r);
     }
+    // `dependency.x.outputs.y` (Terragrunt): cross into the dependency
+    // unit's source module.
+    if is_terragrunt(fe)
+        && r.segments.first().map(String::as_str) == Some("dependency")
+        && r.segments.len() >= 4
+        && r.segments[2] == "outputs"
+    {
+        resolve_dependency_output(out, ctx, fi, enclosing, &from_id, r);
+    }
 }
 
 fn resolve_module_output(
@@ -509,6 +627,230 @@ fn resolve_module_output(
             out,
             enclosing.map(|si| (fi, si)),
             format!("module.{module}.{output}"),
+            r.line,
+        ),
+    }
+}
+
+fn push_import(
+    out: &mut TerraformResolved,
+    ctx: &Ctx<'_>,
+    from: &FileExtraction,
+    to_fi: usize,
+    confidence: Confidence,
+    evidence: &str,
+) {
+    let to = &ctx.extractions[to_fi];
+    if to.file_id == from.file_id {
+        return;
+    }
+    let mut edge = Edge::new(
+        EdgeKind::Imports,
+        from.file_id.clone(),
+        to.file_id.clone(),
+        confidence,
+        evidence.to_string(),
+    );
+    if let Some(marker) = cross_component_marker(from.component.as_deref(), to.component.as_deref())
+    {
+        edge.evidence.push(marker.to_string());
+    }
+    out.edges.push(edge);
+}
+
+fn remote_module_edge(
+    out: &mut TerraformResolved,
+    remote_nodes: &mut BTreeMap<String, NodeId>,
+    fe: &FileExtraction,
+    key: String,
+    evidence: &str,
+) {
+    let id = remote_nodes
+        .entry(key.clone())
+        .or_insert_with(|| {
+            let id = crate::graph::module_id(&key, true);
+            out.nodes.push(Node::module(
+                id.clone(),
+                Provenance::Syntactic,
+                fe.origin,
+                ModuleNode {
+                    path: key.clone(),
+                    external: true,
+                },
+            ));
+            id
+        })
+        .clone();
+    out.edges.push(Edge::new(
+        EdgeKind::Imports,
+        fe.file_id.clone(),
+        id,
+        Confidence::Certain,
+        evidence.to_string(),
+    ));
+}
+
+fn resolve_terragrunt(
+    out: &mut TerraformResolved,
+    remote_nodes: &mut BTreeMap<String, NodeId>,
+    ctx: &Ctx<'_>,
+    fi: usize,
+    tg: &RawTerragrunt,
+) {
+    let fe = &ctx.extractions[fi];
+    let dir = relpath_dir(&fe.relpath);
+
+    if let Some(p) = &tg.source {
+        match source_target(dir, p) {
+            Some(SourceTarget::Local(t)) => {
+                for &tfi in ctx.files_by_dir.get(t.as_str()).into_iter().flatten() {
+                    push_import(
+                        out,
+                        ctx,
+                        fe,
+                        tfi,
+                        Confidence::Certain,
+                        "tg-terraform-source",
+                    );
+                }
+            }
+            Some(SourceTarget::Remote(s)) => {
+                if let Some(key) = sanitize_remote_source(s) {
+                    remote_module_edge(out, remote_nodes, fe, key, "tg-terraform-source:remote");
+                }
+            }
+            None => {}
+        }
+    }
+
+    for dep in &tg.dependencies {
+        let Some(d) = tg_target(dir, &dep.config_path) else {
+            continue;
+        };
+        match ctx.by_relpath.get(&join(&d, "terragrunt.hcl")) {
+            Some(&tfi) => push_import(out, ctx, fe, tfi, Confidence::Certain, "tg-dependency"),
+            None => {
+                let name = format!("dependency.{}", dep.name);
+                let at = fe
+                    .extract
+                    .symbols
+                    .iter()
+                    .position(|s| s.start_line == dep.line && s.name == name)
+                    .map(|si| (fi, si));
+                let shown = if safe_path(&d) {
+                    d.as_str()
+                } else {
+                    "<invalid>"
+                };
+                record_miss(out, at, format!("config_path:{shown}"), dep.line);
+            }
+        }
+    }
+
+    for p in &tg.dependencies_paths {
+        if let Some(d) = tg_target(dir, p) {
+            if let Some(&tfi) = ctx.by_relpath.get(&join(&d, "terragrunt.hcl")) {
+                push_import(out, ctx, fe, tfi, Confidence::Certain, "tg-dependencies");
+            }
+        }
+    }
+
+    for p in &tg.includes {
+        match p {
+            TgPath::FindInParentFolders(name) => {
+                let name = name.as_deref().unwrap_or("terragrunt.hcl");
+                // Pure lookup over the *walked* files, starting at the
+                // parent directory — nothing is executed (INV-2).
+                let mut cur = dir;
+                while !cur.is_empty() {
+                    cur = relpath_dir(cur);
+                    if let Some(&tfi) = ctx.by_relpath.get(&join(cur, name)) {
+                        push_import(
+                            out,
+                            ctx,
+                            fe,
+                            tfi,
+                            Confidence::Inferred,
+                            "tg-include:find_in_parent_folders",
+                        );
+                        break;
+                    }
+                }
+            }
+            other => {
+                if let Some(t) = tg_target(dir, other) {
+                    if let Some(&tfi) = ctx.by_relpath.get(&t) {
+                        push_import(out, ctx, fe, tfi, Confidence::Certain, "tg-include");
+                    }
+                }
+            }
+        }
+    }
+
+    // `inputs = { k = … }` feeds the unit's source module's variable `k`.
+    // An unmatched key is dropped silently: Terragrunt passes unused
+    // inputs on as `TF_VAR_*`.
+    if let Some(target) = ctx.unit_sources.get(&fi) {
+        for key in &tg.inputs {
+            if let [one] = ctx.live(target, &format!("var.{key}"), None).as_slice() {
+                out.edges.push(Edge::new(
+                    EdgeKind::References,
+                    fe.file_id.clone(),
+                    ctx.symbol_ids[one.fi][one.si].clone(),
+                    Confidence::Inferred,
+                    format!("tg-input:{key}"),
+                ));
+            }
+        }
+    }
+}
+
+fn resolve_dependency_output(
+    out: &mut TerraformResolved,
+    ctx: &Ctx<'_>,
+    fi: usize,
+    enclosing: Option<usize>,
+    from_id: &NodeId,
+    r: &RawTfRef,
+) {
+    let fe = &ctx.extractions[fi];
+    let Some(tg) = fe
+        .extract
+        .terraform
+        .as_ref()
+        .and_then(|t| t.terragrunt.as_ref())
+    else {
+        return;
+    };
+    let (dep_name, output) = (&r.segments[1], &r.segments[3]);
+    let Some(dep) = tg.dependencies.iter().find(|d| &d.name == dep_name) else {
+        return;
+    };
+    // dependency -> its unit's terragrunt.hcl -> that unit's source module.
+    let Some(d) = tg_target(relpath_dir(&fe.relpath), &dep.config_path) else {
+        return;
+    };
+    let Some(&unit_fi) = ctx.by_relpath.get(&join(&d, "terragrunt.hcl")) else {
+        return;
+    };
+    let Some(module_dir) = ctx.unit_sources.get(&unit_fi) else {
+        return; // chain not statically resolvable: say nothing
+    };
+    match ctx
+        .live(module_dir, &format!("output.{output}"), None)
+        .as_slice()
+    {
+        [one] => out.edges.push(Edge::new(
+            EdgeKind::References,
+            from_id.clone(),
+            ctx.symbol_ids[one.fi][one.si].clone(),
+            Confidence::Inferred,
+            "tg-dependency-output".to_string(),
+        )),
+        _ => record_miss(
+            out,
+            enclosing.map(|si| (fi, si)),
+            format!("dependency.{dep_name}.outputs.{output}"),
             r.line,
         ),
     }
@@ -936,5 +1278,122 @@ mod tests {
         assert_eq!(args.len(), 1);
         // `count` is a meta-argument, not an input.
         assert_eq!(unresolved(&nodes, "module.m"), vec!["arg:nope"]);
+    }
+
+    // ---- ADR-0043 -----------------------------------------------------
+
+    fn import_targets<'e>(
+        edges: &'e [Edge],
+        from: &FileExtraction,
+        to: &[&FileExtraction],
+        evidence0: &str,
+    ) -> Vec<&'e Edge> {
+        edges
+            .iter()
+            .filter(|e| {
+                e.kind == EdgeKind::Imports
+                    && e.from == from.file_id
+                    && to.iter().any(|t| t.file_id == e.to)
+                    && e.evidence[0] == evidence0
+            })
+            .collect()
+    }
+
+    #[test]
+    fn find_in_parent_folders_picks_the_nearest_walked_ancestor() {
+        let far = tf_file("root.hcl", "locals {\n  a = 1\n}\n");
+        let near = tf_file("env/root.hcl", "locals {\n  b = 1\n}\n");
+        let unit = tf_file(
+            "env/prod/x/terragrunt.hcl",
+            "include \"r\" {\n  path = find_in_parent_folders(\"root.hcl\")\n}\n",
+        );
+        let top = tf_file(
+            "terragrunt.hcl",
+            "include {\n  path = find_in_parent_folders(\"root.hcl\")\n}\n",
+        );
+        let (far_c, near_c, unit_c, top_c) = (
+            tf_file("root.hcl", ""),
+            tf_file("env/root.hcl", ""),
+            tf_file("env/prod/x/terragrunt.hcl", ""),
+            tf_file("terragrunt.hcl", ""),
+        );
+        let (_, edges) = run(vec![far, near, unit, top]);
+        let e = import_targets(
+            &edges,
+            &unit_c,
+            &[&near_c],
+            "tg-include:find_in_parent_folders",
+        );
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].confidence, Confidence::Inferred);
+        assert!(
+            import_targets(
+                &edges,
+                &unit_c,
+                &[&far_c],
+                "tg-include:find_in_parent_folders"
+            )
+            .is_empty()
+        );
+        // A file at the repo root has no parent directory to search.
+        assert!(
+            import_targets(
+                &edges,
+                &top_c,
+                &[&far_c],
+                "tg-include:find_in_parent_folders"
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_literal_include_is_certain() {
+        let root = tf_file("root.hcl", "");
+        let unit = tf_file(
+            "u/terragrunt.hcl",
+            "include {\n  path = \"../root.hcl\"\n}\n",
+        );
+        let (_, edges) = run(vec![tf_file("root.hcl", ""), unit]);
+        let e = import_targets(
+            &edges,
+            &tf_file("u/terragrunt.hcl", ""),
+            &[&root],
+            "tg-include",
+        );
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].confidence, Confidence::Certain);
+    }
+
+    #[test]
+    fn terragrunt_locals_never_see_terraform_locals_in_the_same_directory() {
+        let (nodes, edges) = run(vec![
+            tf_file("u/main.tf", "locals {\n  a = 1\n}\n"),
+            tf_file("u/terragrunt.hcl", "locals {\n  b = local.a\n}\n"),
+        ]);
+        assert!(refs(&nodes, &edges).is_empty());
+        assert_eq!(unresolved(&nodes, "local.b"), vec!["local.a"]);
+    }
+
+    #[test]
+    fn matched_inputs_link_to_the_source_module_and_unmatched_are_silent() {
+        let (nodes, edges) = run(vec![
+            tf_file("m/v.tf", "variable \"a\" {}\n"),
+            tf_file(
+                "u/terragrunt.hcl",
+                "terraform {\n  source = \"../m\"\n}\ninputs = {\n  a = 1\n  b = 2\n}\n",
+            ),
+        ]);
+        let tg: Vec<_> = edges
+            .iter()
+            .filter(|e| e.kind == EdgeKind::References)
+            .map(|e| e.evidence.clone())
+            .collect();
+        assert_eq!(tg, vec![vec!["tg-input:a".to_string()]]);
+        // Silent: no unresolved entry anywhere for the unmatched key.
+        assert!(nodes.iter().all(|n| match &n.data {
+            NodeData::Symbol(s) => s.unresolved_calls.is_empty(),
+            _ => true,
+        }));
     }
 }

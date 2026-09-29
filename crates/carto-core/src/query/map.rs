@@ -597,18 +597,25 @@ fn infra_lines(
         )
     };
     let mut calls: BTreeMap<(String, String), usize> = BTreeMap::new();
+    let mut unit_deps: BTreeMap<(String, String), usize> = BTreeMap::new();
     let mut remote: BTreeMap<String, usize> = BTreeMap::new();
     for edge in qg.edges() {
         if edge.kind != EdgeKind::Imports || !in_scope(&edge.from) {
             continue;
         }
         match edge.evidence.first().map(String::as_str) {
-            Some("tf-module-source") => {
+            // A Terragrunt unit's `terraform.source` is a module call too.
+            Some("tf-module-source" | "tg-terraform-source") => {
                 if let (Some(from), Some(to)) = (dir_of(&edge.from), dir_of(&edge.to)) {
                     *calls.entry((from, to)).or_insert(0) += 1;
                 }
             }
-            Some("tf-module-remote") => {
+            Some("tg-dependency" | "tg-dependencies") => {
+                if let (Some(from), Some(to)) = (dir_of(&edge.from), dir_of(&edge.to)) {
+                    *unit_deps.entry((from, to)).or_insert(0) += 1;
+                }
+            }
+            Some("tf-module-remote" | "tg-terraform-source:remote") => {
                 if let Some(NodeData::Module(m)) = qg.node(&edge.to).map(|n| &n.data) {
                     *remote.entry(m.path.clone()).or_insert(0) += 1;
                 }
@@ -624,6 +631,15 @@ fn infra_lines(
         for ((from, to), n) in ranked {
             let from = if from.is_empty() { "." } else { from.as_str() };
             let to = if to.is_empty() { "." } else { to.as_str() };
+            lines.push(format!("    {from} -> {to}  ({n})"));
+        }
+    }
+    if !unit_deps.is_empty() {
+        let mut ranked: Vec<_> = unit_deps.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        ranked.truncate(RANKED_ROWS);
+        lines.push("  terragrunt dependencies (unit dir -> dependency unit dir):".to_string());
+        for ((from, to), n) in ranked {
             lines.push(format!("    {from} -> {to}  ({n})"));
         }
     }

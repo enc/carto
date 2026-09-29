@@ -616,6 +616,22 @@ so they've been subdivided. Current state:
   No `SCHEMA_VERSION` change. `fixtures/tf-modules/.../modules.tf`,
   +5 `cli_terraform.rs` tests, 19 `terraform.rs` tests. **Next:**
   ADR-0043 Terragrunt, ADR-0044 tfvars caveat.
+- **Terraform source support, slice 3 of 4 (2026-09-29, ADR-0043)** —
+  Terragrunt, as file-level edges inside the single `infra` component
+  (ADR-0037 unchanged). `terragrunt.hcl`/`root.hcl` only (other `*.hcl`
+  stay literals-only), each its own resolution scope. Statically
+  decidable path shapes only (`Literal`, `${get_terragrunt_dir()}`+literal,
+  `find_in_parent_folders`); `get_repo_root()` etc. produce no edge.
+  `terraform.source` → module files (`certain`) or external `Module`;
+  `dependency`/`dependencies` → the dependency unit's `terragrunt.hcl`
+  (`certain`); `include` → file (`certain`) or nearest walked ancestor
+  for `find_in_parent_folders` (`inferred`); `inputs` keys → the unit's
+  source module's variables and `dependency.x.outputs.y` → the
+  dependency unit's module output (`inferred`); unmatched inputs are
+  silent (Terragrunt forwards them as `TF_VAR_*`). `.terraform/` and
+  `.terragrunt-cache/` are now pruned from the walk (spec §5.1
+  amendment). `fixtures/terragrunt-live/`, `cli_terragrunt.rs` (8
+  tests). No `SCHEMA_VERSION` change. **Next:** ADR-0044 tfvars caveat.
 - **M2+ remaining (infra graph proper, join, ingest)** — spec §10. The
   contract slice above is adjacent to, not a substitute for, this: no
   `IacResource`/`depends_on`/IAM extraction/§6.6 attribute allowlist
@@ -708,7 +724,11 @@ Do not "fix" these without checking the linked reasoning first:
   blocks are not symbols. A token embedded in a remote module
   source's *path* is not detected (userinfo and `?query` are
   stripped, ADR-0042). Terragrunt and the tfvars caveat are
-  ADR-0043/0044 (not yet built); `*.hcl` files still yield contract
+  ADR-0044 (not yet built). Terragrunt (ADR-0043) covers
+  `terragrunt.hcl`/`root.hcl` only: no `generate`,
+  `read_terragrunt_config`, `include` expose/merge, `mock_outputs`,
+  `terragrunt.stack.hcl`; a `dependency` defined only in an included
+  file is reported undefined. Other `*.hcl` files yield contract
   literals only.
 - **Rust path-qualified call resolution** (`Type::method()`, `module::func()`).
   Call matching is bare-name-only; those call sites aren't captured at all.
