@@ -62,6 +62,7 @@ const DENYLIST_DESCRIPTION: &[&str] = &[
     "*credentials*",
     "*.tfstate*",
     "*.tfvars",
+    "*.tfvars.json",
 ];
 
 /// Result of [`walk`]: `File` nodes ready to insert into a [`graph::Graph`],
@@ -265,7 +266,8 @@ fn is_denied_dir_name(name: &str) -> bool {
 }
 
 /// Spec §5.1's secret-shaped set: `*.pem`, `*.key`, `*.p12`, `.env*`,
-/// `*credentials*`, `*.tfstate*`, `*.tfvars`.
+/// `*credentials*`, `*.tfstate*`, `*.tfvars`, `*.tfvars.json` (ADR-0044:
+/// the JSON form of the same file, previously walked, hashed and parsed).
 fn is_sensitive(file_name: &str) -> bool {
     let lower = file_name.to_ascii_lowercase();
     lower.ends_with(".pem")
@@ -275,6 +277,7 @@ fn is_sensitive(file_name: &str) -> bool {
         || lower.contains("credentials")
         || lower.contains(".tfstate")
         || lower.ends_with(".tfvars")
+        || lower.ends_with(".tfvars.json")
 }
 
 /// Converts a path (relative, from `strip_prefix`) into the repo-relative,
@@ -424,9 +427,20 @@ mod tests {
         write(dir.path(), "fake.pem", b"-----BEGIN FAKE KEY-----");
         write(dir.path(), "aws-credentials.json", b"{\"key\":\"fake\"}");
         write(dir.path(), "prod.tfvars", b"password = \"fake\"");
+        write(
+            dir.path(),
+            "prod.auto.tfvars.json",
+            b"{\"password\":\"fake\"}",
+        );
 
         let out = walk(dir.path(), true).unwrap();
-        for path in [".env", "fake.pem", "aws-credentials.json", "prod.tfvars"] {
+        for path in [
+            ".env",
+            "fake.pem",
+            "aws-credentials.json",
+            "prod.tfvars",
+            "prod.auto.tfvars.json",
+        ] {
             let node = node_path(&out, path).unwrap_or_else(|| panic!("missing node for {path}"));
             assert_eq!(node.excluded, Some(ExclusionReason::Sensitive));
             assert_eq!(node.sha256, None, "{path} contents must never be hashed");

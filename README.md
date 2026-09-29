@@ -47,9 +47,11 @@ see [`bench/`](bench/)) also exists: `carto serve` exposes
 `index`/`where`/`deps`/`map`/`selfcheck` over MCP stdio
 ([ADR-0018](docs/adr/0018-mcp-transport-hand-rolled-jsonrpc.md)).
 Also pulled ahead on request: cross-language string-literal contracts
-(`contract`/`orphans`, ADRs 0025–0027) and
+(`contract`/`orphans`, ADRs 0025–0027),
 [monorepo / multi-component indexing](#monorepos-multiple-projects-in-one-tree)
-(ADRs 0034–0039). See [`docs/STATUS.md`](docs/STATUS.md) for the
+(ADRs 0034–0039) and
+[Terraform / Terragrunt source support](#terraform-and-terragrunt)
+(ADRs 0041–0044). See [`docs/STATUS.md`](docs/STATUS.md) for the
 detailed handoff.
 
 ## Building
@@ -215,6 +217,88 @@ Design record: ADRs
 [0037](docs/adr/0037-terraform-rollup-aggregator-parsing-exclude.md),
 [0038](docs/adr/0038-descendant-component-scoping.md),
 [0039](docs/adr/0039-component-dependency-graph.md).
+
+## Terraform and Terragrunt
+
+carto reads Terraform **source** — `*.tf` files, per-environment variants
+such as `locals.tf.simu`, and Terragrunt's `terragrunt.hcl` / `root.hcl` —
+and answers "who uses this?" and "which module calls which?". It is the
+code as written, **not a plan**: nothing is executed (no `terraform`, no
+`terragrunt`), `count`/`for_each` are not expanded, and there are no
+resolved resources or IAM yet (that needs `terraform show -json`
+ingestion, a later step; `map` says so under `## infra`).
+
+### What is understood
+
+| Construct | Becomes | Edge |
+|---|---|---|
+| `variable`, `output`, `resource`, `data`, `module`, each `locals` entry | a symbol named by its Terraform address: `var.region`, `output.vpc_id`, `aws_s3_bucket.logs`, `data.aws_iam_policy_document.x`, `module.vpc`, `local.prefix` | — |
+| `var.x`, `local.x`, `module.m`, `data.t.n`, `<type>.<name>` in an expression | a reference **inside the same module directory only** | `references`, `inferred` |
+| `module "m" { source = "../modules/vpc" }` | every file of the called directory | `imports`, `certain` |
+| `module.m.out`; `foo = …` inside a `module` block | the called module's `output "out"` / `variable "foo"` | `references`, `inferred` |
+| registry / `git::` / `https://` module source | an external module — credentials and `?ref=`/query removed | `imports`, `certain` |
+| Terragrunt `terraform { source }`, `dependency`, `dependencies`, `include` | the module's files, the dependency unit's `terragrunt.hcl`, the included file | `imports`, `certain` (`find_in_parent_folders` → nearest walked file, `inferred`) |
+| Terragrunt `inputs = { k = … }`; `dependency.x.outputs.y` | the unit's source module's `variable "k"`; the dependency unit's module `output "y"` | `references`, `inferred` |
+
+Per-environment files (`locals.tf.simu`, `locals.tf.prod`) that define the
+same name give one edge **per variant** instead of a guess; `override.tf`
+yields to the base declaration. Terragrunt files are their own scope:
+their `locals` never mix with a `.tf` file in the same folder. Paths built
+from Terragrunt functions carto cannot evaluate (`get_repo_root()`,
+`path_relative_to_include()`) produce no edge, never a wrong one.
+
+### How to use it
+
+```bash
+carto index infra/                                   # then, against that index:
+carto where var.region --exact                       # every declaration named var.region
+carto deps var.region --dir in --subpath envs/prod   # who uses it (subpath picks one module)
+carto deps module.vpc --dir both                     # what a module call reads, who reads it
+carto deps aws_s3_bucket.logs --dir in
+carto map --section infra                            # module-call graph, remote modules, Terragrunt unit chain
+```
+
+`map --section infra` on [`fixtures/tf-modules`](fixtures/tf-modules/README.md):
+
+```
+## infra
+  source-level Terraform (parsed .tf files, not a resolved plan): 23 symbols — 4 tf_local, 5 tf_module, 4 tf_output, 4 tf_resource, 6 tf_variable
+  module calls (calling dir -> called dir, file-level imports):
+    infra/envs/prod -> infra/modules/vpc  (3)
+    infra/envs/prod -> infra/modules/app  (2)
+  remote modules (registry/git/http sources, credentials stripped):
+    git::https://example.com/org/net.git//modules/net  in=1
+    terraform-aws-modules/vpc/aws  in=1
+  resolved infrastructure graph (IacResource, depends_on, IAM): none — requires M2 (plan/state JSON ingestion)
+```
+
+### Reading the results
+
+- **A variable with no inbound edges is not "unset" or "unused".** Values
+  also come from `*.tfvars`, `TF_VAR_*`, `-var`/`-var-file`, a caller's
+  module argument or a Terragrunt input. `*.tfvars` / `*.tfvars.json` are
+  **never read** (they often hold secrets) — carto only lists their paths
+  next to the variable, and `deps` prints this caveat on every variable.
+- **`unresolved_calls` means "not found among the parsed files"**
+  (`local.missing`, `arg:foo`, `source:<dir>`, `config_path:<dir>`): a
+  gitignored generated file or a `*.tf.json` is invisible to carto, so it
+  is a lead, not a verdict.
+- `.terraform/` and `.terragrunt-cache/` (downloaded module copies) are
+  skipped.
+
+### Not supported (yet)
+
+Plan/state JSON, resolved resources, IAM, and the link from code to the
+resources it deploys; `count`/`for_each` instances; provider aliases;
+`moved`/`import` blocks; Terragrunt `generate`, `read_terragrunt_config`,
+`include` expose/merge, `mock_outputs` and stacks; other `*.hcl` files
+(`common.hcl`, Packer, Nomad); reading `*.tfvars`.
+
+Design record: ADRs
+[0041](docs/adr/0041-terraform-source-symbols-and-references.md),
+[0042](docs/adr/0042-terraform-module-calls.md),
+[0043](docs/adr/0043-terragrunt-relations.md),
+[0044](docs/adr/0044-terraform-variables-may-be-set-externally.md).
 
 ## Using with Claude Code
 

@@ -296,6 +296,9 @@ fn graph_is_deterministic_and_leaks_no_declaration_values() {
     // reaches the graph.
     assert!(!ga.contains("eu-central-1"));
     assert!(!ga.contains("\"override\""));
+    // INV-3/§5.1: `*.tfvars` and `*.tfvars.json` contents are never read.
+    assert!(!ga.contains("TFVARS-CANARY"));
+    assert!(!ga.contains("TFVARS-JSON-CANARY"));
 }
 
 // ---- ADR-0042: module calls ------------------------------------------
@@ -514,4 +517,132 @@ fn map_infra_section_summarizes_source_level_terraform_honestly() {
     // Still honest that this is not the resolved infrastructure graph.
     assert!(text.contains("requires M2"), "{text}");
     assert!(text.contains("requires M3"), "{text}");
+}
+
+// ---- ADR-0044: a variable may be set outside the code ------------------
+
+fn deps_stdout(out: &Path, args: &[&str]) -> String {
+    let stdout = Command::cargo_bin("carto")
+        .unwrap()
+        .arg("deps")
+        .args(args)
+        .arg(fixture_path())
+        .arg("--out")
+        .arg(out)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    String::from_utf8(stdout).unwrap()
+}
+
+#[test]
+fn tfvars_files_are_recorded_as_sensitive_and_never_hashed() {
+    let out = TempDir::new("tfvars-walk");
+    let graph: Value = serde_json::from_str(&index(out.path())).unwrap();
+    for path in [
+        "infra/envs/prod/prod.tfvars",
+        "infra/envs/prod/prod.auto.tfvars.json",
+    ] {
+        let node = graph["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["kind"] == "file" && n["path"] == path)
+            .unwrap_or_else(|| panic!("no File node for {path}"));
+        assert_eq!(node["excluded"], "sensitive", "{path}");
+        assert!(node["sha256"].is_null(), "{path} must never be hashed");
+    }
+}
+
+#[test]
+fn deps_on_a_variable_names_the_tfvars_files_beside_it_but_never_their_contents() {
+    let out = TempDir::new("tfvars-note");
+    index(out.path());
+    let text = deps_stdout(
+        out.path(),
+        &["var.region", "--dir", "in", "--subpath", "infra/envs/prod"],
+    );
+    assert!(text.contains("infra/envs/prod/prod.tfvars"), "{text}");
+    assert!(
+        text.contains("infra/envs/prod/prod.auto.tfvars.json"),
+        "{text}"
+    );
+    assert!(text.contains("contents never read"), "{text}");
+    assert!(text.contains("TF_VAR_*"), "{text}");
+    assert!(
+        text.contains("not evidence it is unset or unused"),
+        "{text}"
+    );
+    assert!(!text.contains("CANARY"), "{text}");
+}
+
+#[test]
+fn the_caveat_is_always_printed_for_a_variable_even_with_no_tfvars_file() {
+    let out = TempDir::new("tfvars-none");
+    index(out.path());
+    let text = deps_stdout(
+        out.path(),
+        &[
+            "var.region",
+            "--dir",
+            "in",
+            "--subpath",
+            "infra/modules/vpc",
+        ],
+    );
+    assert!(
+        text.contains("no *.tfvars file in this directory"),
+        "{text}"
+    );
+    assert!(
+        text.contains("not evidence it is unset or unused"),
+        "{text}"
+    );
+}
+
+#[test]
+fn the_caveat_is_inbound_only_and_variable_only() {
+    let out = TempDir::new("tfvars-scope");
+    index(out.path());
+    // Outbound question about the same variable: no caveat.
+    let outbound = deps_stdout(
+        out.path(),
+        &["var.region", "--dir", "out", "--subpath", "infra/envs/prod"],
+    );
+    assert!(!outbound.contains("TF_VAR_"), "{outbound}");
+    // Not a variable: no caveat, even inbound.
+    let resource = deps_stdout(out.path(), &["aws_vpc.main", "--dir", "in"]);
+    assert!(!resource.contains("TF_VAR_"), "{resource}");
+}
+
+#[test]
+fn json_carries_the_structured_field_only_for_variable_roots() {
+    let out = TempDir::new("tfvars-json");
+    index(out.path());
+    let run = |args: &[&str]| -> Value {
+        serde_json::from_str(&deps_stdout(out.path(), &[args, &["--json"]].concat())).unwrap()
+    };
+    let var = run(&["var.region", "--dir", "in", "--subpath", "infra/envs/prod"]);
+    assert_eq!(
+        var["root_may_be_set_externally"]["tfvars_files"],
+        serde_json::json!([
+            "infra/envs/prod/prod.auto.tfvars.json",
+            "infra/envs/prod/prod.tfvars"
+        ])
+    );
+    let module_var = run(&[
+        "var.region",
+        "--dir",
+        "in",
+        "--subpath",
+        "infra/modules/vpc",
+    ]);
+    assert_eq!(
+        module_var["root_may_be_set_externally"]["tfvars_files"],
+        serde_json::json!([])
+    );
+    let resource = run(&["aws_vpc.main", "--dir", "in"]);
+    assert!(resource["root_may_be_set_externally"].is_null());
 }

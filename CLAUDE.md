@@ -450,9 +450,13 @@ decidable path shapes resolve (`get_repo_root()` etc. → no edge —
 Terragrunt functions are never evaluated, INV-2);
 `find_in_parent_folders` is a lookup over *walked* files, hence
 `inferred`; `.terraform/`/`.terragrunt-cache/` are pruned from the walk.
-`*.tfvars` stays on the sensitive
-denylist — contents are never read; ADR-0044 models the implication
-(a variable may be set outside the code) at query time instead.
+`*.tfvars`/`*.tfvars.json` stay on the sensitive
+denylist — contents are never read; ADR-0044 handles the implication at
+query time instead: `deps` on a `tf_variable` root carries
+`root_may_be_set_externally` (tfvars *paths* beside it plus a caveat
+sentence from the shared `ExternalInputs::note()`), because a variable
+may be set outside the code and zero inbound edges is not evidence it is
+unset.
 
 ## Conventions
 

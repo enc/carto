@@ -249,9 +249,49 @@ knowing before trusting a result at face value:
   calls little" or "several of its top-level calls/type-refs didn't
   resolve," and the two look identical from the response alone.
 
+## Terraform and Terragrunt (source level)
+
+For `*.tf` files (and per-environment variants such as `locals.tf.simu`)
+carto names each top-level declaration by the address written in a
+reference — `var.region`, `local.prefix`, `output.vpc_id`,
+`aws_s3_bucket.logs`, `data.aws_iam_policy_document.x`, `module.vpc` — so
+`where` and `deps` take those names directly. The same name in several
+module directories is normal; `deps` then lists the candidates by ID and
+`--subpath` narrows to one.
+
+What `deps` can show for them: references inside one module directory
+(`inferred`); references across a module call (`module.m.out` reaches the
+called module's `output`, and each argument in a `module` block reaches
+the called module's `variable`); `imports` edges (`certain`) from a file
+with `source = "./x"` (or a Terragrunt `terraform { source }`) to every
+file of that module directory; registry/git/http sources as external
+modules with credentials and query strings removed; and, for
+`terragrunt.hcl`/`root.hcl`, the unit chain — `dependency`,
+`include` (`find_in_parent_folders` is `inferred`, a lookup over walked
+files), `inputs` keys reaching the source module's variables, and
+`dependency.x.outputs.y` reaching the dependency unit's module output.
+`map --section infra` summarizes the module-call graph.
+
+Reading those results:
+
+- A variable with zero inbound edges is not "unset" or "unused": values
+  also come from `*.tfvars` (never read — only their paths are listed),
+  `TF_VAR_*`, `-var`/`-var-file`, a caller's module argument or a
+  Terragrunt input. `deps` prints this caveat on every variable.
+- An `unresolved_calls` entry on a Terraform symbol means "not found among
+  the parsed files" (`local.missing`, `arg:foo`, `source:<dir>`,
+  `config_path:<dir>`) — a gitignored generated file or a `*.tf.json`
+  is invisible to carto, so it is a lead to check, not a verdict.
+- Terragrunt functions are never evaluated: a path built from
+  `get_repo_root()` or `path_relative_to_include()` produces no edge and
+  no claim either way.
+- This is the code as written, not a plan: `count`/`for_each` instances
+  are not expanded and there are no resolved resources or IAM; `map`
+  says so under `## infra`.
+
 ## What carto does not do (yet)
 
-No infrastructure graph, no code↔infrastructure join, no semantic/summary
+No resolved infrastructure graph (`terraform show -json` plan/state ingestion, resolved `depends_on`, IAM), no code↔infrastructure join, no semantic/summary
 layer, no `impact`/`infra_of`/`unused_permissions` tools — these are on
 carto's roadmap but not built. `map`'s output says so explicitly rather
 than silently omitting those sections. Call resolution is best-effort and

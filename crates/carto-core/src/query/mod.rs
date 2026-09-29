@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub use contract::{ContractMatch, ContractQuery, ContractResult, ContractSite, run as contract};
-pub use deps::{DepEdge, DepsQuery, DepsResult, Hop, NodeSummary, run as deps};
+pub use deps::{DepEdge, DepsQuery, DepsResult, ExternalInputs, Hop, NodeSummary, run as deps};
 pub use find::{FindQuery, FindResult, ModuleMatch, SymbolMatch, run as find};
 pub use map::{MapCounts, MapQuery, MapResult, MapSection, run as map};
 pub use orphans::{OrphanContract, OrphansQuery, OrphansResult, run as orphans};

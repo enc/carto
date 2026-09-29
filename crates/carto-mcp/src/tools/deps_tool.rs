@@ -192,6 +192,13 @@ fn render_text(result: &query::DepsResult, dir: Direction) -> String {
             },
         ));
     }
+    // ADR-0044: a Terraform variable may be set outside the code, so an
+    // inbound question about one always carries the caveat.
+    if matches!(dir, Direction::In | Direction::Both) {
+        if let Some(ext) = &result.root_may_be_set_externally {
+            out.push_str(&format!("  {}\n", ext.note()));
+        }
+    }
     for hop in &result.hops {
         for edge in &hop.edges {
             let arrow = match edge.direction {

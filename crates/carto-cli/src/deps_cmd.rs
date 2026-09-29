@@ -211,6 +211,13 @@ pub fn print_human(result: &query::DepsResult, dir: Direction) {
             },
         );
     }
+    // ADR-0044: a Terraform variable may be set outside the code, so an
+    // inbound question about one always carries the caveat.
+    if matches!(dir, Direction::In | Direction::Both) {
+        if let Some(ext) = &result.root_may_be_set_externally {
+            println!("  {}", ext.note());
+        }
+    }
     for hop in &result.hops {
         for edge in &hop.edges {
             // `direction` is always In or Out for a specific edge (never

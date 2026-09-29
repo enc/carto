@@ -16,7 +16,10 @@
 use super::{Direction, FindQuery, QueryGraph, Truncation, find};
 use crate::consts;
 use crate::error::{Error, ErrorKind, Result};
-use crate::graph::{Confidence, EdgeKind, InboundCallSite, NodeData, NodeId, UnresolvedCall};
+use crate::graph::{
+    Confidence, EdgeKind, ExclusionReason, InboundCallSite, NodeData, NodeId, SymKind,
+    UnresolvedCall,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
@@ -116,6 +119,60 @@ pub struct Hop {
     pub edges: Vec<DepEdge>,
 }
 
+/// ADR-0044: what carto can honestly say about *where else* a Terraform
+/// `variable` may get its value, for a root that is one. A variable is
+/// routinely set from outside the code — `*.tfvars` (never read: spec
+/// §5.1), `TF_VAR_*`, `-var`/`-var-file`, a caller's module argument, a
+/// Terragrunt input — so zero inbound edges must never be read as "unset"
+/// or "unused". Present (`Some`) for **every** `tf_variable` root, even
+/// with no tfvars file, so the caveat is never silently absent.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalInputs {
+    /// Repo-relative paths of the `*.tfvars` / `*.tfvars.json` files in
+    /// the variable's own directory — recorded by the walk as sensitive
+    /// `File` nodes; only their *paths* are used here, contents were
+    /// never read. Sorted.
+    pub tfvars_files: Vec<String>,
+}
+
+/// Most tfvars paths the rendered note lists (the structured field
+/// always carries all of them).
+const TFVARS_SHOWN: usize = 10;
+
+impl ExternalInputs {
+    /// The one-line note both front ends print for an inbound question —
+    /// shared here so the CLI and MCP wording cannot drift.
+    pub fn note(&self) -> String {
+        let n = self.tfvars_files.len();
+        let files = if n == 0 {
+            "no *.tfvars file in this directory".to_string()
+        } else {
+            let shown: Vec<&str> = self
+                .tfvars_files
+                .iter()
+                .take(TFVARS_SHOWN)
+                .map(String::as_str)
+                .collect();
+            let more = if n > TFVARS_SHOWN {
+                format!(", +{} more", n - TFVARS_SHOWN)
+            } else {
+                String::new()
+            };
+            format!(
+                "{n} *.tfvars file{} in this directory, contents never read: {}{more}",
+                if n == 1 { "" } else { "s" },
+                shown.join(", ")
+            )
+        };
+        format!(
+            "(this variable may also be set outside the code — {files}; also TF_VAR_* \
+             environment variables, -var/-var-file on the command line, a caller's module \
+             argument or a Terragrunt input. Zero inbound edges is not evidence it is unset \
+             or unused)"
+        )
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DepsResult {
     pub root: NodeSummary,
@@ -163,8 +220,42 @@ pub struct DepsResult {
     /// Uncapped count backing `root_unresolved_inbound_calls` — see
     /// [`crate::graph::SymbolNode::unresolved_inbound_call_count`].
     pub root_unresolved_inbound_call_count: u32,
+    /// `Some` for a Terraform `variable` root (ADR-0044); `None` for
+    /// everything else.
+    pub root_may_be_set_externally: Option<ExternalInputs>,
     pub hops: Vec<Hop>,
     pub truncation: Truncation,
+}
+
+/// ADR-0044: for a `tf_variable` root, the sensitive-excluded
+/// `*.tfvars`/`*.tfvars.json` files sitting in the variable's own
+/// directory (a root module's tfvars live next to its `variable`
+/// blocks). Paths only — the walk never read their contents.
+fn external_inputs(qg: &QueryGraph, root_id: &NodeId) -> Option<ExternalInputs> {
+    let NodeData::Symbol(sym) = &qg.node(root_id)?.data else {
+        return None;
+    };
+    if sym.sym_kind != SymKind::TfVariable {
+        return None;
+    }
+    let dir_of = |path: &str| path.rsplit_once('/').map_or("", |(d, _)| d).to_string();
+    let dir = dir_of(&qg.node(&sym.file)?.data.as_file()?.path);
+    let mut files: BTreeSet<String> = BTreeSet::new();
+    for node in qg.nodes() {
+        let Some(f) = node.data.as_file() else {
+            continue;
+        };
+        let lower = f.path.to_ascii_lowercase();
+        if f.excluded == Some(ExclusionReason::Sensitive)
+            && (lower.ends_with(".tfvars") || lower.ends_with(".tfvars.json"))
+            && dir_of(&f.path) == dir
+        {
+            files.insert(f.path.clone());
+        }
+    }
+    Some(ExternalInputs {
+        tfvars_files: files.into_iter().collect(),
+    })
 }
 
 pub fn run(qg: &QueryGraph, query: &DepsQuery) -> Result<DepsResult> {
@@ -209,6 +300,8 @@ pub fn run(qg: &QueryGraph, query: &DepsQuery) -> Result<DepsResult> {
         Some(NodeData::Symbol(s)) => s.unresolved_inbound_call_count,
         _ => 0,
     };
+
+    let root_may_be_set_externally = external_inputs(qg, &root_id);
 
     let mut visited: BTreeSet<NodeId> = BTreeSet::new();
     visited.insert(root_id.clone());
@@ -324,6 +417,7 @@ pub fn run(qg: &QueryGraph, query: &DepsQuery) -> Result<DepsResult> {
         root_uncaptured_outbound_calls,
         root_unresolved_inbound_calls,
         root_unresolved_inbound_call_count,
+        root_may_be_set_externally,
         hops,
         truncation,
     })
@@ -1289,5 +1383,33 @@ mod tests {
         };
         let result = run(&qg, &query).unwrap();
         assert!(!result.truncation.truncated);
+    }
+
+    #[test]
+    fn external_inputs_note_always_carries_the_caveat_and_caps_the_list() {
+        let none = ExternalInputs::default().note();
+        assert!(
+            none.contains("no *.tfvars file in this directory"),
+            "{none}"
+        );
+        assert!(
+            none.contains("not evidence it is unset or unused"),
+            "{none}"
+        );
+
+        let one = ExternalInputs {
+            tfvars_files: vec!["a/x.tfvars".into()],
+        }
+        .note();
+        assert!(one.contains("1 *.tfvars file in this directory"), "{one}");
+
+        let many = ExternalInputs {
+            tfvars_files: (0..13).map(|i| format!("d/{i:02}.tfvars")).collect(),
+        }
+        .note();
+        assert!(many.contains("13 *.tfvars files"), "{many}");
+        assert!(many.contains("d/09.tfvars"), "{many}");
+        assert!(!many.contains("d/10.tfvars"), "{many}");
+        assert!(many.contains("+3 more"), "{many}");
     }
 }

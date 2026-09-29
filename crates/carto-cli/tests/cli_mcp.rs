@@ -194,3 +194,47 @@ fn serve_survives_a_malformed_line_through_the_real_binary() {
     assert!(msgs[0]["error"]["code"].as_i64().is_some());
     assert_eq!(msgs[1]["result"], serde_json::json!({}));
 }
+
+/// ADR-0044 over MCP: `deps` on a Terraform `variable` carries the same
+/// caveat in the text block and the structured field, round-tripped
+/// through the real process boundary.
+#[test]
+fn serve_deps_on_a_terraform_variable_carries_the_external_inputs_caveat() {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/tf-modules");
+    let out = TempDir::new("tfvars-deps");
+    Command::cargo_bin("carto")
+        .unwrap()
+        .arg("index")
+        .arg(&repo)
+        .arg("--out")
+        .arg(out.path())
+        .assert()
+        .success();
+
+    let out_path = out.path().to_string_lossy().replace('\\', "\\\\");
+    let repo_path = repo.to_string_lossy().replace('\\', "\\\\");
+    let request = format!(
+        r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"deps","arguments":{{"repo_path":"{repo_path}","out":"{out_path}","target":"var.region","dir":"in","subpath":"infra/envs/prod"}}}}}}"#
+    );
+    let output = Command::cargo_bin("carto")
+        .unwrap()
+        .arg("serve")
+        .write_stdin(format!("{request}\n"))
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let msgs = lines_of(&output.stdout);
+    assert_eq!(msgs[0]["result"]["isError"], false, "{msgs:?}");
+    let text = msgs[0]["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("not evidence it is unset or unused"),
+        "{text}"
+    );
+    assert!(text.contains("infra/envs/prod/prod.tfvars"), "{text}");
+    assert_eq!(
+        msgs[0]["result"]["structuredContent"]["root_may_be_set_externally"]["tfvars_files"][1],
+        "infra/envs/prod/prod.tfvars"
+    );
+    assert!(!text.contains("CANARY"));
+}

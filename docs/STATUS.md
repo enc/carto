@@ -632,6 +632,23 @@ so they've been subdivided. Current state:
   `.terragrunt-cache/` are now pruned from the walk (spec §5.1
   amendment). `fixtures/terragrunt-live/`, `cli_terragrunt.rs` (8
   tests). No `SCHEMA_VERSION` change. **Next:** ADR-0044 tfvars caveat.
+- **Terraform source support, slice 4 of 4 (2026-09-29, ADR-0044)** —
+  closes the ADR-0041→0044 sequence. A Terraform variable may be set
+  outside the code (`*.tfvars`, `TF_VAR_*`, `-var`, a caller's argument, a
+  Terragrunt input), so zero inbound edges is never evidence it is unset
+  or unused. `tfvars` **stay unread** (spec §5.1; user direction: "handle
+  the implications", not the file); `*.tfvars.json` is now sensitive too.
+  `DepsResult::root_may_be_set_externally` (`Some` for every `tf_variable`
+  root, `None` otherwise; an additive `null` on the JSON/MCP payload)
+  lists the tfvars paths sitting beside the variable — computed at query
+  time from existing sensitive `File` nodes, no schema change — and
+  `ExternalInputs::note()` (one shared sentence, always ends "not
+  evidence it is unset or unused") is printed for `--dir in`/`both` by
+  both the CLI and the MCP tool. `rust-crate.deps.golden.json`: exactly
+  one added `null` line. Canary values in the fixture's tfvars never
+  reach `graph.json`. Skill file and README gained a Terraform section.
+  **Sequence complete.** Still absent: plan/state-JSON ingestion (spec
+  §6.2: `IacResource`, resolved `depends_on`, IAM) — its own later slice.
 - **M2+ remaining (infra graph proper, join, ingest)** — spec §10. The
   contract slice above is adjacent to, not a substitute for, this: no
   `IacResource`/`depends_on`/IAM extraction/§6.6 attribute allowlist
@@ -721,10 +738,11 @@ Do not "fix" these without checking the linked reasoning first:
   `unresolved_calls` entry means "not found among parsed files". No
   `count`/`for_each` instance expansion, no provider aliases, no
   `moved`/`import`/`check`/`provider`/`terraform` block symbols, nested
-  blocks are not symbols. A token embedded in a remote module
+  blocks are not symbols. `*.tfvars`/`*.tfvars.json` are never read;
+  a variable's possible external values are only *named* (ADR-0044),
+  never inferred. A token embedded in a remote module
   source's *path* is not detected (userinfo and `?query` are
-  stripped, ADR-0042). Terragrunt and the tfvars caveat are
-  ADR-0044 (not yet built). Terragrunt (ADR-0043) covers
+  stripped, ADR-0042). Terragrunt (ADR-0043) covers
   `terragrunt.hcl`/`root.hcl` only: no `generate`,
   `read_terragrunt_config`, `include` expose/merge, `mock_outputs`,
   `terragrunt.stack.hcl`; a `dependency` defined only in an included

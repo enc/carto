@@ -120,6 +120,7 @@
     "label": "handle",
     "location": "src/handlers.rs:3-9"
   },
+  "root_may_be_set_externally": null,
   "root_uncaptured_inbound_calls": 0,
   "root_uncaptured_outbound_calls": 0,
   "root_unresolved_calls": [
