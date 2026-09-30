@@ -78,9 +78,9 @@ listed rows only (ADR-0014).
 
 ## Consequences
 
-- `terraform.rs` (19 tests) gains `Ctx`, module-call resolution,
+- `terraform.rs` gains `Ctx`, module-call resolution,
   `normalize_rel`, `sanitize_remote_source`; `hcl.rs` gains
-  `collect_module_calls` (13 tests); `extractor.rs` gains
+  `collect_module_calls`; `extractor.rs` gains
   `RawTfModuleCall`; `resolve.rs` appends the pass's external `Module`
   nodes (deduped by ID); `SymKind::is_terraform`; `map.rs::infra_lines`.
 - Map keys inside `terraform.rs` are owned `(String, String)`: a

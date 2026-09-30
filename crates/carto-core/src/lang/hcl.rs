@@ -131,6 +131,12 @@ fn is_terragrunt_file(file_name: &str) -> bool {
     matches!(file_name, "terragrunt.hcl" | "root.hcl")
 }
 
+/// `<stem>.tf.<suffix>` suffixes that are copies or scratch files, not
+/// per-environment variants (ADR-0041, follow-up).
+const NON_CONFIG_SUFFIXES: &[&str] = &[
+    "bak", "old", "orig", "backup", "example", "sample", "disabled", "tmp", "swp", "json",
+];
+
 /// `Some((variant, is_override))` for a Terraform source file name:
 /// `main.tf` → `(None, false)`, `locals.tf.simu` → `(Some("simu"),
 /// false)`, `override.tf`/`db_override.tf` → override. `None` for
@@ -141,7 +147,15 @@ fn terraform_file_kind(file_name: &str) -> Option<(Option<String>, bool)> {
     } else {
         let idx = file_name.find(".tf.")?;
         let suffix = &file_name[idx + 4..];
-        if suffix.is_empty() {
+        // A single plain token is an environment variant (`simu`,
+        // `prod`, …). Backup/scratch/example copies Terraform itself
+        // ignores are not: their declarations must not become symbols or
+        // stand in as definitions.
+        if suffix.is_empty()
+            || suffix.contains('.')
+            || suffix.ends_with('~')
+            || NON_CONFIG_SUFFIXES.contains(&suffix.to_ascii_lowercase().as_str())
+        {
             return None;
         }
         (&file_name[..idx], Some(suffix.to_string()))
@@ -1019,6 +1033,23 @@ locals {
         assert_eq!(terraform_file_kind("db_override.tf"), Some((None, true)));
         assert_eq!(terraform_file_kind("terragrunt.hcl"), None);
         assert_eq!(terraform_file_kind(".terraform.lock.hcl"), None);
+        // Backup/scratch copies and multi-part suffixes are not variants.
+        for name in [
+            "main.tf.bak",
+            "vars.tf.OLD",
+            "x.tf.example",
+            "x.tf.disabled",
+            "x.tf.swp",
+            "x.tf.a.b",
+            "x.tf.prod~",
+            "x.tf.",
+        ] {
+            assert_eq!(terraform_file_kind(name), None, "{name}");
+        }
+        assert_eq!(
+            terraform_file_kind("locals.tf.staging"),
+            Some((Some("staging".to_string()), false))
+        );
     }
 
     #[test]

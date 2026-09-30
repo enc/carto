@@ -563,7 +563,10 @@ fn resolve_ref(
 
     match live.as_slice() {
         [one] => push_edge(one, vec!["tf-ref:same-module".to_string()]),
-        [] if !all.is_empty() => {
+        // Only a *plain* file falls back to per-environment variants: a
+        // variant file (`x.tf.simu`) never sees another variant's files
+        // (`y.tf.prod`), so for it this is a genuine miss.
+        [] if !all.is_empty() && variant.is_none() => {
             // Defined only in other environment variants.
             for d in all {
                 let suffix = d.variant.as_deref().unwrap_or_default();
@@ -1395,5 +1398,28 @@ mod tests {
             NodeData::Symbol(s) => s.unresolved_calls.is_empty(),
             _ => true,
         }));
+    }
+
+    #[test]
+    fn a_variant_file_never_falls_back_to_another_variants_definition() {
+        let (nodes, edges) = run(vec![
+            tf_file("env/locals.tf.prod", "locals {\n  prefix = \"b\"\n}\n"),
+            tf_file(
+                "env/extra.tf.simu",
+                "output \"o\" {\n  value = local.prefix\n}\n",
+            ),
+        ]);
+        assert!(refs(&nodes, &edges).is_empty(), "no cross-variant edge");
+        assert_eq!(unresolved(&nodes, "output.o"), vec!["local.prefix"]);
+    }
+
+    #[test]
+    fn a_definition_only_in_a_backup_file_is_not_a_definition() {
+        let (nodes, edges) = run(vec![
+            tf_file("m/vars.tf.bak", "variable \"x\" {}\n"),
+            tf_file("m/main.tf", "output \"o\" {\n  value = var.x\n}\n"),
+        ]);
+        assert!(refs(&nodes, &edges).is_empty());
+        assert_eq!(unresolved(&nodes, "output.o"), vec!["var.x"]);
     }
 }

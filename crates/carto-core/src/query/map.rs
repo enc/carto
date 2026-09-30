@@ -556,10 +556,14 @@ fn infra_lines(
     };
 
     let mut by_kind: BTreeMap<&'static str, usize> = BTreeMap::new();
+    let mut terraform_anywhere = false;
     for node in qg.nodes() {
         if let NodeData::Symbol(s) = &node.data {
-            if s.sym_kind.is_terraform() && in_scope(&node.id) {
-                *by_kind.entry(s.sym_kind.as_str()).or_insert(0) += 1;
+            if s.sym_kind.is_terraform() {
+                terraform_anywhere = true;
+                if in_scope(&node.id) {
+                    *by_kind.entry(s.sym_kind.as_str()).or_insert(0) += 1;
+                }
             }
         }
     }
@@ -568,10 +572,14 @@ fn infra_lines(
         "  none — requires M3 (code<->infra join)".to_string(),
     ];
     if by_kind.is_empty() {
-        let mut lines = vec![
-            "## infra".to_string(),
-            "  none — requires M2 (infrastructure graph)".to_string(),
-        ];
+        // "no infrastructure found" and "none inside the requested
+        // --subpath/--component" are different answers.
+        let note = if terraform_anywhere {
+            "  no Terraform in this scope (source-level Terraform exists elsewhere in this repo); the resolved infrastructure graph requires M2"
+        } else {
+            "  none — requires M2 (infrastructure graph)"
+        };
+        let mut lines = vec!["## infra".to_string(), note.to_string()];
         lines.extend(join);
         return lines;
     }

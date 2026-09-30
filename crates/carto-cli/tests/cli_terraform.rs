@@ -646,3 +646,41 @@ fn json_carries_the_structured_field_only_for_variable_roots() {
     let resource = run(&["aws_vpc.main", "--dir", "in"]);
     assert!(resource["root_may_be_set_externally"].is_null());
 }
+
+#[test]
+fn map_infra_says_when_terraform_exists_but_not_in_scope() {
+    // `fixtures/monorepo` has Terraform under `infra/` and Go/C#/TS/Python
+    // elsewhere: a scope without Terraform must not read as "no infra".
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/monorepo");
+    let out = TempDir::new("map-scope");
+    Command::cargo_bin("carto")
+        .unwrap()
+        .arg("index")
+        .arg(&repo)
+        .arg("--out")
+        .arg(out.path())
+        .assert()
+        .success();
+    let map = |subpath: &str| -> String {
+        let stdout = Command::cargo_bin("carto")
+            .unwrap()
+            .args(["map", "--section", "infra", "--subpath", subpath])
+            .arg(&repo)
+            .arg("--out")
+            .arg(out.path())
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        String::from_utf8(stdout).unwrap()
+    };
+    let outside = map("services");
+    assert!(outside.contains("no Terraform in this scope"), "{outside}");
+    assert!(
+        !outside.contains("none — requires M2 (infrastructure graph)"),
+        "{outside}"
+    );
+    let inside = map("infra");
+    assert!(inside.contains("source-level Terraform"), "{inside}");
+}

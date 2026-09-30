@@ -97,8 +97,7 @@ module calls, and its remote sources with remote modules.
   confidence; inputs and cross-unit dependency outputs, unmatched inputs
   silent; misses reported vs silent; file-local `locals`; caches pruned and
   lock file symbol-free; remote source stripped of a fake credential/`?ref`;
-  determinism and the `map` chain). 16 `hcl.rs` and 23 `terraform.rs` unit
-  tests overall.
+  determinism and the `map` chain).
 - A `terragrunt.hcl` in a directory that also holds `.tf` files keeps the
   two scopes separate (unit-tested).
 - **Not in this slice:** the tfvars implication (ADR-0044); `generate`

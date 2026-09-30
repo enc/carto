@@ -128,8 +128,8 @@ binary cannot deserialize the new `sym_kind` spellings.
 
 ## Consequences
 
-- New `lang/terraform.rs` (11 tests), `hcl.rs` gains symbol/reference
-  extraction and `terraform_file_kind` (7 new tests, 12 total),
+- New `lang/terraform.rs` (with unit tests), `hcl.rs` gains symbol/reference
+  extraction and `terraform_file_kind` (with unit tests),
   `ExtractOut::terraform: Option<TerraformFacts>` (a `None` line in each
   other extractor), `SymKind` +7 variants, `consts.rs` history entry,
   `resolve.rs` hook (+ `smallest_containing_symbol`/`relpath_dir` made
@@ -151,3 +151,21 @@ binary cannot deserialize the new `sym_kind` spellings.
   (`carto-core/tests/compile_fail.rs`) mismatches its snapshots on
   rustc 1.94.1 (an extra "error originates in the macro `println`"
   note) — verified identical on an untouched `origin/main` checkout.
+
+## Follow-up (2026-09-30, review fixes)
+
+- **Variant files never fall back to other variants.** The `env-variant`
+  fan-out applies only when the *referencing* file is a plain `*.tf`; a
+  reference inside `x.tf.simu` to a name defined only in `y.tf.prod` is a
+  genuine miss (recorded, no edge). Before this, it produced a false
+  `inferred` edge into another environment's file.
+- **`<stem>.tf.<suffix>` is a variant only for a single plain token.**
+  Suffixes `bak`, `old`, `orig`, `backup`, `example`, `sample`, `disabled`,
+  `tmp`, `swp`, `json` (any case), a suffix ending in `~`, and a
+  multi-part suffix (`x.tf.a.b`) are copies or scratch files Terraform
+  ignores — they yield no symbols or references, so a backup can't stand
+  in as a definition.
+- `map --section infra` distinguishes "no Terraform anywhere" (the
+  original placeholder) from "Terraform exists but none inside the
+  requested `--subpath`/`--component`".
+
